@@ -1,9 +1,9 @@
 # PP-OCRv6 Rust Inference Assessment
 
 This repository contains a direct F32 Safetensors implementation of PP-OCRv6 medium, small, and
-tiny detector/recognizer pairs using Candle. It does not use ORT, Paddle, Python, or a bundled
-native inference library at runtime. ORT/Core ML measurements are external reference data only;
-they are not project dependencies.
+tiny detector/recognizer pairs using Candle. Its performance target is efficient native Metal
+execution without routing inference through a separate system ML runtime. The experimental Burn
+path uses ONNX only as an offline graph-import format; it is not a runtime dependency.
 
 ## Reproducible Run
 
@@ -84,6 +84,76 @@ The medium detector's four 9x9 projection convolutions must be tiled to stay wit
 
 All four runs had identical output sums. F16 was also probed on tiny at `[1,3,416,736]`: it produced an all-zero detector mask and no material speed gain. The implementation deliberately remains F32-only.
 
+## Burn Metal Probe
+
+`tools/ppocr-burn-bench` is a separate, native Rust Burn 0.21.0 experiment. It imports official
+ONNX once at build time, embeds the generated graph and weights, and executes through Metal/WGPU
+with fusion. Inputs are pre-uploaded, and the timed interval is `forward` plus `Metal::sync`;
+model loading, preprocessing, and output readback are excluded.
+
+On the same M4, F32 official models at the constrained shapes produced:
+
+| Model | Input | Samples | Burn Metal p50 | p90 |
+| --- | --- | ---: | ---: | ---: |
+| medium detector | `[1,3,416,736]` | 5 warmups, 30 runs | 582.286 ms | 591.309 ms |
+| medium recognizer | `[1,3,48,320]` | 5 warmups, 30 runs | 142.368 ms | 145.146 ms |
+| small detector | `[1,3,416,736]` | 5 warmups, 30 runs | 89.821 ms | 91.512 ms |
+| small recognizer | `[1,3,48,320]` | 5 warmups, 30 runs | 29.205 ms | 29.802 ms |
+| tiny detector | `[1,3,416,736]` | 5 warmups, 50 runs | 29.252 ms | 30.803 ms |
+| tiny recognizer | `[1,3,48,320]` | 5 warmups, 50 runs | 7.260 ms | 7.488 ms |
+
+Tiny is about 5.5x faster for detection and 7.1x faster for recognition than the current direct
+F32 Candle measurements at the same shapes. Before timing, the tool performs a synchronized
+forward/readback sanity check. The small-model smoke run produced detector output
+`[1,1,416,736]` with sum `19076.196182` and recognizer output `[1,40,18710]` with sum
+`40.000132`; all values were finite. This checks import and execution health, not end-to-end OCR
+semantic parity.
+
+The default `metal + fusion` configuration is the reproducible Burn baseline. Enabling Burn's
+optional autotune feature is not usable on this macOS Metal/WGPU combination: its GPU-to-CPU
+tuning-buffer map fails validation and the fusion scheduler subsequently panics. No autotuned
+latency is reported.
+
+## External ORT CPU / ANE Comparison
+
+The following direct-inference measurements were supplied from the same local evaluation effort
+and were produced by an external ORT benchmark. The first table is treated as recognition because
+it reports lines per second; the second is treated as detection because it reports frames per
+second. They are external CPU and ANE reference measurements, not Candle or Burn results and not
+an ORT runtime dependency of this repository.
+
+| Recognition size | CPU p50 | CPU mean | CPU throughput | ANE p50 | ANE mean | ANE throughput |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| tiny | 1.80 ms | 1.84 ms | 555 lines/s | 3.67 ms | 3.72 ms | 273 lines/s |
+| small | 8.10 ms | 8.10 ms | 124 lines/s | 11.45 ms | 11.43 ms | 87 lines/s |
+| medium | 21.38 ms | 21.41 ms | 47 lines/s | 30.52 ms | 30.55 ms | 33 lines/s |
+
+| Detection size | CPU p50 | CPU mean | CPU throughput | ANE p50 | ANE mean | ANE throughput |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| tiny | 48.39 ms | 48.38 ms | 20.7 frames/s | 47.92 ms | 48.02 ms | 20.9 frames/s |
+| small | 95.44 ms | 95.68 ms | 10.5 frames/s | 90.94 ms | 90.85 ms | 11.0 frames/s |
+| medium | 517.06 ms | 519.91 ms | 1.9 frames/s | 354.48 ms | 360.46 ms | 2.8 frames/s |
+
+Using the Burn p50 values above, the direct latency comparison is:
+
+| Recognition size | Burn p50 | Burn vs CPU | Burn vs ANE |
+| --- | ---: | ---: | ---: |
+| tiny | 7.260 ms | 4.03x slower | 1.98x slower |
+| small | 29.205 ms | 3.61x slower | 2.55x slower |
+| medium | 142.368 ms | 6.66x slower | 4.66x slower |
+
+| Detection size | Burn p50 | Burn vs CPU | Burn vs ANE |
+| --- | ---: | ---: | ---: |
+| tiny | 29.252 ms | 39.5% faster | 39.0% faster |
+| small | 89.821 ms | 5.9% faster | 1.2% faster |
+| medium | 582.286 ms | 12.6% slower | 64.3% slower |
+
+Burn therefore has a detector advantage at tiny and small, while recognition is the current
+latency bottleneck. Medium remains slower than both references. These derived comparisons are
+provisional until the two paths are confirmed to use identical model revisions, input shapes,
+preprocessing, dtypes, warmups, synchronization, and timing boundaries. Burn's measurements use
+pre-uploaded fixed tensors and synchronized `forward + Metal::sync` only.
+
 ## Native CPU ONNX Control
 
 RTen 0.24 is a separate pure-Rust CPU control using the official matching ONNX repositories, not a conversion performed in this assessment and not a replacement for direct Safetensors loading. On the same Apple M4 with four performance cores, one warmup plus one synchronized real-image run gave:
@@ -106,12 +176,12 @@ The medium detector is roughly 451 GMAC at the validation-frame input size. Cand
 | Runtime | Model format | CPU | GPU | Assessment |
 | --- | --- | --- | --- | --- |
 | Candle 0.10.2 | Requested Safetensors | Yes | Metal/CUDA | Implemented for medium/small/tiny. Tiny is usable for reduced-resolution local inference; medium needs custom fused/grouped convolution kernels for a materially higher ceiling. |
-| Burn 0.21 with WGPU/CubeCL | Requested Safetensors | Yes | Metal/WGPU/CUDA backends | Best native Rust GPU development candidate. It still needs the same hand-written graph and weight mapping; no automatic PP-OCRv6 importer exists. |
+| Burn 0.21 with WGPU/CubeCL | Official ONNX imported at build time | Yes | Metal/WGPU/CUDA backends | Native Metal p50 at constrained shapes: medium 582.286/142.368 ms, small 89.821/29.205 ms, tiny 29.252/7.260 ms (detector/recognizer). The default stable configuration is `metal + fusion`; autotune is currently unstable on this host. |
 | RTen 0.24 | Official matching ONNX | Yes | No | Measured on a real validation frame: 1502 ms detector and 37 ms for a 320-wide crop. Strong pure-Rust CPU fallback, but it does not read the supplied Safetensors directly. |
 | Wonnx 0.5 | Official ONNX | No practical result | WGPU/Metal | Current model preparation fails on unsupported HardSigmoid; detector also needs ConvTranspose support. |
 | Tract 0.23 | Official ONNX | Yes | No | Current dynamic PP-OCRv6 ONNX optimization fails at the first convolution. |
 
-`ort` is not evaluated, linked, or used by this project.
+Neither path invokes a separate system ML runtime.
 
 ## Compatibility Notes
 
