@@ -3,7 +3,8 @@
 This repository contains a direct F32 Safetensors implementation of PP-OCRv6 medium, small, and
 tiny detector/recognizer pairs using Candle. Its performance target is efficient native Metal
 execution without routing inference through a separate system ML runtime. The experimental Burn
-path uses ONNX only as an offline graph-import format; it is not a runtime dependency.
+path uses ONNX only as an offline graph-import format; it is not part of the default runtime
+dependency set.
 
 ## Reproducible Run
 
@@ -32,8 +33,8 @@ hf download PaddlePaddle/PP-OCRv6_tiny_rec_safetensors model.safetensors \
 cargo run --release -- \
   --det-model /tmp/ppocr-v6-models/det/model.safetensors \
   --rec-model /tmp/ppocr-v6-models/rec/model.safetensors \
-  --image /Users/wei/Dev/python/subfast-net/data/validation_samples/images/video0001_f00000060.jpg \
-  --annotations /Users/wei/Dev/python/subfast-net/data/validation_samples/annotations.jsonl \
+  --image /path/to/validation/images/video0001_f00000060.jpg \
+  --annotations /path/to/validation/annotations.jsonl \
   --device metal --warmup 1 --iterations 3
 ```
 
@@ -45,8 +46,8 @@ cargo run --release -- \
   --rec-model /tmp/ppocr-v6-models/tiny-rec/model.safetensors \
   --det-size tiny --rec-size tiny \
   --det-max-side 736 --rec-max-width 320 \
-  --image /Users/wei/Dev/python/subfast-net/data/validation_samples/images/video0001_f00000060.jpg \
-  --annotations /Users/wei/Dev/python/subfast-net/data/validation_samples/annotations.jsonl \
+  --image /path/to/validation/images/video0001_f00000060.jpg \
+  --annotations /path/to/validation/annotations.jsonl \
   --device metal --warmup 1 --iterations 5
 ```
 
@@ -86,21 +87,45 @@ All four runs had identical output sums. F16 was also probed on tiny at `[1,3,41
 
 ## Burn Metal Probe
 
-`tools/ppocr-burn-bench` is a separate, native Rust Burn 0.21.0 experiment. It imports official
-ONNX once at build time, embeds the generated graph and weights, and executes through Metal/WGPU
-with fusion. Inputs are pre-uploaded, and the timed interval is `forward` plus `Metal::sync`;
-model loading, preprocessing, and output readback are excluded.
+Burn is an opt-in runtime feature of this crate. It imports official ONNX once at build time,
+embeds the generated graph and weights, and executes through Metal/WGPU with fusion. Inputs are
+pre-uploaded, and the timed interval is `forward` plus `Metal::sync`; model loading,
+preprocessing, and output readback are excluded.
+
+Prepare fixed-shape models with the Rust utility, then build the Burn benchmark without enabling
+the default Candle feature:
+
+```sh
+cargo run --release --no-default-features --features onnx-tools \
+  --bin ppocr-onnx-staticize -- det.onnx /tmp/det-fixed.onnx --shape 1 3 416 736
+cargo run --release --no-default-features --features onnx-tools \
+  --bin ppocr-onnx-staticize -- rec.onnx /tmp/rec-fixed.onnx --shape 1 3 48 320
+
+PPOCR_BURN_DET_ONNX=/tmp/det-fixed.onnx \
+PPOCR_BURN_REC_ONNX=/tmp/rec-fixed.onnx \
+cargo run --release --no-default-features --features burn-bench \
+  --bin ppocr-burn-bench -- \
+  --image /path/to/image.jpg --annotations /path/to/annotations.jsonl --warmup 5 --runs 30
+```
+
+`--annotations` is optional. The benchmark validates detector shape `[1,3,416,736]` and fixes
+recognition to `[1,3,48,320]`; preprocessing and model loading are outside timed loops.
+
+The benchmark vendors a narrow `burn-cubecl` patch: with autotune disabled, compatible
+ungrouped 1x1 convolutions use Burn's existing im2col/matmul implementation; every other
+convolution stays on the Direct path. This avoids the unstable global autotuner without changing
+grouped, strided, padded, or non-1x1 convolution selection.
 
 On the same M4, F32 official models at the constrained shapes produced:
 
-| Model | Input | Samples | Burn Metal p50 | p90 |
-| --- | --- | ---: | ---: | ---: |
-| medium detector | `[1,3,416,736]` | 5 warmups, 30 runs | 582.286 ms | 591.309 ms |
-| medium recognizer | `[1,3,48,320]` | 5 warmups, 30 runs | 142.368 ms | 145.146 ms |
-| small detector | `[1,3,416,736]` | 5 warmups, 30 runs | 89.821 ms | 91.512 ms |
-| small recognizer | `[1,3,48,320]` | 5 warmups, 30 runs | 29.205 ms | 29.802 ms |
-| tiny detector | `[1,3,416,736]` | 5 warmups, 50 runs | 29.252 ms | 30.803 ms |
-| tiny recognizer | `[1,3,48,320]` | 5 warmups, 50 runs | 7.260 ms | 7.488 ms |
+| Model | Input | Samples | Burn Metal p50 | p90 | Notes |
+| --- | --- | ---: | ---: | ---: | --- |
+| medium detector | `[1,3,416,736]` | 5 warmups, 20 runs | 167.100 ms | 167.709 ms | 3.31x faster than the 552.820 ms Direct control |
+| medium recognizer | `[1,3,48,320]` | 5 warmups, 20 runs | 17.627 ms | 17.870 ms | 8.20x faster than the 144.493 ms Direct control |
+| small detector | `[1,3,416,736]` | 5 warmups, 30 runs | 89.821 ms | 91.512 ms | Historical Direct baseline |
+| small recognizer | `[1,3,48,320]` | 5 warmups, 30 runs | 29.205 ms | 29.802 ms | Historical Direct baseline |
+| tiny detector | `[1,3,416,736]` | 5 warmups, 50 runs | 29.252 ms | 30.803 ms | Historical Direct baseline |
+| tiny recognizer | `[1,3,48,320]` | 5 warmups, 50 runs | 7.260 ms | 7.488 ms | Historical Direct baseline |
 
 Tiny is about 5.5x faster for detection and 7.1x faster for recognition than the current direct
 F32 Candle measurements at the same shapes. Before timing, the tool performs a synchronized
@@ -109,10 +134,23 @@ forward/readback sanity check. The small-model smoke run produced detector outpu
 `40.000132`; all values were finite. This checks import and execution health, not end-to-end OCR
 semantic parity.
 
-The default `metal + fusion` configuration is the reproducible Burn baseline. Enabling Burn's
+For the medium run, the Direct and guarded-im2col output sums were `8150.233108` and
+`8150.233923` for detection, and both `40.000226` for recognition. The existing synchronized
+shape/finite/nonzero checks still pass. This is a numerical smoke check, not end-to-end OCR
+semantic parity.
+
+The default `metal + fusion` configuration uses the guarded 1x1 path above. Enabling Burn's
 optional autotune feature is not usable on this macOS Metal/WGPU combination: its GPU-to-CPU
 tuning-buffer map fails validation and the fusion scheduler subsequently panics. No autotuned
 latency is reported.
+
+### Batch Mode
+
+Batch mode was evaluated on the prior Direct baseline and intentionally not retained. Small
+detector throughput did not improve, medium detector throughput plateaued at batch 2 while still
+slower than the CPU reference, and recognition's limited gains did not make it competitive. The
+guarded 1x1 path delivers the material batch-1 gain; a future batch experiment must be measured
+again against this optimized baseline.
 
 ## External ORT CPU / ANE Comparison
 
@@ -134,25 +172,24 @@ an ORT runtime dependency of this repository.
 | small | 95.44 ms | 95.68 ms | 10.5 frames/s | 90.94 ms | 90.85 ms | 11.0 frames/s |
 | medium | 517.06 ms | 519.91 ms | 1.9 frames/s | 354.48 ms | 360.46 ms | 2.8 frames/s |
 
-Using the Burn p50 values above, the direct latency comparison is:
+Using the optimized medium Burn p50 values above, the direct latency comparison is:
 
 | Recognition size | Burn p50 | Burn vs CPU | Burn vs ANE |
 | --- | ---: | ---: | ---: |
 | tiny | 7.260 ms | 4.03x slower | 1.98x slower |
 | small | 29.205 ms | 3.61x slower | 2.55x slower |
-| medium | 142.368 ms | 6.66x slower | 4.66x slower |
+| medium | 17.627 ms | 1.21x faster | 1.73x faster |
 
 | Detection size | Burn p50 | Burn vs CPU | Burn vs ANE |
 | --- | ---: | ---: | ---: |
 | tiny | 29.252 ms | 39.5% faster | 39.0% faster |
 | small | 89.821 ms | 5.9% faster | 1.2% faster |
-| medium | 582.286 ms | 12.6% slower | 64.3% slower |
+| medium | 167.100 ms | 3.09x faster | 2.12x faster |
 
-Burn therefore has a detector advantage at tiny and small, while recognition is the current
-latency bottleneck. Medium remains slower than both references. These derived comparisons are
-provisional until the two paths are confirmed to use identical model revisions, input shapes,
-preprocessing, dtypes, warmups, synchronization, and timing boundaries. Burn's measurements use
-pre-uploaded fixed tensors and synchronized `forward + Metal::sync` only.
+The optimized medium path has an advantage over both external references on this workload.
+These derived comparisons are provisional until the two paths are confirmed to use identical model
+revisions, input shapes, preprocessing, dtypes, warmups, synchronization, and timing boundaries.
+Burn's measurements use pre-uploaded fixed tensors and synchronized `forward + Metal::sync` only.
 
 ## Native CPU ONNX Control
 
@@ -176,7 +213,7 @@ The medium detector is roughly 451 GMAC at the validation-frame input size. Cand
 | Runtime | Model format | CPU | GPU | Assessment |
 | --- | --- | --- | --- | --- |
 | Candle 0.10.2 | Requested Safetensors | Yes | Metal/CUDA | Implemented for medium/small/tiny. Tiny is usable for reduced-resolution local inference; medium needs custom fused/grouped convolution kernels for a materially higher ceiling. |
-| Burn 0.21 with WGPU/CubeCL | Official ONNX imported at build time | Yes | Metal/WGPU/CUDA backends | Native Metal p50 at constrained shapes: medium 582.286/142.368 ms, small 89.821/29.205 ms, tiny 29.252/7.260 ms (detector/recognizer). The default stable configuration is `metal + fusion`; autotune is currently unstable on this host. |
+| Burn 0.21 with WGPU/CubeCL | Official ONNX imported at build time | Yes | Metal/WGPU/CUDA backends | Native Metal p50 at constrained shapes: optimized medium 167.100/17.627 ms (detector/recognizer). A vendored guarded 1x1 im2col fallback replaces Direct only where shape-safe; autotune remains unstable on this host. |
 | RTen 0.24 | Official matching ONNX | Yes | No | Measured on a real validation frame: 1502 ms detector and 37 ms for a 320-wide crop. Strong pure-Rust CPU fallback, but it does not read the supplied Safetensors directly. |
 | Wonnx 0.5 | Official ONNX | No practical result | WGPU/Metal | Current model preparation fails on unsupported HardSigmoid; detector also needs ConvTranspose support. |
 | Tract 0.23 | Official ONNX | Yes | No | Current dynamic PP-OCRv6 ONNX optimization fails at the first convolution. |
