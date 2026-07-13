@@ -1,12 +1,12 @@
-#[cfg(feature = "burn-bench")]
+#[cfg(feature = "burn-infer")]
 use burn_onnx::{LoadStrategy, ModelGen};
-#[cfg(feature = "burn-bench")]
+#[cfg(feature = "burn-infer")]
 use std::{
     env,
     path::{Path, PathBuf},
 };
 
-#[cfg(feature = "burn-bench")]
+#[cfg(feature = "burn-infer")]
 fn model_path(variable: &str) -> Option<PathBuf> {
     let value = env::var_os(variable)?;
     let path = PathBuf::from(value);
@@ -22,7 +22,7 @@ fn model_path(variable: &str) -> Option<PathBuf> {
     )
 }
 
-#[cfg(feature = "burn-bench")]
+#[cfg(feature = "burn-infer")]
 fn generate(source: &Path, name: &str) {
     let stem = source
         .file_stem()
@@ -45,7 +45,7 @@ fn generate(source: &Path, name: &str) {
     );
 }
 
-#[cfg(feature = "burn-bench")]
+#[cfg(feature = "burn-infer")]
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(ppocr_burn_models)");
     for variable in ["PPOCR_BURN_DET_ONNX", "PPOCR_BURN_REC_ONNX"] {
@@ -59,7 +59,7 @@ fn main() {
         (Some(detector), Some(recognizer)) => (detector, recognizer),
         (None, None) => {
             println!(
-                "cargo:warning=Burn benchmark model generation skipped; set PPOCR_BURN_DET_ONNX and PPOCR_BURN_REC_ONNX to build the benchmark"
+                "cargo:warning=Burn model generation skipped; set PPOCR_BURN_DET_ONNX and PPOCR_BURN_REC_ONNX to build Burn inference or benchmarks"
             );
             return;
         }
@@ -73,5 +73,5 @@ fn main() {
     println!("cargo:rustc-cfg=ppocr_burn_models");
 }
 
-#[cfg(not(feature = "burn-bench"))]
+#[cfg(not(feature = "burn-infer"))]
 fn main() {}

@@ -65,6 +65,9 @@ pub fn conv_im2col_1x1<R: CubeRuntime, const N: usize>(
     if options.groups != 1 {
         return Err(ConvSetupError::Groups(options.groups));
     }
+    if !supports_im2col_1x1(&options) {
+        return Err(ConvSetupError::Unknown);
+    }
 
     let rank = input.meta.num_dims();
     let dim_c = rank - 1;
@@ -165,12 +168,18 @@ fn is_spatial_contiguous(shape: &[usize], strides: &[usize]) -> bool {
         return false;
     }
 
-    for i in (1..dim_c).rev() {
+    for i in (0..dim_c).rev() {
         if strides[i + 1] * shape[i + 1] != strides[i] {
             return false;
         }
     }
     true
+}
+
+pub(crate) fn supports_im2col_1x1<const N: usize>(options: &ConvOptions<N>) -> bool {
+    options.groups == 1
+        && options.stride.iter().all(|stride| *stride == 1)
+        && options.padding.iter().all(|padding| *padding == 0)
 }
 
 fn from_handle<R: CubeRuntime>(
@@ -186,4 +195,34 @@ fn from_handle<R: CubeRuntime>(
         device.clone(),
         dtype,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn im2col_1x1_requires_unit_stride_and_zero_padding() {
+        assert!(supports_im2col_1x1(&ConvOptions::new(
+            [1, 1], [0, 0], [1, 1], 1,
+        )));
+        assert!(!supports_im2col_1x1(&ConvOptions::new(
+            [2, 2], [1, 1], [1, 1], 1,
+        )));
+        assert!(!supports_im2col_1x1(&ConvOptions::new(
+            [1, 1], [1, 0], [1, 1], 1,
+        )));
+        assert!(!supports_im2col_1x1(&ConvOptions::new(
+            [1, 1], [0, 0], [1, 1], 2,
+        )));
+        assert!(supports_im2col_1x1(&ConvOptions::new(
+            [1, 1], [0, 0], [3, 2], 1,
+        )));
+    }
+
+    #[test]
+    fn flattening_requires_a_contiguous_batch_stride() {
+        assert!(is_spatial_contiguous(&[2, 3, 4, 5], &[60, 20, 5, 1]));
+        assert!(!is_spatial_contiguous(&[2, 3, 4, 5], &[80, 20, 5, 1]));
+    }
 }

@@ -15,7 +15,7 @@ use crate::{
     tensor::CubeTensor,
 };
 
-use super::{conv_direct, conv_im2col_1x1};
+use super::{conv_direct, conv_im2col_1x1, supports_im2col_1x1};
 #[cfg(feature = "autotune")]
 use super::forward::conv_autotune;
 
@@ -114,7 +114,7 @@ fn can_use_im2col_1x1<R: CubeRuntime, const N: usize>(
     weight: &CubeTensor<R>,
     options: &ConvOptions<N>,
 ) -> bool {
-    if options.groups != 1 {
+    if !supports_im2col_1x1(options) {
         return false;
     }
 

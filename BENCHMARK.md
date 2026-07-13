@@ -85,6 +85,27 @@ The medium detector's four 9x9 projection convolutions must be tiled to stay wit
 
 All four runs had identical output sums. F16 was also probed on tiny at `[1,3,416,736]`: it produced an all-zero detector mask and no material speed gain. The implementation deliberately remains F32-only.
 
+## Burn End-to-End OCR
+
+`ppocr-burn` runs the fixed-shape Burn models as a complete OCR pipeline: aspect-preserving
+detector letterboxing, detector-mask postprocessing, rotated text crops, fixed-width recognition,
+CTC greedy decoding, and JSON output. `--dict` accepts a one-entry-per-line dictionary or the
+released recognizer `inference.yml`, whose `character_dict` matches the model class count. The
+standard implicit PaddleX space class is handled automatically when present.
+
+```sh
+PPOCR_BURN_DET_ONNX=/tmp/det-fixed.onnx \
+PPOCR_BURN_REC_ONNX=/tmp/rec-fixed.onnx \
+cargo run --release --no-default-features --features burn-infer \
+  --bin ppocr-burn -- \
+  --image /path/to/image.jpg --dict /path/to/inference.yml --output /tmp/ocr.json
+```
+
+The runtime defaults to binary threshold `0.2`, box-score threshold `0.4`, unclip ratio `1.4`,
+and at most 1,000 boxes. All values can be adjusted through `--help`. The bounded fixed inputs
+avoid dynamic-shape compilation behavior, and the runtime synchronizes before every output
+readback.
+
 ## Burn Metal Probe
 
 Burn is an opt-in runtime feature of this crate. It imports official ONNX once at build time,
@@ -116,91 +137,46 @@ ungrouped 1x1 convolutions use Burn's existing im2col/matmul implementation; eve
 convolution stays on the Direct path. This avoids the unstable global autotuner without changing
 grouped, strided, padded, or non-1x1 convolution selection.
 
-On the same M4, F32 official models at the constrained shapes produced:
+On the same M4, F32 official models were freshly measured with five warmups and 30 timed runs at
+the constrained shapes:
 
-| Model | Input | Samples | Burn Metal p50 | p90 | Notes |
-| --- | --- | ---: | ---: | ---: | --- |
-| medium detector | `[1,3,416,736]` | 5 warmups, 20 runs | 167.100 ms | 167.709 ms | 3.31x faster than the 552.820 ms Direct control |
-| medium recognizer | `[1,3,48,320]` | 5 warmups, 20 runs | 17.627 ms | 17.870 ms | 8.20x faster than the 144.493 ms Direct control |
-| small detector | `[1,3,416,736]` | 5 warmups, 30 runs | 89.821 ms | 91.512 ms | Historical Direct baseline |
-| small recognizer | `[1,3,48,320]` | 5 warmups, 30 runs | 29.205 ms | 29.802 ms | Historical Direct baseline |
-| tiny detector | `[1,3,416,736]` | 5 warmups, 50 runs | 29.252 ms | 30.803 ms | Historical Direct baseline |
-| tiny recognizer | `[1,3,48,320]` | 5 warmups, 50 runs | 7.260 ms | 7.488 ms | Historical Direct baseline |
+| Model | Input | Configuration | Burn Metal p50 | p90 | Throughput at p50 |
+| --- | --- | --- | ---: | ---: | ---: |
+| medium detector | `[1,3,416,736]` | guarded 1x1 im2col | 166.927 ms | 167.613 ms | 5.99 frames/s |
+| medium recognizer | `[1,3,48,320]` | guarded 1x1 im2col | 17.634 ms | 17.752 ms | 56.71 lines/s |
+| small detector | `[1,3,416,736]` | guarded 1x1 im2col | 47.855 ms | 48.590 ms | 20.90 frames/s |
+| small recognizer | `[1,3,48,320]` | guarded 1x1 im2col | 10.278 ms | 11.470 ms | 97.30 lines/s |
+| tiny detector | `[1,3,416,736]` | guarded 1x1 im2col | 28.606 ms | 29.214 ms | 34.96 frames/s |
+| tiny recognizer | `[1,3,48,320]` | guarded 1x1 im2col | 3.918 ms | 5.142 ms | 255.23 lines/s |
 
-Tiny is about 5.5x faster for detection and 7.1x faster for recognition than the current direct
-F32 Candle measurements at the same shapes. Before timing, the tool performs a synchronized
-forward/readback sanity check. The small-model smoke run produced detector output
-`[1,1,416,736]` with sum `19076.196182` and recognizer output `[1,40,18710]` with sum
-`40.000132`; all values were finite. This checks import and execution health, not end-to-end OCR
-semantic parity.
-
-For the medium run, the Direct and guarded-im2col output sums were `8150.233108` and
-`8150.233923` for detection, and both `40.000226` for recognition. The existing synchronized
-shape/finite/nonzero checks still pass. This is a numerical smoke check, not end-to-end OCR
-semantic parity.
+Before timing, the tool performs a synchronized forward/readback sanity check. All six fresh runs
+returned finite, nonzero outputs with the expected detector shape `[1,1,416,736]`; recognizer
+outputs had shape `[1,40,18710]` for medium/small and `[1,40,6906]` for tiny. This checks import
+and execution health, not end-to-end OCR semantic parity.
 
 The default `metal + fusion` configuration uses the guarded 1x1 path above. Enabling Burn's
 optional autotune feature is not usable on this macOS Metal/WGPU combination: its GPU-to-CPU
 tuning-buffer map fails validation and the fusion scheduler subsequently panics. No autotuned
 latency is reported.
 
-### Batch Mode
-
-Batch mode was evaluated on the prior Direct baseline and intentionally not retained. Small
-detector throughput did not improve, medium detector throughput plateaued at batch 2 while still
-slower than the CPU reference, and recognition's limited gains did not make it competitive. The
-guarded 1x1 path delivers the material batch-1 gain; a future batch experiment must be measured
-again against this optimized baseline.
-
-## External ORT CPU / ANE Comparison
-
-The following direct-inference measurements were supplied from the same local evaluation effort
-and were produced by an external ORT benchmark. The first table is treated as recognition because
-it reports lines per second; the second is treated as detection because it reports frames per
-second. They are external CPU and ANE reference measurements, not Candle or Burn results and not
-an ORT runtime dependency of this repository.
-
-| Recognition size | CPU p50 | CPU mean | CPU throughput | ANE p50 | ANE mean | ANE throughput |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| tiny | 1.80 ms | 1.84 ms | 555 lines/s | 3.67 ms | 3.72 ms | 273 lines/s |
-| small | 8.10 ms | 8.10 ms | 124 lines/s | 11.45 ms | 11.43 ms | 87 lines/s |
-| medium | 21.38 ms | 21.41 ms | 47 lines/s | 30.52 ms | 30.55 ms | 33 lines/s |
-
-| Detection size | CPU p50 | CPU mean | CPU throughput | ANE p50 | ANE mean | ANE throughput |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| tiny | 48.39 ms | 48.38 ms | 20.7 frames/s | 47.92 ms | 48.02 ms | 20.9 frames/s |
-| small | 95.44 ms | 95.68 ms | 10.5 frames/s | 90.94 ms | 90.85 ms | 11.0 frames/s |
-| medium | 517.06 ms | 519.91 ms | 1.9 frames/s | 354.48 ms | 360.46 ms | 2.8 frames/s |
-
-Using the optimized medium Burn p50 values above, the direct latency comparison is:
-
-| Recognition size | Burn p50 | Burn vs CPU | Burn vs ANE |
-| --- | ---: | ---: | ---: |
-| tiny | 7.260 ms | 4.03x slower | 1.98x slower |
-| small | 29.205 ms | 3.61x slower | 2.55x slower |
-| medium | 17.627 ms | 1.21x faster | 1.73x faster |
-
-| Detection size | Burn p50 | Burn vs CPU | Burn vs ANE |
-| --- | ---: | ---: | ---: |
-| tiny | 29.252 ms | 39.5% faster | 39.0% faster |
-| small | 89.821 ms | 5.9% faster | 1.2% faster |
-| medium | 167.100 ms | 3.09x faster | 2.12x faster |
-
-The optimized medium path has an advantage over both external references on this workload.
-These derived comparisons are provisional until the two paths are confirmed to use identical model
-revisions, input shapes, preprocessing, dtypes, warmups, synchronization, and timing boundaries.
-Burn's measurements use pre-uploaded fixed tensors and synchronized `forward + Metal::sync` only.
-
 ## Native CPU ONNX Control
 
-RTen 0.24 is a separate pure-Rust CPU control using the official matching ONNX repositories, not a conversion performed in this assessment and not a replacement for direct Safetensors loading. On the same Apple M4 with four performance cores, one warmup plus one synchronized real-image run gave:
+RTen 0.24 is a separate pure-Rust CPU control using the official matching ONNX repositories, not a
+conversion performed in this assessment and not a replacement for direct Safetensors loading. Each
+model was freshly measured with four performance cores, five warmups, and 30 timed runs. RTen
+receives one fixed randomly generated F32 input per model, reused for all runs.
 
-| Sample / model | Input | RTen forward | Other measured work |
-| --- | --- | ---: | --- |
-| `f00022200` det | `[1,3,1088,1920]` | 1501.82 ms | JPEG decode 4.58 ms; resize plus BGR normalization 17.25 ms |
-| GT crop from `f00022200` rec | `[1,3,48,320]` | 36.99 ms | Preprocessing 0.068 ms |
+| Model | Input | RTen p50 | p90 | Throughput at p50 |
+| --- | --- | ---: | ---: | ---: |
+| medium detector | `[1,3,416,736]` | 222.560 ms | 223.530 ms | 4.49 frames/s |
+| medium recognizer | `[1,3,48,320]` | 36.250 ms | 37.790 ms | 27.59 lines/s |
+| small detector | `[1,3,416,736]` | 39.890 ms | 40.410 ms | 25.07 frames/s |
+| small recognizer | `[1,3,48,320]` | 9.290 ms | 10.830 ms | 107.64 lines/s |
+| tiny detector | `[1,3,416,736]` | 18.130 ms | 19.490 ms | 55.16 frames/s |
+| tiny recognizer | `[1,3,48,320]` | 2.100 ms | 2.290 ms | 476.19 lines/s |
 
-The RTen control is the practical CPU option found in this assessment. It remains too slow for real-time full-HD detection, but is roughly an order of magnitude faster than the direct Candle CPU detector and recognition paths.
+Throughput in both native-runtime tables is calculated as `1000 / p50_ms`; it excludes model
+loading, image decoding, preprocessing, and OCR postprocessing.
 
 ## Conclusion
 
@@ -213,8 +189,8 @@ The medium detector is roughly 451 GMAC at the validation-frame input size. Cand
 | Runtime | Model format | CPU | GPU | Assessment |
 | --- | --- | --- | --- | --- |
 | Candle 0.10.2 | Requested Safetensors | Yes | Metal/CUDA | Implemented for medium/small/tiny. Tiny is usable for reduced-resolution local inference; medium needs custom fused/grouped convolution kernels for a materially higher ceiling. |
-| Burn 0.21 with WGPU/CubeCL | Official ONNX imported at build time | Yes | Metal/WGPU/CUDA backends | Native Metal p50 at constrained shapes: optimized medium 167.100/17.627 ms (detector/recognizer). A vendored guarded 1x1 im2col fallback replaces Direct only where shape-safe; autotune remains unstable on this host. |
-| RTen 0.24 | Official matching ONNX | Yes | No | Measured on a real validation frame: 1502 ms detector and 37 ms for a 320-wide crop. Strong pure-Rust CPU fallback, but it does not read the supplied Safetensors directly. |
+| Burn 0.21 with WGPU/CubeCL | Official ONNX imported at build time | Yes | Metal/WGPU/CUDA backends | Fresh guarded-path p50 detector/recognizer latency (ms): medium 166.927/17.634, small 47.855/10.278, tiny 28.606/3.918. |
+| RTen 0.24 | Official matching ONNX | Yes | No | Fresh four-performance-core p50 detector/recognizer latency (ms): medium 222.560/36.250, small 39.890/9.290, tiny 18.130/2.100. It does not read the supplied Safetensors directly. |
 | Wonnx 0.5 | Official ONNX | No practical result | WGPU/Metal | Current model preparation fails on unsupported HardSigmoid; detector also needs ConvTranspose support. |
 | Tract 0.23 | Official ONNX | Yes | No | Current dynamic PP-OCRv6 ONNX optimization fails at the first convolution. |
 
@@ -223,5 +199,5 @@ Neither path invokes a separate system ML runtime.
 ## Compatibility Notes
 
 - Candle 0.11.0 does not compile on stable Rust 1.92 for this Apple Silicon host because its NEON `f16` code uses unstable `stdarch_neon_f16`; this project intentionally pins Candle 0.10.2.
-- Small detector/recognizer use `--det-size small --rec-size small`; tiny uses `--det-size tiny --rec-size tiny`. Tiny recognition emits 6906 logits and needs the released `ppocrv6_tiny_dict` for text decoding. This benchmark executable intentionally stops at CTC logits.
+- Small detector/recognizer use `--det-size small --rec-size small`; tiny uses `--det-size tiny --rec-size tiny`. Tiny recognition emits 6906 logits and needs the released `ppocrv6_tiny_dict` for text decoding. This benchmark executable intentionally stops at CTC logits; use `ppocr-burn` for full OCR output.
 - Validation annotations contain polygons and detector scores but no text transcription. They validate frame/crop latency and detector output shape, not end-to-end OCR accuracy.

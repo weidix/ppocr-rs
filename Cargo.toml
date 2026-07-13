@@ -22,12 +22,13 @@ candle-accelerate = ["candle", "candle-core/accelerate", "candle-nn/accelerate"]
 training = ["candle", "dep:candle-optimisers", "dep:clap", "dep:rand"]
 
 # Burn is opt-in so its WGPU/CubeCL dependency graph does not affect Candle
-# consumers. Model generation is further isolated to the benchmark feature.
+# consumers. ONNX model generation is isolated to the Burn inference features.
 onnx-tools = ["dep:onnx-ir", "dep:protobuf"]
 burn = ["dep:burn", "dep:burn-store"]
 burn-metal = ["burn", "burn/metal", "burn/fusion"]
 burn-autotune = ["burn-metal", "burn/autotune"]
-burn-bench = ["burn-metal", "dep:burn-onnx"]
+burn-infer = ["burn-metal", "dep:burn-onnx"]
+burn-bench = ["burn-infer"]
 
 [dependencies]
 anyhow = "1.0"
@@ -59,6 +60,13 @@ required-features = ["candle"]
 name = "ppocr-burn-bench"
 path = "src/bin/ppocr-burn-bench.rs"
 required-features = ["burn-bench"]
+test = false
+bench = false
+
+[[bin]]
+name = "ppocr-burn"
+path = "src/bin/ppocr-burn.rs"
+required-features = ["burn-infer"]
 test = false
 bench = false
 
