@@ -7,10 +7,46 @@ Candle CRNN trainer. Runtime dependencies are selected explicitly through Cargo 
 | --- | --- | --- |
 | `candle-metal` | PP-OCRv6 Safetensors inference on Metal | Yes |
 | `candle` | PP-OCRv6 Safetensors inference on CPU | No |
+| `cpu` | Self-contained SIMD CPU inference for converted models | No |
+| `cpu-convert` | Offline ONNX to `.ppocr-cpu` conversion | No |
 | `burn-infer` | Fixed-shape ONNX Burn Metal end-to-end OCR | No |
 | `burn-bench` | Fixed-shape ONNX Burn Metal benchmark | No |
 | `onnx-tools` | Rust ONNX fixed-shape utility | No |
 | `training` | Candle CRNN trainer | No |
+
+## Self-Contained CPU Backend
+
+The `cpu` runtime implements the PP-OCRv6 operators locally and does not invoke ONNX Runtime,
+Burn, Candle, RTen, BLAS, or another inference library. Its only compute dependency is Rayon for
+the fixed worker pool. `rten-onnx` is enabled only by `cpu-convert` to decode ONNX offline and is
+not linked into deployed `cpu` builds.
+
+Convert a model at its deployed fixed shape, then benchmark the packed model:
+
+```sh
+cargo run --release --no-default-features --features cpu-convert \
+  --bin ppocr-cpu-convert -- \
+  inference.onnx model.ppocr-cpu --shape 1 3 48 320
+
+cargo run --release --no-default-features --features cpu \
+  --bin ppocr-cpu-bench -- \
+  model.ppocr-cpu --threads 4 --warmup 5 --runs 30
+```
+
+The runtime API accepts a contiguous NCHW F32 tensor:
+
+```rust
+use ppocr_rs::cpu::{CpuModel, CpuOptions, Tensor};
+
+let model = CpuModel::load("model.ppocr-cpu", CpuOptions { threads: 4 })?;
+let input = Tensor::from_f32(model.input_shape().to_vec(), input_values)?;
+let output = model.run(input)?;
+```
+
+On the Apple M4 benchmark host, the optimized tiny detector runs at 21.56 ms p50 versus the
+documented 27.84 ms ORT baseline. Repeated tiny recognizer runs measure 1.83-1.91 ms p50 versus
+1.81 ms for ORT. The recognizer comparison used identical input: all 40 argmax positions matched,
+with maximum absolute output error `8.24e-5`.
 
 Run end-to-end Candle OCR. `--dict` accepts either one character per line or the matching PaddleX
 recognizer `inference.yml`:

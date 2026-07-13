@@ -1,5 +1,8 @@
 pub mod ocr;
 
+#[cfg(feature = "cpu")]
+pub mod cpu;
+
 #[cfg(feature = "burn")]
 pub mod burn_runtime;
 
