@@ -34,8 +34,9 @@ cargo run --release -- \
   --det-model /tmp/ppocr-v6-models/det/model.safetensors \
   --rec-model /tmp/ppocr-v6-models/rec/model.safetensors \
   --image /path/to/validation/images/video0001_f00000060.jpg \
-  --annotations /path/to/validation/annotations.jsonl \
-  --device metal --warmup 1 --iterations 3
+  --dict /path/to/PP-OCRv6_medium_rec_onnx/inference.yml \
+  --det-max-side 736 \
+  --device metal --output /tmp/candle-ocr.json
 ```
 
 Use `--device cpu` for the CPU path. To run a smaller model, add matching size flags:
@@ -47,11 +48,11 @@ cargo run --release -- \
   --det-size tiny --rec-size tiny \
   --det-max-side 736 --rec-max-width 320 \
   --image /path/to/validation/images/video0001_f00000060.jpg \
-  --annotations /path/to/validation/annotations.jsonl \
-  --device metal --warmup 1 --iterations 5
+  --dict /path/to/PP-OCRv6_tiny_rec_onnx/inference.yml \
+  --device metal --output /tmp/candle-ocr.json
 ```
 
-`--det-max-side` and `--rec-max-width` are opt-in latency controls. `--det-max-side` only downsizes an image whose longest edge exceeds the limit. With neither flag, detector preprocessing preserves the released `limit_type=min` behavior and recognition keeps its dynamic width (up to 3200). The command prints JSON with model load, preprocessing, host-to-device transfer, synchronized forward, and transfer-plus-forward timing.
+`--det-max-side` and `--rec-max-width` are opt-in latency controls. `--det-max-side` only downsizes an image whose longest edge exceeds the limit. With neither flag, detector preprocessing preserves the released `limit_type=min` behavior and recognition keeps its dynamic width (up to 3200). The runtime performs detector-mask postprocessing, polygon rectification, overlapping wide-line splitting, and CTC greedy decoding without annotations, then writes reading-order OCR JSON.
 
 ## Direct Safetensors Results
 
@@ -198,6 +199,33 @@ $RTEN /path/to/PP-OCRv6_tiny_rec_onnx/inference.onnx \
 Throughput in both native-runtime tables is calculated as `1000 / p50_ms`; it excludes model
 loading, image decoding, preprocessing, and OCR postprocessing.
 
+## ONNX Runtime Fixed-Shape Probe
+
+ONNX Runtime (ORT) was measured with fixed F32 inputs: detector `[1,3,416,736]` and recognizer
+`[1,3,48,320]`. Each backend uses five warmups and 30 timed runs. Values are milliseconds per
+item. Throughput is calculated as `1000 / p50_ms`.
+
+| Model | Input | Backend | ORT p50 | p90 | Throughput at p50 |
+| --- | --- | --- | ---: | ---: | ---: |
+| medium detector | `[1,3,416,736]` | CPU | 303.26 ms | 307.81 ms | 3.30 frames/s |
+| medium detector | `[1,3,416,736]` | GPU | 184.75 ms | 211.84 ms | 5.41 frames/s |
+| medium detector | `[1,3,416,736]` | ANE | 180.73 ms | 194.42 ms | 5.53 frames/s |
+| medium recognizer | `[1,3,48,320]` | CPU | 22.68 ms | 23.19 ms | 44.1 lines/s |
+| medium recognizer | `[1,3,48,320]` | GPU | 34.35 ms | 37.56 ms | 29.1 lines/s |
+| medium recognizer | `[1,3,48,320]` | ANE | 31.87 ms | 32.73 ms | 31.4 lines/s |
+| small detector | `[1,3,416,736]` | CPU | 56.13 ms | 57.49 ms | 17.8 frames/s |
+| small detector | `[1,3,416,736]` | GPU | 55.58 ms | 56.15 ms | 18.0 frames/s |
+| small detector | `[1,3,416,736]` | ANE | 52.87 ms | 54.39 ms | 18.9 frames/s |
+| small recognizer | `[1,3,48,320]` | CPU | 8.54 ms | 8.72 ms | 117.0 lines/s |
+| small recognizer | `[1,3,48,320]` | GPU | 13.35 ms | 13.73 ms | 74.9 lines/s |
+| small recognizer | `[1,3,48,320]` | ANE | 11.91 ms | 12.15 ms | 84.0 lines/s |
+| tiny detector | `[1,3,416,736]` | CPU | 27.84 ms | 28.33 ms | 35.9 frames/s |
+| tiny detector | `[1,3,416,736]` | GPU | 29.65 ms | 30.29 ms | 33.7 frames/s |
+| tiny detector | `[1,3,416,736]` | ANE | 27.40 ms | 28.19 ms | 36.5 frames/s |
+| tiny recognizer | `[1,3,48,320]` | CPU | 1.81 ms | 2.08 ms | 553.4 lines/s |
+| tiny recognizer | `[1,3,48,320]` | GPU | 4.34 ms | 4.58 ms | 230.5 lines/s |
+| tiny recognizer | `[1,3,48,320]` | ANE | 4.52 ms | 5.21 ms | 221.2 lines/s |
+
 ## Conclusion
 
 The direct Candle path now loads and executes all official PP-OCRv6 size tiers. Medium remains unsuitable for local real-time full-HD detection. Tiny is the practical ceiling within the current direct F32/Candle implementation: about 1.2 frames/s at dynamic full-HD input, or 6.2 frames/s with a 736-pixel maximum side before postprocessing. The 736 setting trades small-text recall for latency and needs task-level accuracy evaluation before deployment.
@@ -208,9 +236,10 @@ The medium detector is roughly 451 GMAC at the validation-frame input size. Cand
 
 | Runtime | Model format | CPU | GPU | Assessment |
 | --- | --- | --- | --- | --- |
-| Candle 0.10.2 | Requested Safetensors | Yes | Metal/CUDA | Implemented for medium/small/tiny. Tiny is usable for reduced-resolution local inference; medium needs custom fused/grouped convolution kernels for a materially higher ceiling. |
+| Candle 0.10.2 | Requested Safetensors | Yes | Metal/CUDA | End-to-end OCR is implemented for medium/small/tiny. Tiny is usable for reduced-resolution local inference; medium needs custom fused/grouped convolution kernels for a materially higher ceiling. |
 | Burn 0.21 with WGPU/CubeCL | Official ONNX imported at build time | Yes | Metal/WGPU/CUDA backends | Fresh guarded-path p50 detector/recognizer latency (ms): medium 166.927/17.634, small 47.855/10.278, tiny 28.606/3.918. |
 | RTen 0.24 | Official matching ONNX | Yes | No | Fresh four-worker-thread p50 detector/recognizer latency (ms): medium 222.560/36.250, small 39.890/9.290, tiny 18.130/2.100. It does not read the supplied Safetensors directly. |
+| ONNX Runtime (ORT) | ONNX | Yes | GPU/ANE | Fixed-shape p50 detector/recognizer latency (ms): CPU medium 303.26/22.68, small 56.13/8.54, tiny 27.84/1.81; GPU medium 184.75/34.35, small 55.58/13.35, tiny 29.65/4.34; ANE medium 180.73/31.87, small 52.87/11.91, tiny 27.40/4.52. |
 | Wonnx 0.5 | Official ONNX | No practical result | WGPU/Metal | Current model preparation fails on unsupported HardSigmoid; detector also needs ConvTranspose support. |
 | Tract 0.23 | Official ONNX | Yes | No | Current dynamic PP-OCRv6 ONNX optimization fails at the first convolution. |
 
@@ -219,5 +248,5 @@ Neither path invokes a separate system ML runtime.
 ## Compatibility Notes
 
 - Candle 0.11.0 does not compile on stable Rust 1.92 for this Apple Silicon host because its NEON `f16` code uses unstable `stdarch_neon_f16`; this project intentionally pins Candle 0.10.2.
-- Small detector/recognizer use `--det-size small --rec-size small`; tiny uses `--det-size tiny --rec-size tiny`. Tiny recognition emits 6906 logits and needs the released `ppocrv6_tiny_dict` for text decoding. This benchmark executable intentionally stops at CTC logits; use `ppocr-burn` for full OCR output.
+- Small detector/recognizer use `--det-size small --rec-size small`; tiny uses `--det-size tiny --rec-size tiny`. Tiny recognition emits 6906 logits and needs the released `ppocrv6_tiny_dict` for text decoding. The Candle CLI decodes those logits into full OCR output.
 - Validation annotations contain polygons and detector scores but no text transcription. They validate frame/crop latency and detector output shape, not end-to-end OCR accuracy.
