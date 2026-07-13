@@ -1,48 +1,41 @@
 use anyhow::{Context, Result, bail};
 use candle_core::{Device, Tensor};
-use ppocr_rs::model::{Detector, ModelSize, Recognizer};
-use ppocr_rs::preprocess::{
-    Crop, PreparedInput, load_rgb, longest_annotation_crop, prepare_detector, prepare_recognizer,
+use ppocr_rs::{
+    model::{Detector, ModelSize, Recognizer},
+    ocr::{
+        DecodedText, Detection, DetectorPostprocessOptions, Point, decode_ctc_greedy_for_input,
+        extract_detections, join_decoded_texts, load_dictionary, rectify_text_crop,
+        split_recognition_crop_for_input,
+    },
+    preprocess::{load_rgb, prepare_detector_with_transform, prepare_recognizer_from_image},
 };
 use serde::Serialize;
-use std::env;
-use std::path::PathBuf;
-use std::time::Instant;
+use std::{env, fs, path::PathBuf};
+
+const RECOGNIZER_HEIGHT: usize = 48;
+const DEFAULT_RECOGNIZER_MAX_WIDTH: u32 = 3_200;
 
 #[derive(Debug)]
 struct Args {
     det_model: PathBuf,
     rec_model: PathBuf,
     image: PathBuf,
-    annotations: PathBuf,
+    dictionary: PathBuf,
+    output: Option<PathBuf>,
     det_size: ModelSize,
     rec_size: ModelSize,
     det_max_side: Option<u32>,
     rec_max_width: Option<u32>,
     device: String,
-    warmup: usize,
-    iterations: usize,
+    postprocess: DetectorPostprocessOptions,
 }
 
 #[derive(Serialize)]
-struct Latency {
-    min_ms: f64,
-    p50_ms: f64,
-    p90_ms: f64,
-    mean_ms: f64,
-    max_ms: f64,
-}
-
-#[derive(Serialize)]
-struct ModelReport {
-    model_load_ms: f64,
-    preprocessing_ms: f64,
-    h2d_ms: Latency,
-    forward_ms: Latency,
-    h2d_and_forward_ms: Latency,
-    input_shape: Vec<usize>,
-    output_shape: Vec<usize>,
-    output_sum: f32,
+struct TextResult {
+    polygon: [Point; 4],
+    detection_score: f32,
+    text: String,
+    recognition_score: f32,
 }
 
 #[derive(Serialize)]
@@ -51,235 +44,130 @@ struct Report {
     device: String,
     image: String,
     source_shape: [u32; 2],
-    detector_size: &'static str,
-    recognizer_size: &'static str,
-    detector_max_side: Option<u32>,
+    detector_input_shape: [usize; 4],
+    detector_output_shape: Vec<usize>,
     recognizer_max_width: Option<u32>,
-    jpeg_decode_ms: f64,
-    warmup: usize,
-    iterations: usize,
-    recognition_crop: Crop,
-    detector: ModelReport,
-    recognizer: ModelReport,
+    detector_binary_threshold: f32,
+    detector_box_threshold: f32,
+    detector_unclip_ratio: f32,
+    texts: Vec<TextResult>,
+}
+
+struct TensorOutput {
+    shape: Vec<usize>,
+    values: Vec<f32>,
 }
 
 fn main() -> Result<()> {
     let args = parse_args()?;
+    args.postprocess.validate()?;
+    let dictionary = load_dictionary(&args.dictionary)?;
+    validate_dictionary(&dictionary, args.rec_size)?;
+
     let device = create_device(&args.device)?;
-
-    let decode_started = Instant::now();
     let image = load_rgb(&args.image)?;
-    let jpeg_decode_ms = elapsed_ms(decode_started);
     let source_shape = [image.width(), image.height()];
+    let detector_input = prepare_detector_with_transform(&image, args.det_max_side)?;
 
-    let detector_preprocess_started = Instant::now();
-    let detector_input = prepare_detector(&image, args.det_max_side);
-    let detector_preprocessing_ms = elapsed_ms(detector_preprocess_started);
-
-    let crop = longest_annotation_crop(&args.annotations, &args.image, &image)?;
-    let recognizer_preprocess_started = Instant::now();
-    let recognizer_input = prepare_recognizer(&image, crop, args.rec_max_width)?;
-    let recognizer_preprocessing_ms = elapsed_ms(recognizer_preprocess_started);
-
-    let detector_load_started = Instant::now();
     let detector = Detector::load(&args.det_model, &device, args.det_size)
         .with_context(|| format!("load detector {}", args.det_model.display()))?;
-    let detector_load_ms = elapsed_ms(detector_load_started);
-    let detector_report = benchmark_detector(
-        &detector,
-        &detector_input,
-        &device,
-        args.warmup,
-        args.iterations,
-        detector_load_ms,
-        detector_preprocessing_ms,
-    )?;
-
-    let recognizer_load_started = Instant::now();
     let recognizer = Recognizer::load(&args.rec_model, &device, args.rec_size)
         .with_context(|| format!("load recognizer {}", args.rec_model.display()))?;
-    let recognizer_load_ms = elapsed_ms(recognizer_load_started);
-    let recognizer_report = benchmark_recognizer(
-        &recognizer,
-        &recognizer_input,
+
+    let detector_output = read_output(
+        "detector",
+        detector.forward(&detector_input.input.to_tensor(&device)?)?,
         &device,
-        args.warmup,
-        args.iterations,
-        recognizer_load_ms,
-        recognizer_preprocessing_ms,
+    )?;
+    let detections = extract_detections(
+        &detector_output.values,
+        &detector_output.shape,
+        detector_input.transform,
+        args.postprocess,
     )?;
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&Report {
+    let chunk_width = args.rec_max_width.unwrap_or(DEFAULT_RECOGNIZER_MAX_WIDTH) as usize;
+    let mut texts = Vec::with_capacity(detections.len());
+    for detection in detections {
+        let crop = rectify_text_crop(&image, detection.polygon)?;
+        let mut decoded_chunks = Vec::new();
+        for chunk in split_recognition_crop_for_input(&crop, RECOGNIZER_HEIGHT, chunk_width)? {
+            let recognizer_input = prepare_recognizer_from_image(&chunk, args.rec_max_width)?;
+            let recognizer_output = read_output(
+                "recognizer",
+                recognizer.forward(&recognizer_input.input.to_tensor(&device)?)?,
+                &device,
+            )?;
+            decoded_chunks.push(decode_ctc_greedy_for_input(
+                &recognizer_output.values,
+                &recognizer_output.shape,
+                &dictionary,
+                recognizer_input.content_width,
+                recognizer_input.input.width,
+            )?);
+        }
+        texts.push(text_result(detection, join_decoded_texts(&decoded_chunks)));
+    }
+
+    write_report(
+        &Report {
             runtime: "candle-0.10.2-direct-safetensors",
             device: args.device,
             image: args.image.display().to_string(),
             source_shape,
-            detector_size: args.det_size.as_str(),
-            recognizer_size: args.rec_size.as_str(),
-            detector_max_side: args.det_max_side,
+            detector_input_shape: detector_input.input.shape(),
+            detector_output_shape: detector_output.shape,
             recognizer_max_width: args.rec_max_width,
-            jpeg_decode_ms,
-            warmup: args.warmup,
-            iterations: args.iterations,
-            recognition_crop: crop,
-            detector: detector_report,
-            recognizer: recognizer_report,
-        })?
-    );
+            detector_binary_threshold: args.postprocess.binary_threshold,
+            detector_box_threshold: args.postprocess.box_threshold,
+            detector_unclip_ratio: args.postprocess.unclip_ratio,
+            texts,
+        },
+        args.output.as_ref(),
+    )
+}
+
+fn validate_dictionary(dictionary: &[String], size: ModelSize) -> Result<()> {
+    let classes = size.recognizer_classes();
+    if classes != dictionary.len() + 1 && classes != dictionary.len() + 2 {
+        bail!(
+            "recognizer size {} has {classes} output classes, but the dictionary has {} entries",
+            size.as_str(),
+            dictionary.len()
+        );
+    }
     Ok(())
 }
 
-fn benchmark_detector(
-    model: &Detector,
-    input: &PreparedInput,
-    device: &Device,
-    warmup: usize,
-    iterations: usize,
-    model_load_ms: f64,
-    preprocessing_ms: f64,
-) -> Result<ModelReport> {
-    let h2d_ms = measure_h2d(input, device, iterations)?;
-    let device_input = input.to_tensor(device)?;
-    for _ in 0..warmup {
-        let _ = model.forward(&device_input)?;
-        device.synchronize()?;
+fn read_output(name: &str, output: Tensor, device: &Device) -> Result<TensorOutput> {
+    device.synchronize()?;
+    let shape = output.dims().to_vec();
+    let values = output.flatten_all()?.to_vec1::<f32>()?;
+    if values.iter().any(|value| !value.is_finite()) {
+        bail!("{name} output contains non-finite values");
     }
-    let (forward_ms, output) =
-        measure_forward(device, iterations, || model.forward(&device_input))?;
-    let h2d_and_forward_ms =
-        measure_h2d_and_forward(device, input, iterations, |tensor| model.forward(tensor))?;
-    report_from_output(
-        model_load_ms,
-        preprocessing_ms,
-        input,
-        output,
-        h2d_ms,
-        forward_ms,
-        h2d_and_forward_ms,
-    )
+    Ok(TensorOutput { shape, values })
 }
 
-fn benchmark_recognizer(
-    model: &Recognizer,
-    input: &PreparedInput,
-    device: &Device,
-    warmup: usize,
-    iterations: usize,
-    model_load_ms: f64,
-    preprocessing_ms: f64,
-) -> Result<ModelReport> {
-    let h2d_ms = measure_h2d(input, device, iterations)?;
-    let device_input = input.to_tensor(device)?;
-    for _ in 0..warmup {
-        let _ = model.forward(&device_input)?;
-        device.synchronize()?;
-    }
-    let (forward_ms, output) =
-        measure_forward(device, iterations, || model.forward(&device_input))?;
-    let h2d_and_forward_ms =
-        measure_h2d_and_forward(device, input, iterations, |tensor| model.forward(tensor))?;
-    report_from_output(
-        model_load_ms,
-        preprocessing_ms,
-        input,
-        output,
-        h2d_ms,
-        forward_ms,
-        h2d_and_forward_ms,
-    )
-}
-
-fn measure_h2d(input: &PreparedInput, device: &Device, iterations: usize) -> Result<Latency> {
-    let mut samples = Vec::with_capacity(iterations);
-    for _ in 0..iterations {
-        let started = Instant::now();
-        let _ = input.to_tensor(device)?;
-        device.synchronize()?;
-        samples.push(elapsed_ms(started));
-    }
-    Ok(latency(samples))
-}
-
-fn measure_forward<F>(
-    device: &Device,
-    iterations: usize,
-    mut forward: F,
-) -> Result<(Latency, Tensor)>
-where
-    F: FnMut() -> candle_core::Result<Tensor> + Send,
-{
-    let mut samples = Vec::with_capacity(iterations);
-    let mut output = None;
-    for _ in 0..iterations {
-        let started = Instant::now();
-        let result = forward()?;
-        device.synchronize()?;
-        samples.push(elapsed_ms(started));
-        output = Some(result);
-    }
-    Ok((latency(samples), output.expect("at least one iteration")))
-}
-
-fn measure_h2d_and_forward<F>(
-    device: &Device,
-    input: &PreparedInput,
-    iterations: usize,
-    mut forward: F,
-) -> Result<Latency>
-where
-    F: FnMut(&Tensor) -> candle_core::Result<Tensor> + Send,
-{
-    let mut samples = Vec::with_capacity(iterations);
-    for _ in 0..iterations {
-        let started = Instant::now();
-        let tensor = input.to_tensor(device)?;
-        let _ = forward(&tensor)?;
-        device.synchronize()?;
-        samples.push(elapsed_ms(started));
-    }
-    Ok(latency(samples))
-}
-
-fn report_from_output(
-    model_load_ms: f64,
-    preprocessing_ms: f64,
-    input: &PreparedInput,
-    output: Tensor,
-    h2d_ms: Latency,
-    forward_ms: Latency,
-    h2d_and_forward_ms: Latency,
-) -> Result<ModelReport> {
-    let output_shape = output.dims().to_vec();
-    let output_sum = output.sum_all()?.to_scalar::<f32>()?;
-    Ok(ModelReport {
-        model_load_ms,
-        preprocessing_ms,
-        h2d_ms,
-        forward_ms,
-        h2d_and_forward_ms,
-        input_shape: input.shape().to_vec(),
-        output_shape,
-        output_sum,
-    })
-}
-
-fn latency(mut samples: Vec<f64>) -> Latency {
-    samples.sort_by(f64::total_cmp);
-    let count = samples.len();
-    let percentile = |p: f64| samples[((count - 1) as f64 * p).round() as usize];
-    Latency {
-        min_ms: samples[0],
-        p50_ms: percentile(0.50),
-        p90_ms: percentile(0.90),
-        mean_ms: samples.iter().sum::<f64>() / count as f64,
-        max_ms: samples[count - 1],
+fn text_result(detection: Detection, decoded: DecodedText) -> TextResult {
+    TextResult {
+        polygon: detection.polygon,
+        detection_score: detection.score,
+        text: decoded.text,
+        recognition_score: decoded.score,
     }
 }
 
-fn elapsed_ms(started: Instant) -> f64 {
-    started.elapsed().as_secs_f64() * 1_000.0
+fn write_report(report: &Report, output: Option<&PathBuf>) -> Result<()> {
+    let serialized = serde_json::to_string_pretty(report).context("serialize OCR output")?;
+    match output {
+        Some(path) => fs::write(path, serialized)
+            .with_context(|| format!("write OCR output {}", path.display())),
+        None => {
+            println!("{serialized}");
+            Ok(())
+        }
+    }
 }
 
 fn create_device(value: &str) -> Result<Device> {
@@ -294,14 +182,14 @@ fn parse_args() -> Result<Args> {
     let mut det_model = None;
     let mut rec_model = None;
     let mut image = None;
-    let mut annotations = None;
+    let mut dictionary = None;
+    let mut output = None;
     let mut det_size = ModelSize::Medium;
     let mut rec_size = ModelSize::Medium;
     let mut det_max_side = None;
     let mut rec_max_width = None;
     let mut device = String::from("metal");
-    let mut warmup = 2;
-    let mut iterations = 5;
+    let mut postprocess = DetectorPostprocessOptions::default();
     let mut values = env::args().skip(1);
 
     while let Some(flag) = values.next() {
@@ -316,7 +204,8 @@ fn parse_args() -> Result<Args> {
             "--det-model" => det_model = Some(PathBuf::from(value)),
             "--rec-model" => rec_model = Some(PathBuf::from(value)),
             "--image" => image = Some(PathBuf::from(value)),
-            "--annotations" => annotations = Some(PathBuf::from(value)),
+            "--dict" => dictionary = Some(PathBuf::from(value)),
+            "--output" => output = Some(PathBuf::from(value)),
             "--det-size" => {
                 det_size = value
                     .parse()
@@ -330,26 +219,27 @@ fn parse_args() -> Result<Args> {
             "--det-max-side" => det_max_side = Some(parse_positive_u32(&value, &flag)?),
             "--rec-max-width" => rec_max_width = Some(parse_positive_u32(&value, &flag)?),
             "--device" => device = value,
-            "--warmup" => warmup = value.parse().context("parse --warmup")?,
-            "--iterations" => iterations = value.parse().context("parse --iterations")?,
-            _ => bail!("unknown argument {flag}"),
+            "--det-threshold" => postprocess.binary_threshold = parse_f32(&value, &flag)?,
+            "--box-threshold" => postprocess.box_threshold = parse_f32(&value, &flag)?,
+            "--unclip-ratio" => postprocess.unclip_ratio = parse_f32(&value, &flag)?,
+            "--min-area" => postprocess.min_area = parse_usize(&value, &flag)?,
+            "--max-boxes" => postprocess.max_boxes = parse_usize(&value, &flag)?,
+            _ => bail!("unknown argument {flag}; pass --help for usage"),
         }
     }
-    if iterations == 0 {
-        bail!("--iterations must be at least 1");
-    }
+
     Ok(Args {
         det_model: det_model.context("--det-model is required")?,
         rec_model: rec_model.context("--rec-model is required")?,
         image: image.context("--image is required")?,
-        annotations: annotations.context("--annotations is required")?,
+        dictionary: dictionary.context("--dict is required")?,
+        output,
         det_size,
         rec_size,
         det_max_side,
         rec_max_width,
         device,
-        warmup,
-        iterations,
+        postprocess,
     })
 }
 
@@ -363,8 +253,20 @@ fn parse_positive_u32(value: &str, flag: &str) -> Result<u32> {
     Ok(parsed)
 }
 
+fn parse_f32(value: &str, flag: &str) -> Result<f32> {
+    value
+        .parse::<f32>()
+        .with_context(|| format!("parse {flag}"))
+}
+
+fn parse_usize(value: &str, flag: &str) -> Result<usize> {
+    value
+        .parse::<usize>()
+        .with_context(|| format!("parse {flag}"))
+}
+
 fn print_usage() {
     println!(
-        "Usage: ppocr-rs --det-model PATH --rec-model PATH --image PATH --annotations PATH [--det-size medium|small|tiny] [--rec-size medium|small|tiny] [--det-max-side N] [--rec-max-width N] [--device cpu|metal] [--warmup N] [--iterations N]"
+        "Usage: ppocr-rs --det-model PATH --rec-model PATH --image PATH --dict PATH [--output PATH] [--det-size medium|small|tiny] [--rec-size medium|small|tiny] [--det-max-side N] [--rec-max-width N] [--device cpu|metal] [--det-threshold F32] [--box-threshold F32] [--unclip-ratio F32] [--min-area N] [--max-boxes N]"
     );
 }

@@ -16,13 +16,13 @@ use burn::{
 };
 use ppocr_rs::burn_runtime::{
     ocr::{
-        DecodedText, Detection, DetectorPostprocessOptions, Point, decode_ctc_greedy,
+        DecodedText, Detection, DetectorPostprocessOptions, Point, decode_ctc_greedy_with_width,
         extract_detections, join_decoded_texts, load_dictionary, rectify_text_crop,
-        split_recognition_crop,
+        split_recognition_crop_with_width,
     },
     preprocess::{
         PreparedInput, load_rgb, prepare_fixed_detector_with_transform,
-        prepare_fixed_recognizer_from_image,
+        prepare_fixed_recognizer_from_image_with_width, recognizer_shape_for_width,
     },
 };
 use serde::Serialize;
@@ -34,6 +34,7 @@ struct Arguments {
     image: PathBuf,
     dictionary: PathBuf,
     output: Option<PathBuf>,
+    recognizer_width: usize,
     postprocess: DetectorPostprocessOptions,
 }
 
@@ -61,6 +62,7 @@ struct OcrReport {
 pub fn run() -> Result<()> {
     let arguments = parse_arguments()?;
     arguments.postprocess.validate()?;
+    let recognizer_input_shape = recognizer_shape_for_width(arguments.recognizer_width)?;
     let image = load_rgb(&arguments.image)?;
     let source_shape = [image.width(), image.height()];
     let detector_input = prepare_fixed_detector_with_transform(&image)?;
@@ -84,16 +86,18 @@ pub fn run() -> Result<()> {
     for detection in detections {
         let crop = rectify_text_crop(&image, detection.polygon)?;
         let mut decoded_chunks = Vec::new();
-        for crop in split_recognition_crop(&crop)? {
-            let recognizer_input = prepare_fixed_recognizer_from_image(&crop)?;
+        for crop in split_recognition_crop_with_width(&crop, arguments.recognizer_width)? {
+            let recognizer_input =
+                prepare_fixed_recognizer_from_image_with_width(&crop, arguments.recognizer_width)?;
             let recognizer_tensor = to_tensor(&recognizer_input.input, &device);
             let recognizer_output =
                 read_output("recognizer", recognizer.forward(recognizer_tensor), &device)?;
-            decoded_chunks.push(decode_ctc_greedy(
+            decoded_chunks.push(decode_ctc_greedy_with_width(
                 &recognizer_output.values,
                 &recognizer_output.shape,
                 &dictionary,
                 recognizer_input.content_width,
+                arguments.recognizer_width,
             )?);
         }
         let decoded = join_decoded_texts(&decoded_chunks);
@@ -105,7 +109,7 @@ pub fn run() -> Result<()> {
         image: arguments.image.display().to_string(),
         source_shape,
         detector_input_shape: detector_input.input.shape(),
-        recognizer_input_shape: ppocr_rs::burn_runtime::preprocess::RECOGNIZER_SHAPE,
+        recognizer_input_shape,
         detector_binary_threshold: arguments.postprocess.binary_threshold,
         detector_box_threshold: arguments.postprocess.box_threshold,
         detector_unclip_ratio: arguments.postprocess.unclip_ratio,
@@ -168,6 +172,8 @@ fn parse_arguments() -> Result<Arguments> {
     let mut image = None;
     let mut dictionary = None;
     let mut output = None;
+    let embedded_width = embedded_recognizer_width();
+    let mut recognizer_width = embedded_width;
     let mut postprocess = DetectorPostprocessOptions::default();
     let mut arguments = env::args_os().skip(1);
 
@@ -176,6 +182,10 @@ fn parse_arguments() -> Result<Arguments> {
             "--image" => image = Some(PathBuf::from(next_value(&mut arguments, "--image")?)),
             "--dict" => dictionary = Some(PathBuf::from(next_value(&mut arguments, "--dict")?)),
             "--output" => output = Some(PathBuf::from(next_value(&mut arguments, "--output")?)),
+            "--rec-width" => {
+                recognizer_width =
+                    parse_usize(next_value(&mut arguments, "--rec-width")?, "--rec-width")?
+            }
             "--det-threshold" => {
                 postprocess.binary_threshold = parse_f32(
                     next_value(&mut arguments, "--det-threshold")?,
@@ -210,12 +220,25 @@ fn parse_arguments() -> Result<Arguments> {
         }
     }
 
+    if recognizer_width != embedded_width {
+        bail!(
+            "--rec-width {recognizer_width} does not match the recognizer ONNX width {embedded_width} embedded at build time"
+        );
+    }
+
     Ok(Arguments {
         image: image.context("--image PATH is required")?,
         dictionary: dictionary.context("--dict PATH is required")?,
         output,
+        recognizer_width,
         postprocess,
     })
+}
+
+fn embedded_recognizer_width() -> usize {
+    env!("PPOCR_BURN_RECOGNIZER_WIDTH")
+        .parse()
+        .expect("build script emits a valid recognizer width")
 }
 
 fn next_value(
@@ -245,6 +268,6 @@ fn parse_usize(value: std::ffi::OsString, flag: &str) -> Result<usize> {
 
 pub fn print_usage() {
     println!(
-        "usage: ppocr-burn --image PATH --dict PATH [--output PATH] [--det-threshold F32] [--box-threshold F32] [--unclip-ratio F32] [--min-area N] [--max-boxes N]"
+        "usage: ppocr-burn --image PATH --dict PATH [--output PATH] [--rec-width N] [--det-threshold F32] [--box-threshold F32] [--unclip-ratio F32] [--min-area N] [--max-boxes N]"
     );
 }

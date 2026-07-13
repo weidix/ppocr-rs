@@ -16,7 +16,7 @@ fn main() -> anyhow::Result<()> {
         .any(|argument| matches!(argument.to_str(), Some("--help") | Some("-h")))
     {
         println!(
-            "usage: ppocr-burn --image PATH --dict PATH [--output PATH] [--det-threshold F32] [--box-threshold F32] [--unclip-ratio F32] [--min-area N] [--max-boxes N]"
+            "usage: ppocr-burn --image PATH --dict PATH [--output PATH] [--rec-width N] [--det-threshold F32] [--box-threshold F32] [--unclip-ratio F32] [--min-area N] [--max-boxes N]"
         );
         return Ok(());
     }

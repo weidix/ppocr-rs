@@ -21,6 +21,13 @@ impl ModelSize {
             Self::Tiny => "tiny",
         }
     }
+
+    pub const fn recognizer_classes(self) -> usize {
+        match self {
+            Self::Medium | Self::Small => 18_710,
+            Self::Tiny => 6_906,
+        }
+    }
 }
 
 impl FromStr for ModelSize {

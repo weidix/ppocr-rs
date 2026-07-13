@@ -1,8 +1,14 @@
 #[cfg(feature = "burn-infer")]
 use burn_onnx::{LoadStrategy, ModelGen};
 #[cfg(feature = "burn-infer")]
+use onnx_ir_build::ModelProto;
+#[cfg(feature = "burn-infer")]
+use protobuf_build::Message;
+#[cfg(feature = "burn-infer")]
 use std::{
     env,
+    fs::File,
+    io::BufReader,
     path::{Path, PathBuf},
 };
 
@@ -46,6 +52,73 @@ fn generate(source: &Path, name: &str) {
 }
 
 #[cfg(feature = "burn-infer")]
+fn recognizer_width(source: &Path) -> usize {
+    let input = File::open(source)
+        .unwrap_or_else(|error| panic!("open recognizer ONNX {}: {error}", source.display()));
+    let mut input = BufReader::new(input);
+    let model = ModelProto::parse_from_reader(&mut input)
+        .unwrap_or_else(|error| panic!("decode recognizer ONNX {}: {error}", source.display()));
+    let graph = model
+        .graph
+        .as_ref()
+        .unwrap_or_else(|| panic!("recognizer ONNX {} has no graph", source.display()));
+    if graph.input.len() != 1 {
+        panic!(
+            "recognizer ONNX {} must have exactly one graph input, found {}",
+            source.display(),
+            graph.input.len()
+        );
+    }
+    let input = &graph.input[0];
+    let type_proto = input.type_.as_ref().unwrap_or_else(|| {
+        panic!(
+            "recognizer ONNX {} input {:?} has no type",
+            source.display(),
+            input.name
+        )
+    });
+    if !type_proto.has_tensor_type() {
+        panic!(
+            "recognizer ONNX {} input {:?} is not a tensor",
+            source.display(),
+            input.name
+        );
+    }
+    let tensor_type = type_proto.tensor_type();
+    let shape = tensor_type.shape.as_ref().unwrap_or_else(|| {
+        panic!(
+            "recognizer ONNX {} input {:?} has no shape",
+            source.display(),
+            input.name
+        )
+    });
+    let dimensions = shape
+        .dim
+        .iter()
+        .map(|dimension| dimension.dim_value())
+        .collect::<Vec<_>>();
+    if dimensions.len() != 4
+        || dimensions[0] != 1
+        || dimensions[1] != 3
+        || dimensions[2] != 48
+        || dimensions[3] <= 0
+    {
+        panic!(
+            "recognizer ONNX {} input {:?} must have fixed shape [1, 3, 48, width], found {dimensions:?}",
+            source.display(),
+            input.name
+        );
+    }
+    usize::try_from(dimensions[3]).unwrap_or_else(|_| {
+        panic!(
+            "recognizer ONNX {} width {} does not fit usize",
+            source.display(),
+            dimensions[3]
+        )
+    })
+}
+
+#[cfg(feature = "burn-infer")]
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(ppocr_burn_models)");
     for variable in ["PPOCR_BURN_DET_ONNX", "PPOCR_BURN_REC_ONNX"] {
@@ -67,6 +140,9 @@ fn main() {
     };
     println!("cargo:rerun-if-changed={}", detector.display());
     println!("cargo:rerun-if-changed={}", recognizer.display());
+
+    let recognizer_width = recognizer_width(&recognizer);
+    println!("cargo:rustc-env=PPOCR_BURN_RECOGNIZER_WIDTH={recognizer_width}");
 
     generate(&detector, "detector");
     generate(&recognizer, "recognizer");

@@ -107,6 +107,20 @@ and at most 1,000 boxes. All values can be adjusted through `--help`. The bounde
 avoid dynamic-shape compilation behavior, and the runtime synchronizes before every output
 readback.
 
+For long lines, build a wider fixed recognizer and pass its width to `ppocr-burn`; the command
+line width must exactly match the ONNX shape used during Burn model generation:
+
+```sh
+cargo run --release --no-default-features --features onnx-tools \
+  --bin ppocr-onnx-staticize -- rec.onnx /tmp/rec-fixed-1024.onnx --shape 1 3 48 1024
+
+PPOCR_BURN_DET_ONNX=/tmp/det-fixed.onnx \
+PPOCR_BURN_REC_ONNX=/tmp/rec-fixed-1024.onnx \
+cargo run --release --no-default-features --features burn-infer \
+  --bin ppocr-burn -- \
+  --image /path/to/image.jpg --dict /path/to/inference.yml --rec-width 1024 --output /tmp/ocr.json
+```
+
 ## Burn Metal Probe
 
 Burn is an opt-in runtime feature of this crate. It imports official ONNX once at build time,
@@ -132,6 +146,8 @@ cargo run --release --no-default-features --features burn-bench \
 
 `--annotations` is optional. The benchmark validates detector shape `[1,3,416,736]` and fixes
 recognition to `[1,3,48,320]`; preprocessing and model loading are outside timed loops.
+`ppocr-burn-bench` therefore must be built with a recognizer staticized at width `320`; use
+`ppocr-burn --rec-width N` for wide recognizer models.
 
 The benchmark vendors a narrow `burn-cubecl` patch: with autotune disabled, compatible
 ungrouped 1x1 convolutions use Burn's existing im2col/matmul implementation; every other

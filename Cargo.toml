@@ -27,7 +27,12 @@ onnx-tools = ["dep:onnx-ir", "dep:protobuf"]
 burn = ["dep:burn", "dep:burn-store"]
 burn-metal = ["burn", "burn/metal", "burn/fusion"]
 burn-autotune = ["burn-metal", "burn/autotune"]
-burn-infer = ["burn-metal", "dep:burn-onnx"]
+burn-infer = [
+    "burn-metal",
+    "dep:burn-onnx",
+    "dep:onnx-ir-build",
+    "dep:protobuf-build",
+]
 burn-bench = ["burn-infer"]
 
 [dependencies]
@@ -47,6 +52,8 @@ serde_json = "1.0"
 
 [build-dependencies]
 burn-onnx = { version = "=0.21.0", optional = true }
+onnx-ir-build = { package = "onnx-ir", version = "=0.21.0", optional = true }
+protobuf-build = { package = "protobuf", version = "=3.7.2", optional = true }
 
 [patch.crates-io]
 burn-cubecl = { path = "vendor/burn-cubecl" }

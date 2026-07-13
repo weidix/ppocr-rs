@@ -15,6 +15,11 @@ const REC_STD_BGR: [f32; 3] = [0.5, 0.5, 0.5];
 pub const DETECTOR_SHAPE: [usize; 4] = [1, 3, 416, 736];
 pub const RECOGNIZER_SHAPE: [usize; 4] = [1, 3, 48, 320];
 
+pub fn recognizer_shape_for_width(width: usize) -> Result<[usize; 4]> {
+    validate_recognizer_width(width)?;
+    Ok([1, 3, RECOGNIZER_SHAPE[2], width])
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedInput {
     pub data: Vec<f32>,
@@ -147,10 +152,17 @@ pub fn prepare_fixed_recognizer(
 }
 
 pub fn prepare_fixed_recognizer_from_image(image: &RgbImage) -> Result<FixedRecognizerInput> {
+    prepare_fixed_recognizer_from_image_with_width(image, RECOGNIZER_SHAPE[3])
+}
+
+pub fn prepare_fixed_recognizer_from_image_with_width(
+    image: &RgbImage,
+    width: usize,
+) -> Result<FixedRecognizerInput> {
     if image.width() == 0 || image.height() == 0 {
         bail!("recognizer image must be non-empty");
     }
-    prepare_recognizer_image(image, RECOGNIZER_SHAPE[3] as u32)
+    prepare_recognizer_image(image, validate_recognizer_width(width)?)
 }
 
 fn prepare_fixed_recognizer_from_crop(
@@ -329,6 +341,13 @@ fn prepare_recognizer_image(image: &RgbImage, canvas_width: u32) -> Result<Fixed
     })
 }
 
+fn validate_recognizer_width(width: usize) -> Result<u32> {
+    if width == 0 {
+        bail!("recognizer width must be greater than zero");
+    }
+    u32::try_from(width).context("recognizer width exceeds supported image dimensions")
+}
+
 fn normalized_bgr(
     image: &RgbImage,
     canvas_height: usize,
@@ -396,6 +415,25 @@ mod tests {
         let expected = (127.0 / 255.0 - 0.5) / 0.5;
         assert!((prepared.input.data[0] - expected).abs() < 1e-6);
         assert_eq!(prepared.input.data[48], 0.0);
+    }
+
+    #[test]
+    fn recognizer_supports_a_wide_fixed_input() {
+        let image = RgbImage::from_pixel(100, 20, Rgb([127, 127, 127]));
+        let prepared = prepare_fixed_recognizer_from_image_with_width(&image, 1024)
+            .expect("prepare recognizer");
+
+        assert_eq!(recognizer_shape_for_width(1024).unwrap(), [1, 3, 48, 1024]);
+        assert_eq!(prepared.input.shape(), [1, 3, 48, 1024]);
+        assert_eq!(prepared.content_width, 240);
+        assert_eq!(prepared.input.data[240], 0.0);
+    }
+
+    #[test]
+    fn recognizer_rejects_a_zero_fixed_width() {
+        let image = RgbImage::from_pixel(1, 1, Rgb([0, 0, 0]));
+        assert!(prepare_fixed_recognizer_from_image_with_width(&image, 0).is_err());
+        assert!(recognizer_shape_for_width(0).is_err());
     }
 
     #[test]

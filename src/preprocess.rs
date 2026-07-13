@@ -1,3 +1,4 @@
+use crate::ocr::DetectorTransform;
 use anyhow::{Context, Result, bail};
 use candle_core::{Device, Tensor};
 use image::{ImageReader, RgbImage, imageops, imageops::FilterType};
@@ -29,6 +30,18 @@ impl PreparedInput {
     }
 }
 
+#[derive(Clone)]
+pub struct PreparedDetectorInput {
+    pub input: PreparedInput,
+    pub transform: DetectorTransform,
+}
+
+#[derive(Clone)]
+pub struct PreparedRecognizerInput {
+    pub input: PreparedInput,
+    pub content_width: usize,
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Crop {
     pub x: u32,
@@ -47,7 +60,19 @@ pub fn load_rgb(path: impl AsRef<Path>) -> Result<RgbImage> {
 }
 
 pub fn prepare_detector(image: &RgbImage, max_side: Option<u32>) -> PreparedInput {
+    prepare_detector_with_transform(image, max_side)
+        .expect("detector input requires a non-empty image")
+        .input
+}
+
+pub fn prepare_detector_with_transform(
+    image: &RgbImage,
+    max_side: Option<u32>,
+) -> Result<PreparedDetectorInput> {
     let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        bail!("detector image must be non-empty");
+    }
     let ratio = match max_side {
         Some(limit) => (f64::from(limit) / f64::from(width.max(height))).min(1.0),
         None => {
@@ -66,7 +91,10 @@ pub fn prepare_detector(image: &RgbImage, max_side: Option<u32>) -> PreparedInpu
     let target_height = ((f64::from(height) * ratio / 32.0).round() as u32).max(1) * 32;
     let target_width = ((f64::from(width) * ratio / 32.0).round() as u32).max(1) * 32;
     let resized = imageops::resize(image, target_width, target_height, FilterType::Triangle);
-    normalized_bgr(&resized, target_width as usize, &DET_MEAN_BGR, &DET_STD_BGR)
+    Ok(PreparedDetectorInput {
+        input: normalized_bgr(&resized, target_width as usize, &DET_MEAN_BGR, &DET_STD_BGR),
+        transform: DetectorTransform::new(width, height, target_width, target_height)?,
+    })
 }
 
 pub fn longest_annotation_crop(
@@ -153,24 +181,48 @@ pub fn prepare_recognizer(
     crop: Crop,
     max_width: Option<u32>,
 ) -> Result<PreparedInput> {
-    if crop.width == 0 || crop.height == 0 {
-        bail!("recognizer crop must be non-empty");
+    Ok(prepare_recognizer_from_image(&crop_image(image, crop)?, max_width)?.input)
+}
+
+pub fn prepare_recognizer_from_image(
+    image: &RgbImage,
+    max_width: Option<u32>,
+) -> Result<PreparedRecognizerInput> {
+    if image.width() == 0 || image.height() == 0 {
+        bail!("recognizer image must be non-empty");
     }
-    let cropped = imageops::crop_imm(image, crop.x, crop.y, crop.width, crop.height).to_image();
-    let source_ratio = f64::from(crop.width) / f64::from(crop.height);
+    if let Some(max_width) = max_width {
+        if max_width < 320 {
+            bail!("recognizer maximum width must be at least 320 pixels");
+        }
+    }
+    let source_ratio = f64::from(image.width()) / f64::from(image.height());
     let canvas_width = max_width.unwrap_or_else(|| {
         ((48.0 * source_ratio.max(320.0 / 48.0)) as u32)
             .max(320)
             .min(3200)
     });
     let resized_width = ((48.0 * source_ratio).ceil() as u32).min(canvas_width);
-    let resized = imageops::resize(&cropped, resized_width, 48, FilterType::Triangle);
-    Ok(normalized_bgr(
-        &resized,
-        canvas_width as usize,
-        &REC_MEAN_BGR,
-        &REC_STD_BGR,
-    ))
+    let resized = imageops::resize(image, resized_width, 48, FilterType::Triangle);
+    Ok(PreparedRecognizerInput {
+        input: normalized_bgr(&resized, canvas_width as usize, &REC_MEAN_BGR, &REC_STD_BGR),
+        content_width: resized_width as usize,
+    })
+}
+
+fn crop_image(image: &RgbImage, crop: Crop) -> Result<RgbImage> {
+    if crop.width == 0 || crop.height == 0 {
+        bail!("recognizer crop must be non-empty");
+    }
+    let (image_width, image_height) = image.dimensions();
+    if crop.x >= image_width
+        || crop.y >= image_height
+        || crop.width > image_width - crop.x
+        || crop.height > image_height - crop.y
+    {
+        bail!("recognizer crop is outside the image bounds");
+    }
+    Ok(imageops::crop_imm(image, crop.x, crop.y, crop.width, crop.height).to_image())
 }
 
 fn normalized_bgr(
@@ -218,6 +270,17 @@ mod tests {
     }
 
     #[test]
+    fn detector_transform_maps_resized_coordinates_back_to_the_source() {
+        let image = RgbImage::from_pixel(1920, 1080, Rgb([0, 0, 0]));
+        let prepared =
+            prepare_detector_with_transform(&image, Some(736)).expect("prepare detector input");
+
+        assert_eq!(prepared.input.shape(), [1, 3, 416, 736]);
+        assert!((prepared.transform.map_x_to_source(736.0) - 1920.0).abs() < 1e-4);
+        assert!((prepared.transform.map_y_to_source(416.0) - 1080.0).abs() < 1e-4);
+    }
+
+    #[test]
     fn recognizer_uses_half_normalization_and_zero_padding() {
         let image = RgbImage::from_pixel(1, 1, Rgb([127, 127, 127]));
         let prepared = prepare_recognizer(
@@ -236,5 +299,15 @@ mod tests {
         let expected = (127.0 / 255.0 - 0.5) / 0.5;
         assert!((prepared.data[0] - expected).abs() < 1e-6);
         assert_eq!(prepared.data[48], 0.0);
+    }
+
+    #[test]
+    fn recognizer_reports_the_unpadded_content_width() {
+        let image = RgbImage::from_pixel(80, 20, Rgb([127, 127, 127]));
+        let prepared =
+            prepare_recognizer_from_image(&image, Some(320)).expect("prepare recognizer input");
+
+        assert_eq!(prepared.input.shape(), [1, 3, 48, 320]);
+        assert_eq!(prepared.content_width, 192);
     }
 }

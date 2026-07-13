@@ -1,13 +1,60 @@
-use crate::burn_runtime::preprocess::{DetectorTransform, RECOGNIZER_SHAPE};
 use anyhow::{Context, Result, bail};
 use image::{Rgb, RgbImage, imageops};
 use serde::Serialize;
 use std::{collections::VecDeque, fs, path::Path};
 
+pub const RECOGNIZER_INPUT_HEIGHT: usize = 48;
+pub const RECOGNIZER_INPUT_WIDTH: usize = 320;
+
 const MAX_RECTIFIED_EDGE: f32 = 4_096.0;
 const MAX_RECTIFIED_PIXELS: f32 = 8_000_000.0;
 const MAX_RECOGNITION_CHUNKS: usize = 64;
 const PROBABILITY_EPSILON: f32 = 1e-8;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DetectorTransform {
+    source_width: u32,
+    source_height: u32,
+    content_width: u32,
+    content_height: u32,
+}
+
+impl DetectorTransform {
+    pub fn new(
+        source_width: u32,
+        source_height: u32,
+        content_width: u32,
+        content_height: u32,
+    ) -> Result<Self> {
+        if source_width == 0 || source_height == 0 || content_width == 0 || content_height == 0 {
+            bail!("detector transform dimensions must be non-zero");
+        }
+        Ok(Self {
+            source_width,
+            source_height,
+            content_width,
+            content_height,
+        })
+    }
+
+    pub fn content_width(self) -> u32 {
+        self.content_width
+    }
+
+    pub fn content_height(self) -> u32 {
+        self.content_height
+    }
+
+    pub fn map_x_to_source(self, x: f32) -> f32 {
+        (x * self.source_width as f32 / self.content_width as f32)
+            .clamp(0.0, self.source_width as f32)
+    }
+
+    pub fn map_y_to_source(self, y: f32) -> f32 {
+        (y * self.source_height as f32 / self.content_height as f32)
+            .clamp(0.0, self.source_height as f32)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Point(pub f32, pub f32);
@@ -62,24 +109,21 @@ pub struct DecodedText {
     pub score: f32,
 }
 
-pub fn split_recognition_crop(image: &RgbImage) -> Result<Vec<RgbImage>> {
-    split_recognition_crop_with_width(image, RECOGNIZER_SHAPE[3])
-}
-
-pub fn split_recognition_crop_with_width(
+pub fn split_recognition_crop_for_input(
     image: &RgbImage,
-    recognizer_width: usize,
+    input_height: usize,
+    input_width: usize,
 ) -> Result<Vec<RgbImage>> {
     if image.width() == 0 || image.height() == 0 {
         bail!("cannot split an empty recognition crop");
     }
-    if recognizer_width == 0 {
-        bail!("recognizer width must be greater than zero");
+    if input_height == 0 || input_width == 0 {
+        bail!("recognizer input dimensions must be non-zero");
     }
     let max_width = (image.height() as usize)
-        .checked_mul(recognizer_width)
+        .checked_mul(input_width)
         .context("recognition crop width overflow")?
-        / RECOGNIZER_SHAPE[2];
+        / input_height;
     let max_width = u32::try_from(max_width.max(1)).context("recognition crop width overflow")?;
     if image.width() <= max_width {
         return Ok(vec![image.clone()]);
@@ -144,11 +188,10 @@ pub fn extract_detections(
 
     let content_width = usize::min(transform.content_width() as usize, width);
     let content_height = usize::min(transform.content_height() as usize, height);
-    if content_width == 0 || content_height == 0 {
-        bail!("detector transform has an empty content region");
-    }
-
-    let mut visited = vec![false; content_width * content_height];
+    let visited_len = content_width
+        .checked_mul(content_height)
+        .context("detector content area overflow")?;
+    let mut visited = vec![false; visited_len];
     let mut detections = Vec::new();
     for y in 0..content_height {
         for x in 0..content_width {
@@ -173,8 +216,7 @@ pub fn extract_detections(
             if score < options.box_threshold {
                 continue;
             }
-            let polygon = fit_rotated_box(&component.points, options.unclip_ratio);
-            let polygon = polygon.map(|point| {
+            let polygon = fit_rotated_box(&component.points, options.unclip_ratio).map(|point| {
                 Point(
                     transform.map_x_to_source(point.0),
                     transform.map_y_to_source(point.1),
@@ -216,7 +258,6 @@ pub fn rectify_text_crop(image: &RgbImage, polygon: [Point; 4]) -> Result<RgbIma
     let height = distance(polygon[0], polygon[3]).max(distance(polygon[1], polygon[2]));
     let (output_width, output_height) = bounded_crop_dimensions(width, height)?;
     let mut output = RgbImage::new(output_width, output_height);
-
     for y in 0..output_height {
         let v = (y as f32 + 0.5) / output_height as f32;
         for x in 0..output_width {
@@ -236,9 +277,65 @@ pub fn load_dictionary(path: impl AsRef<Path>) -> Result<Vec<String>> {
     let path = path.as_ref();
     let contents = fs::read_to_string(path)
         .with_context(|| format!("read recognition dictionary {}", path.display()))?;
-    let entries = parse_dictionary(&contents)
-        .with_context(|| format!("parse recognition dictionary {}", path.display()))?;
-    Ok(entries)
+    parse_dictionary(&contents)
+        .with_context(|| format!("parse recognition dictionary {}", path.display()))
+}
+
+pub fn decode_ctc_greedy_for_input(
+    values: &[f32],
+    shape: &[usize],
+    dictionary: &[String],
+    content_width: usize,
+    input_width: usize,
+) -> Result<DecodedText> {
+    let (time_steps, classes) = recognizer_output_shape(shape, values.len())?;
+    let implicit_space_class = classes == dictionary.len().saturating_add(2);
+    if classes != dictionary.len() + 1 && !implicit_space_class {
+        bail!(
+            "recognizer output has {classes} classes, but the dictionary has {} entries; expected dictionary entries plus the CTC blank class",
+            dictionary.len()
+        );
+    }
+    if content_width == 0 || content_width > input_width {
+        bail!("recognizer content width {content_width} is outside 1..={input_width}");
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        bail!("recognizer output contains non-finite values");
+    }
+
+    let valid_steps = (content_width
+        .checked_mul(time_steps)
+        .context("recognizer time-step calculation overflow")?
+        + input_width
+        - 1)
+        / input_width;
+    let valid_steps = valid_steps.clamp(1, time_steps);
+    let mut text = String::new();
+    let mut log_score = 0.0f64;
+    let mut emitted = 0usize;
+    let mut previous = 0usize;
+    for time in 0..valid_steps {
+        let row = &values[time * classes..(time + 1) * classes];
+        let (class, value) = argmax(row);
+        if class != 0 && class != previous {
+            if implicit_space_class && class == classes - 1 {
+                text.push(' ');
+            } else {
+                text.push_str(&dictionary[class - 1]);
+            }
+            log_score += f64::from(row_probability(row, value).max(PROBABILITY_EPSILON)).ln();
+            emitted += 1;
+        }
+        previous = class;
+    }
+    Ok(DecodedText {
+        text,
+        score: if emitted == 0 {
+            0.0
+        } else {
+            (log_score / emitted as f64).exp() as f32
+        },
+    })
 }
 
 fn parse_dictionary(contents: &str) -> Result<Vec<String>> {
@@ -280,10 +377,9 @@ fn parse_paddlex_character_dict(contents: &str) -> Result<Option<Vec<String>>> {
             if entry_line.trim().is_empty() {
                 continue;
             }
-            let trimmed_start = entry_line.trim_start();
-            let Some(value) = trimmed_start.strip_prefix("- ") else {
-                let entry_indentation = entry_line.len() - trimmed_start.len();
-                if entry_indentation <= indentation {
+            let trimmed = entry_line.trim_start();
+            let Some(value) = trimmed.strip_prefix("- ") else {
+                if entry_line.len() - trimmed.len() <= indentation {
                     break;
                 }
                 bail!(
@@ -314,93 +410,6 @@ fn parse_yaml_scalar(value: &str, line: usize) -> Result<String> {
     Ok(value.to_owned())
 }
 
-pub fn decode_ctc_greedy(
-    values: &[f32],
-    shape: &[usize],
-    dictionary: &[String],
-    content_width: usize,
-) -> Result<DecodedText> {
-    decode_ctc_greedy_with_width(
-        values,
-        shape,
-        dictionary,
-        content_width,
-        RECOGNIZER_SHAPE[3],
-    )
-}
-
-pub fn decode_ctc_greedy_with_width(
-    values: &[f32],
-    shape: &[usize],
-    dictionary: &[String],
-    content_width: usize,
-    recognizer_width: usize,
-) -> Result<DecodedText> {
-    let (time_steps, classes) = recognizer_output_shape(shape, values.len())?;
-    let implicit_space_class = classes == dictionary.len().saturating_add(2);
-    if classes != dictionary.len() + 1 && !implicit_space_class {
-        bail!(
-            "recognizer output has {classes} classes, but the dictionary has {} entries; expected dictionary entries plus the CTC blank class",
-            dictionary.len()
-        );
-    }
-    if recognizer_width == 0 {
-        bail!("recognizer width must be greater than zero");
-    }
-    if content_width == 0 || content_width > recognizer_width {
-        bail!(
-            "recognizer content width {content_width} is outside 1..={}",
-            recognizer_width
-        );
-    }
-    if values.iter().any(|value| !value.is_finite()) {
-        bail!("recognizer output contains non-finite values");
-    }
-
-    let valid_steps = (content_width
-        .checked_mul(time_steps)
-        .context("recognizer time-step calculation overflow")?
-        + recognizer_width
-        - 1)
-        / recognizer_width;
-    let valid_steps = valid_steps.clamp(1, time_steps);
-    let mut text = String::new();
-    let mut log_score = 0.0f64;
-    let mut emitted = 0usize;
-    let mut previous = 0usize;
-
-    for time in 0..valid_steps {
-        let row = &values[time * classes..(time + 1) * classes];
-        let (class, value) = argmax(row);
-        if class != 0 && class != previous {
-            if implicit_space_class && class == classes - 1 {
-                text.push(' ');
-            } else {
-                text.push_str(&dictionary[class - 1]);
-            }
-            log_score += f64::from(row_probability(row, value).max(PROBABILITY_EPSILON)).ln();
-            emitted += 1;
-        }
-        previous = class;
-    }
-
-    Ok(DecodedText {
-        text,
-        score: if emitted == 0 {
-            0.0
-        } else {
-            (log_score / emitted as f64).exp() as f32
-        },
-    })
-}
-
-fn validate_probability(value: f32, name: &str) -> Result<()> {
-    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-        bail!("{name} must be a finite value between zero and one");
-    }
-    Ok(())
-}
-
 fn detector_output_shape(shape: &[usize], value_len: usize) -> Result<(usize, usize)> {
     if shape.len() != 4 || shape[0] != 1 || shape[1] != 1 || shape[2] == 0 || shape[3] == 0 {
         bail!("detector output shape {shape:?}, expected [1, 1, height, width]");
@@ -425,6 +434,13 @@ fn recognizer_output_shape(shape: &[usize], value_len: usize) -> Result<(usize, 
         bail!("recognizer output has {value_len} values, expected {expected} for shape {shape:?}");
     }
     Ok((shape[1], shape[2]))
+}
+
+fn validate_probability(value: f32, name: &str) -> Result<()> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        bail!("{name} must be a finite value between zero and one");
+    }
+    Ok(())
 }
 
 struct Component {
@@ -453,17 +469,14 @@ fn collect_component(
         (0, 1),
         (1, 1),
     ];
-
     let mut queue = VecDeque::new();
     queue.push_back((start_x, start_y));
     visited[start_y * content_width + start_x] = true;
     let mut points = Vec::new();
     let mut score_sum = 0.0;
-
     while let Some((x, y)) = queue.pop_front() {
-        let value = values[y * output_width + x];
         points.push(Point(x as f32 + 0.5, y as f32 + 0.5));
-        score_sum += f64::from(value);
+        score_sum += f64::from(values[y * output_width + x]);
         for (offset_x, offset_y) in NEIGHBORS {
             let next_x = x as isize + offset_x;
             let next_y = y as isize + offset_y;
@@ -477,14 +490,12 @@ fn collect_component(
             let next_x = next_x as usize;
             let next_y = next_y as usize;
             let next_index = next_y * content_width + next_x;
-            if visited[next_index] || values[next_y * output_width + next_x] < threshold {
-                continue;
+            if !visited[next_index] && values[next_y * output_width + next_x] >= threshold {
+                visited[next_index] = true;
+                queue.push_back((next_x, next_y));
             }
-            visited[next_index] = true;
-            queue.push_back((next_x, next_y));
         }
     }
-
     Component { points, score_sum }
 }
 
@@ -532,7 +543,6 @@ fn fit_rotated_box(points: &[Point], unclip_ratio: f32) -> [Point; 4] {
         center,
         add(scale(axis, axis_center), scale(normal, normal_center)),
     );
-
     [
         add(
             center,
@@ -579,9 +589,10 @@ fn bounded_crop_dimensions(width: f32, height: f32) -> Result<(u32, u32)> {
     let edge_scale = (MAX_RECTIFIED_EDGE / width.max(height)).min(1.0);
     let pixel_scale = (MAX_RECTIFIED_PIXELS / (width * height)).sqrt().min(1.0);
     let scale = edge_scale.min(pixel_scale);
-    let width = (width * scale).round().clamp(1.0, MAX_RECTIFIED_EDGE) as u32;
-    let height = (height * scale).round().clamp(1.0, MAX_RECTIFIED_EDGE) as u32;
-    Ok((width, height))
+    Ok((
+        (width * scale).round().clamp(1.0, MAX_RECTIFIED_EDGE) as u32,
+        (height * scale).round().clamp(1.0, MAX_RECTIFIED_EDGE) as u32,
+    ))
 }
 
 fn bilinear_quad(polygon: [Point; 4], u: f32, v: f32) -> Point {
@@ -615,14 +626,6 @@ fn sample_bilinear(image: &RgbImage, point: Point) -> Rgb<u8> {
     Rgb(pixel)
 }
 
-fn argmax(row: &[f32]) -> (usize, f32) {
-    row.iter()
-        .copied()
-        .enumerate()
-        .max_by(|(_, left), (_, right)| left.total_cmp(right))
-        .expect("recognizer output rows are non-empty")
-}
-
 fn row_probability(row: &[f32], value: f32) -> f32 {
     let sum = row.iter().sum::<f32>();
     if row.iter().all(|candidate| *candidate >= 0.0) && (sum - 1.0).abs() <= 0.01 {
@@ -636,20 +639,12 @@ fn row_probability(row: &[f32], value: f32) -> f32 {
     ((value - maximum).exp() / denominator).clamp(0.0, 1.0)
 }
 
-fn dot(left: Point, right: Point) -> f32 {
-    left.0 * right.0 + left.1 * right.1
-}
-
-fn add(left: Point, right: Point) -> Point {
-    Point(left.0 + right.0, left.1 + right.1)
-}
-
-fn scale(point: Point, factor: f32) -> Point {
-    Point(point.0 * factor, point.1 * factor)
-}
-
-fn distance(left: Point, right: Point) -> f32 {
-    ((left.0 - right.0).powi(2) + (left.1 - right.1).powi(2)).sqrt()
+fn argmax(row: &[f32]) -> (usize, f32) {
+    row.iter()
+        .copied()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .expect("recognizer output rows are non-empty")
 }
 
 fn append_with_overlap(target: &mut String, next: &str) -> usize {
@@ -671,49 +666,39 @@ fn append_with_overlap(target: &mut String, next: &str) -> usize {
     next_chars.len() - overlap
 }
 
+fn dot(left: Point, right: Point) -> f32 {
+    left.0 * right.0 + left.1 * right.1
+}
+
+fn add(left: Point, right: Point) -> Point {
+    Point(left.0 + right.0, left.1 + right.1)
+}
+
+fn scale(point: Point, factor: f32) -> Point {
+    Point(point.0 * factor, point.1 * factor)
+}
+
+fn distance(left: Point, right: Point) -> f32 {
+    ((left.0 - right.0).powi(2) + (left.1 - right.1).powi(2)).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::burn_runtime::preprocess::prepare_fixed_detector_with_transform;
     use image::Rgb;
 
     #[test]
-    fn detector_postprocess_ignores_letterbox_padding() {
-        let image = RgbImage::from_pixel(400, 400, Rgb([0, 0, 0]));
-        let input = prepare_fixed_detector_with_transform(&image).expect("prepare detector");
-        let mut values = vec![0.0; DETECTOR_SHAPE_AREA];
-        values[20 * 736 + 500] = 0.9;
-
-        let detections = extract_detections(
-            &values,
-            &[1, 1, 416, 736],
-            input.transform,
-            DetectorPostprocessOptions {
-                min_area: 1,
-                unclip_ratio: 1.0,
-                ..Default::default()
-            },
-        )
-        .expect("postprocess detector");
-
-        assert!(detections.is_empty());
-    }
-
-    #[test]
-    fn detector_postprocess_maps_a_component_back_to_source_coordinates() {
-        let image = RgbImage::from_pixel(736, 416, Rgb([0, 0, 0]));
-        let input = prepare_fixed_detector_with_transform(&image).expect("prepare detector");
-        let mut values = vec![0.0; DETECTOR_SHAPE_AREA];
+    fn detector_postprocess_maps_components_to_source_coordinates() {
+        let mut values = vec![0.0; 416 * 736];
         for y in 20..22 {
             for x in 10..14 {
                 values[y * 736 + x] = 0.9;
             }
         }
-
         let detections = extract_detections(
             &values,
             &[1, 1, 416, 736],
-            input.transform,
+            DetectorTransform::new(736, 416, 736, 416).expect("transform"),
             DetectorPostprocessOptions {
                 min_area: 4,
                 unclip_ratio: 1.0,
@@ -724,167 +709,43 @@ mod tests {
 
         assert_eq!(detections.len(), 1);
         assert!((detections[0].score - 0.9).abs() < 1e-6);
-        let xs = detections[0].polygon.map(|point| point.0);
-        let ys = detections[0].polygon.map(|point| point.1);
-        assert!((xs.iter().copied().fold(f32::INFINITY, f32::min) - 10.0).abs() < 1e-4);
-        assert!((xs.iter().copied().fold(f32::NEG_INFINITY, f32::max) - 14.0).abs() < 1e-4);
-        assert!((ys.iter().copied().fold(f32::INFINITY, f32::min) - 20.0).abs() < 1e-4);
-        assert!((ys.iter().copied().fold(f32::NEG_INFINITY, f32::max) - 22.0).abs() < 1e-4);
+        assert!((detections[0].polygon[0].0 - 10.0).abs() < 1e-4);
     }
 
     #[test]
-    fn rectification_preserves_an_axis_aligned_crop() {
-        let mut image = RgbImage::new(4, 2);
-        for y in 0..2 {
-            for x in 0..4 {
-                image.put_pixel(x, y, Rgb([(x + y * 4) as u8, 0, 0]));
-            }
-        }
-        let crop = rectify_text_crop(
-            &image,
-            [
-                Point(0.0, 0.0),
-                Point(4.0, 0.0),
-                Point(4.0, 2.0),
-                Point(0.0, 2.0),
-            ],
-        )
-        .expect("rectify crop");
-
-        assert_eq!(crop.dimensions(), (4, 2));
-        assert_eq!(crop, image);
-    }
-
-    #[test]
-    fn ctc_decoder_collapses_repetitions_and_honors_blank_tokens() {
-        let dictionary = vec!["A".to_owned(), "B".to_owned()];
+    fn dynamic_ctc_ignores_padded_time_steps() {
+        let dictionary = vec!["A".to_owned()];
         let values = [
-            0.9, 0.1, 0.0, // blank
-            0.1, 0.8, 0.1, // A
-            0.1, 0.7, 0.2, // repeated A
-            0.8, 0.1, 0.1, // blank
-            0.1, 0.1, 0.8, // B
+            0.1, 0.9, // A
+            0.1, 0.9, // collapsed A
+            0.1, 0.9, // padded
+            0.1, 0.9, // padded
+            0.1, 0.9, // padded
         ];
-
-        let decoded = decode_ctc_greedy(&values, &[1, 5, 3], &dictionary, 320).expect("decode CTC");
-
-        assert_eq!(decoded.text, "AB");
-        assert!((decoded.score - 0.8).abs() < 1e-6);
-    }
-
-    #[test]
-    fn ctc_decoder_rejects_a_dictionary_with_the_wrong_class_count() {
-        let error = decode_ctc_greedy(&[1.0, 0.0, 0.0, 0.0], &[1, 1, 4], &["A".to_owned()], 320)
-            .expect_err("class count must fail");
-        assert!(error.to_string().contains("classes"));
-    }
-
-    #[test]
-    fn ctc_decoder_supports_the_paddlex_implicit_space_class() {
-        let decoded = decode_ctc_greedy(&[0.0, 0.1, 0.9], &[1, 1, 3], &["A".to_owned()], 320)
-            .expect("decode implicit space");
-
-        assert_eq!(decoded.text, " ");
-        assert!((decoded.score - 0.9).abs() < 1e-6);
-    }
-
-    #[test]
-    fn ctc_decoder_trims_padding_for_a_wide_recognizer_input() {
-        let dictionary = vec!["A".to_owned(), "B".to_owned()];
-        let values = [
-            0.1, 0.9, 0.0, // A in the only valid time step.
-            0.1, 0.0, 0.9, // B in right padding.
-            0.1, 0.0, 0.9, 0.1, 0.0, 0.9,
-        ];
-
-        let decoded = decode_ctc_greedy_with_width(&values, &[1, 4, 3], &dictionary, 256, 1_024)
+        let decoded = decode_ctc_greedy_for_input(&values, &[1, 5, 2], &dictionary, 40, 100)
             .expect("decode CTC");
-
         assert_eq!(decoded.text, "A");
     }
 
     #[test]
-    fn long_recognition_crops_use_one_third_overlap_without_aspect_ratio_squashing() {
-        let image = RgbImage::from_fn(1_000, 20, |x, _| Rgb([(x & 0xff) as u8, (x >> 8) as u8, 0]));
-        let chunks = split_recognition_crop(&image).expect("split recognition crop");
-
-        assert_eq!(chunks.len(), 11);
+    fn split_preserves_recognizer_aspect_ratio() {
+        let image = RgbImage::from_pixel(1_000, 20, Rgb([0, 0, 0]));
+        let chunks = split_recognition_crop_for_input(&image, 48, 320).expect("split crop");
+        assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|chunk| chunk.width() <= 133));
-        assert_eq!(chunks.first().expect("first chunk").width(), 133);
-        assert_eq!(chunks.last().expect("last chunk").width(), 110);
+    }
+
+    #[test]
+    fn split_uses_a_third_width_overlap_for_chunk_boundaries() {
+        let image = RgbImage::from_fn(300, 20, |x, _| Rgb([(x & 0xff) as u8, (x >> 8) as u8, 0]));
+        let chunks = split_recognition_crop_for_input(&image, 48, 320).expect("split crop");
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].width(), 133);
+        assert_eq!(chunks[1].width(), 133);
+        assert_eq!(chunks[2].width(), 122);
         for x in 0..44 {
             assert_eq!(chunks[0].get_pixel(89 + x, 0), chunks[1].get_pixel(x, 0));
         }
     }
-
-    #[test]
-    fn wide_recognition_input_keeps_a_wide_crop_in_one_chunk() {
-        let image = RgbImage::from_pixel(1_000, 48, Rgb([0, 0, 0]));
-        let chunks =
-            split_recognition_crop_with_width(&image, 1_024).expect("split recognition crop");
-
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].dimensions(), image.dimensions());
-    }
-
-    #[test]
-    fn decoded_chunks_remove_a_shared_boundary_once() {
-        let decoded = join_decoded_texts(&[
-            DecodedText {
-                text: "hello wor".to_owned(),
-                score: 0.8,
-            },
-            DecodedText {
-                text: "world".to_owned(),
-                score: 0.9,
-            },
-        ]);
-
-        assert_eq!(decoded.text, "hello world");
-        assert!(decoded.score > 0.8 && decoded.score < 0.9);
-    }
-
-    #[test]
-    fn decoded_chunks_remove_a_single_character_chinese_boundary() {
-        let decoded = join_decoded_texts(&[
-            DecodedText {
-                text: "完美".to_owned(),
-                score: 0.8,
-            },
-            DecodedText {
-                text: "美的结局可".to_owned(),
-                score: 0.9,
-            },
-            DecodedText {
-                text: "可以发生在".to_owned(),
-                score: 0.9,
-            },
-            DecodedText {
-                text: "在任何人身上".to_owned(),
-                score: 0.9,
-            },
-        ]);
-
-        assert_eq!(decoded.text, "完美的结局可以发生在任何人身上");
-    }
-
-    #[test]
-    fn dictionary_parser_accepts_a_paddlex_model_config() {
-        let dictionary = parse_dictionary(
-            "PostProcess:\n  character_dict:\n  - A\n  - ''''\n  - ' '\n  use_space_char: true\n",
-        )
-        .expect("parse model dictionary");
-
-        assert_eq!(dictionary, ["A", "'", " "]);
-    }
-
-    #[test]
-    fn dictionary_parser_preserves_unquoted_whitespace_characters() {
-        let dictionary = parse_dictionary("PostProcess:\n  character_dict:\n  -  \n  - \u{3000}\n")
-            .expect("parse whitespace characters");
-
-        assert_eq!(dictionary, [" ", "\u{3000}"]);
-    }
-
-    const DETECTOR_SHAPE_AREA: usize = 416 * 736;
 }
