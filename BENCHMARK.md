@@ -163,8 +163,28 @@ latency is reported.
 
 RTen 0.24 is a separate pure-Rust CPU control using the official matching ONNX repositories, not a
 conversion performed in this assessment and not a replacement for direct Safetensors loading. Each
-model was freshly measured with four performance cores, five warmups, and 30 timed runs. RTen
+model was freshly measured with four worker threads, five warmups, and 30 timed runs. RTen
 receives one fixed randomly generated F32 input per model, reused for all runs.
+
+Install `rten-cli` 0.24, then run the following commands for each medium, small, and tiny official
+ONNX repository. `-n 35` performs five warmups followed by 30 samples; p50 and p90 are calculated
+from samples 6 through 35. RTen runs the model only: model loading, image decoding, preprocessing,
+and OCR postprocessing are outside the measurement.
+
+```sh
+RTEN=/path/to/rten
+
+# Detector: fixed [1,3,416,736] random F32 input, four worker threads.
+$RTEN /path/to/PP-OCRv6_tiny_det_onnx/inference.onnx \
+  -t 4 -n 35 \
+  -s '"DynamicDimension.1"=416' \
+  -s '"DynamicDimension.2"=736'
+
+# Recognizer: fixed [1,3,48,320] random F32 input, four worker threads.
+$RTEN /path/to/PP-OCRv6_tiny_rec_onnx/inference.onnx \
+  -t 4 -n 35 \
+  -s '"DynamicDimension.1"=320'
+```
 
 | Model | Input | RTen p50 | p90 | Throughput at p50 |
 | --- | --- | ---: | ---: | ---: |
@@ -190,7 +210,7 @@ The medium detector is roughly 451 GMAC at the validation-frame input size. Cand
 | --- | --- | --- | --- | --- |
 | Candle 0.10.2 | Requested Safetensors | Yes | Metal/CUDA | Implemented for medium/small/tiny. Tiny is usable for reduced-resolution local inference; medium needs custom fused/grouped convolution kernels for a materially higher ceiling. |
 | Burn 0.21 with WGPU/CubeCL | Official ONNX imported at build time | Yes | Metal/WGPU/CUDA backends | Fresh guarded-path p50 detector/recognizer latency (ms): medium 166.927/17.634, small 47.855/10.278, tiny 28.606/3.918. |
-| RTen 0.24 | Official matching ONNX | Yes | No | Fresh four-performance-core p50 detector/recognizer latency (ms): medium 222.560/36.250, small 39.890/9.290, tiny 18.130/2.100. It does not read the supplied Safetensors directly. |
+| RTen 0.24 | Official matching ONNX | Yes | No | Fresh four-worker-thread p50 detector/recognizer latency (ms): medium 222.560/36.250, small 39.890/9.290, tiny 18.130/2.100. It does not read the supplied Safetensors directly. |
 | Wonnx 0.5 | Official ONNX | No practical result | WGPU/Metal | Current model preparation fails on unsupported HardSigmoid; detector also needs ConvTranspose support. |
 | Tract 0.23 | Official ONNX | Yes | No | Current dynamic PP-OCRv6 ONNX optimization fails at the first convolution. |
 
