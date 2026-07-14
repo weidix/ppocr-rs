@@ -15,6 +15,15 @@ enum ModelKind {
     Recognizer,
 }
 
+impl ModelKind {
+    const fn model_dir_suffix(self) -> &'static str {
+        match self {
+            Self::Detector => "det",
+            Self::Recognizer => "rec",
+        }
+    }
+}
+
 struct Arguments {
     model: PathBuf,
     kind: ModelKind,
@@ -140,10 +149,8 @@ fn parse_arguments() -> Result<Arguments> {
             _ => bail!("unknown argument {flag:?}"),
         }
     }
-    let model = model.context(
-        "usage: ppocr-cpu-bench --model MODEL.safetensors --kind det|rec [--size medium|small|tiny] [--height N] [--width N] [--threads N] [--warmup N] [--runs N] [--input INPUT.f32] [--dump OUTPUT.f32] [--compare REFERENCE.f32]",
-    )?;
     let kind = kind.context("--kind is required")?;
+    let model = model.unwrap_or_else(|| default_model_path(size, kind));
     let (default_height, default_width) = match kind {
         ModelKind::Detector => (416, 736),
         ModelKind::Recognizer => (48, 320),
@@ -163,6 +170,12 @@ fn parse_arguments() -> Result<Arguments> {
         dump,
         compare,
     })
+}
+
+fn default_model_path(size: ModelSize, kind: ModelKind) -> PathBuf {
+    PathBuf::from("models")
+        .join(format!("{}-{}", size.as_str(), kind.model_dir_suffix()))
+        .join("model.safetensors")
 }
 
 fn parse_usize(value: &str, flag: &str) -> Result<usize> {

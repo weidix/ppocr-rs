@@ -450,7 +450,7 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
         && options.strides != [1, 1]
         && !((kernel_height != 1 || kernel_width != 1)
             && input_channels * kernel_height * kernel_width >= 128
-            && output_channels >= 32)
+            && output_channels >= 16)
     {
         let patch_size = input_channels * kernel_height * kernel_width;
         for batch_index in 0..batch {
@@ -519,7 +519,7 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
     if options.groups == 1
         && (kernel_height != 1 || kernel_width != 1)
         && input_channels * kernel_height * kernel_width >= 128
-        && output_channels >= 32
+        && output_channels >= 16
     {
         let patch_size = input_channels * kernel_height * kernel_width;
         for batch_index in 0..batch {
@@ -542,6 +542,41 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
                 options,
                 gelu,
             );
+        }
+        return Ok(Tensor::new_f32(
+            vec![batch, output_channels, output_height, output_width],
+            output,
+        ));
+    }
+
+    let depthwise_padding = kernel_height / 2;
+    if options.groups == input_channels
+        && output_channels == input_channels
+        && channels_per_group == 1
+        && options.strides == [1, 1]
+        && kernel_height == kernel_width
+        && matches!(kernel_height, 3 | 5 | 7 | 9)
+        && options.pads == [depthwise_padding; 4]
+    {
+        debug_assert_eq!(input_plane, output_plane);
+        output.par_chunks_mut(output_plane).enumerate().for_each(
+            |(plane_index, output_plane_values)| {
+                let output_channel = plane_index % output_channels;
+                let input_base = plane_index * input_plane;
+                let weight_base = output_channel * kernel_height * kernel_width;
+                kernels::depthwise_conv2d_same(
+                    output_plane_values,
+                    &input[input_base..input_base + input_plane],
+                    &weight[weight_base..weight_base + kernel_height * kernel_width],
+                    input_height,
+                    input_width,
+                    kernel_height,
+                    bias.map_or(0.0, |bias| bias[output_channel]),
+                );
+            },
+        );
+        if gelu {
+            kernels::unary_in_place(&mut output, UnaryOperation::Gelu);
         }
         return Ok(Tensor::new_f32(
             vec![batch, output_channels, output_height, output_width],

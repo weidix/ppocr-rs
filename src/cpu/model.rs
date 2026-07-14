@@ -109,13 +109,21 @@ impl Conv2d {
         bias: bool,
         groups: usize,
     ) -> Result<Self> {
+        let pointwise_prune_threshold = vb.pointwise_prune_threshold();
         let weight = vb.get(
             [out_channels, in_channels / groups, kernel[0], kernel[1]],
             "weight",
         )?;
         let bias = bias.then(|| vb.get(out_channels, "bias")).transpose()?;
         Ok(Self {
-            convolution: BackendConv2d::new(weight, bias, stride, pads, groups)?,
+            convolution: BackendConv2d::new_with_pointwise_prune_threshold(
+                weight,
+                bias,
+                stride,
+                pads,
+                groups,
+                pointwise_prune_threshold,
+            )?,
         })
     }
 
@@ -131,6 +139,7 @@ impl Conv2d {
         groups: usize,
         norm_name: &str,
     ) -> Result<Self> {
+        let pointwise_prune_threshold = vb.pointwise_prune_threshold();
         let conv = vb.pp("convolution");
         let weight = conv.get(
             [out_channels, in_channels / groups, kernel[0], kernel[1]],
@@ -139,7 +148,14 @@ impl Conv2d {
         let bias = bias.then(|| conv.get(out_channels, "bias")).transpose()?;
         let (weight, bias) = fold_batch_norm(weight, bias, vb.pp(norm_name), out_channels)?;
         Ok(Self {
-            convolution: BackendConv2d::new(weight, Some(bias), stride, pads, groups)?,
+            convolution: BackendConv2d::new_with_pointwise_prune_threshold(
+                weight,
+                Some(bias),
+                stride,
+                pads,
+                groups,
+                pointwise_prune_threshold,
+            )?,
         })
     }
 
@@ -150,6 +166,211 @@ impl Conv2d {
     fn forward_gelu(&self, input: &Tensor) -> Result<Tensor> {
         self.convolution.forward_gelu(input)
     }
+}
+
+struct RankOneConv2d {
+    depthwise: Conv2d,
+    pointwise: Conv2d,
+}
+
+impl RankOneConv2d {
+    fn load(
+        vb: VarBuilder<'_>,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+    ) -> Result<Self> {
+        Self::from_fused(
+            vb.get(
+                [out_channels, in_channels, kernel_size, kernel_size],
+                "weight",
+            )?,
+            vb.get(out_channels, "bias")?,
+            in_channels,
+            out_channels,
+            kernel_size,
+        )
+    }
+
+    fn from_fused(
+        weight: Tensor,
+        bias: Tensor,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+    ) -> Result<Self> {
+        let (depthwise, pointwise) =
+            factor_rank_one_conv_weight(&weight, in_channels, out_channels, kernel_size)?;
+        let padding = kernel_size / 2;
+        Ok(Self {
+            depthwise: Conv2d {
+                convolution: BackendConv2d::new(
+                    depthwise,
+                    None,
+                    [1, 1],
+                    [padding; 4],
+                    in_channels,
+                )?,
+            },
+            pointwise: Conv2d {
+                convolution: BackendConv2d::new(pointwise, Some(bias), [1, 1], [0; 4], 1)?,
+            },
+        })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.pointwise.forward(&self.depthwise.forward(input)?)
+    }
+}
+
+fn factor_rank_one_conv_weight(
+    weight: &Tensor,
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+) -> Result<(Tensor, Tensor)> {
+    const POWER_ITERATIONS: usize = 4;
+    const MAX_RELATIVE_ERROR: f64 = 1.0e-6;
+    const MAX_ABSOLUTE_ERROR_SCALE: f64 = 1.0e-5;
+
+    ensure!(
+        kernel_size > 0 && kernel_size % 2 == 1,
+        "rank-one convolution kernel must be positive and odd"
+    );
+    ensure!(
+        weight.shape() == [out_channels, in_channels, kernel_size, kernel_size],
+        "rank-one convolution weight has invalid shape {:?}",
+        weight.shape()
+    );
+    let source = weight.as_f32()?;
+    ensure!(
+        source.iter().all(|value| value.is_finite()),
+        "rank-one convolution weight contains non-finite values"
+    );
+    let spatial = kernel_size * kernel_size;
+    let mut depthwise = vec![0.0f32; in_channels * spatial];
+    let mut pointwise = vec![0.0f32; out_channels * in_channels];
+    let mut direction = vec![0.0f64; spatial];
+    let mut scales = vec![0.0f64; out_channels];
+
+    for input_channel in 0..in_channels {
+        let mut initial_output = 0;
+        let mut initial_energy = 0.0f64;
+        for output_channel in 0..out_channels {
+            let offset = (output_channel * in_channels + input_channel) * spatial;
+            let energy = source[offset..offset + spatial]
+                .iter()
+                .map(|&value| f64::from(value).powi(2))
+                .sum::<f64>();
+            if energy > initial_energy {
+                initial_output = output_channel;
+                initial_energy = energy;
+            }
+        }
+        if initial_energy == 0.0 {
+            continue;
+        }
+
+        let initial_offset = (initial_output * in_channels + input_channel) * spatial;
+        let initial_norm = initial_energy.sqrt();
+        for index in 0..spatial {
+            direction[index] = f64::from(source[initial_offset + index]) / initial_norm;
+        }
+
+        // This is power iteration on each input channel's O-by-K^2 matrix.
+        for _ in 0..POWER_ITERATIONS {
+            for (output_channel, scale) in scales.iter_mut().enumerate() {
+                let offset = (output_channel * in_channels + input_channel) * spatial;
+                *scale = source[offset..offset + spatial]
+                    .iter()
+                    .zip(&direction)
+                    .map(|(&value, &direction)| f64::from(value) * direction)
+                    .sum();
+            }
+            let scale_energy = scales.iter().map(|scale| scale * scale).sum::<f64>();
+            ensure!(
+                scale_energy.is_finite() && scale_energy > 0.0,
+                "rank-one convolution factorization became degenerate"
+            );
+            for (index, value) in direction.iter_mut().enumerate() {
+                *value = scales
+                    .iter()
+                    .enumerate()
+                    .map(|(output_channel, &scale)| {
+                        let offset =
+                            (output_channel * in_channels + input_channel) * spatial + index;
+                        f64::from(source[offset]) * scale
+                    })
+                    .sum::<f64>()
+                    / scale_energy;
+            }
+            let norm = direction
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .sqrt();
+            ensure!(
+                norm.is_finite() && norm > 0.0,
+                "rank-one convolution spatial factor became degenerate"
+            );
+            for value in &mut direction {
+                *value /= norm;
+            }
+        }
+
+        for (output_channel, scale) in scales.iter_mut().enumerate() {
+            let offset = (output_channel * in_channels + input_channel) * spatial;
+            *scale = source[offset..offset + spatial]
+                .iter()
+                .zip(&direction)
+                .map(|(&value, &direction)| f64::from(value) * direction)
+                .sum();
+            pointwise[output_channel * in_channels + input_channel] = *scale as f32;
+        }
+        for (target, &value) in depthwise[input_channel * spatial..(input_channel + 1) * spatial]
+            .iter_mut()
+            .zip(&direction)
+        {
+            *target = value as f32;
+        }
+    }
+
+    let mut maximum_source = 0.0f64;
+    let mut maximum_error = 0.0f64;
+    let mut source_energy = 0.0f64;
+    let mut error_energy = 0.0f64;
+    for output_channel in 0..out_channels {
+        for input_channel in 0..in_channels {
+            let source_offset = (output_channel * in_channels + input_channel) * spatial;
+            let scale = pointwise[output_channel * in_channels + input_channel];
+            for index in 0..spatial {
+                let expected = source[source_offset + index];
+                let actual = scale * depthwise[input_channel * spatial + index];
+                let error = f64::from((expected - actual).abs());
+                maximum_source = maximum_source.max(f64::from(expected.abs()));
+                maximum_error = maximum_error.max(error);
+                source_energy += f64::from(expected).powi(2);
+                error_energy += error * error;
+            }
+        }
+    }
+    let relative_error = if source_energy == 0.0 {
+        0.0
+    } else {
+        (error_energy / source_energy).sqrt()
+    };
+    let maximum_error_limit = maximum_source * MAX_ABSOLUTE_ERROR_SCALE + 1.0e-12;
+    ensure!(
+        maximum_error <= maximum_error_limit && relative_error <= MAX_RELATIVE_ERROR,
+        "fused convolution is not rank-one separable: max error {maximum_error:.6e} \
+         (limit {maximum_error_limit:.6e}), relative Frobenius error {relative_error:.6e} \
+         (limit {MAX_RELATIVE_ERROR:.6e})"
+    );
+
+    Ok((
+        Tensor::new_f32(vec![in_channels, 1, kernel_size, kernel_size], depthwise),
+        Tensor::new_f32(vec![out_channels, in_channels, 1, 1], pointwise),
+    ))
 }
 
 fn fold_batch_norm(
@@ -594,23 +815,103 @@ impl LcNetBackbone {
 
 struct IntraclassBlock {
     reduce: Conv2d,
-    vertical_long: Conv2d,
-    vertical_mid: Conv2d,
-    vertical_short: Conv2d,
-    horizontal_long: Conv2d,
-    horizontal_mid: Conv2d,
-    horizontal_short: Conv2d,
-    symmetric_long: Conv2d,
-    symmetric_mid: Conv2d,
-    symmetric_short: Conv2d,
+    long: Conv2d,
+    mid: Conv2d,
+    short: Conv2d,
     final_conv: ConvBnAct,
+}
+
+fn fuse_intraclass_conv(
+    symmetric_weight: Tensor,
+    symmetric_bias: Tensor,
+    vertical_weight: Tensor,
+    vertical_bias: Tensor,
+    horizontal_weight: Tensor,
+    horizontal_bias: Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let shape = symmetric_weight.shape().to_vec();
+    let [out_channels, in_channels, kernel_height, kernel_width]: [usize; 4] = shape
+        .as_slice()
+        .try_into()
+        .with_context(|| format!("expected rank-four symmetric weight, found {shape:?}"))?;
+    ensure!(
+        kernel_height == kernel_width && kernel_height % 2 == 1,
+        "intraclass symmetric kernel must be odd and square, found {kernel_height}x{kernel_width}"
+    );
+    ensure!(
+        vertical_weight.shape() == [out_channels, in_channels, kernel_height, 1],
+        "intraclass vertical weight has invalid shape {:?}",
+        vertical_weight.shape()
+    );
+    ensure!(
+        horizontal_weight.shape() == [out_channels, in_channels, 1, kernel_width],
+        "intraclass horizontal weight has invalid shape {:?}",
+        horizontal_weight.shape()
+    );
+    for (name, bias) in [
+        ("symmetric", &symmetric_bias),
+        ("vertical", &vertical_bias),
+        ("horizontal", &horizontal_bias),
+    ] {
+        ensure!(
+            bias.shape() == [out_channels],
+            "intraclass {name} bias has invalid shape {:?}",
+            bias.shape()
+        );
+    }
+
+    let vertical = vertical_weight.as_f32()?;
+    let horizontal = horizontal_weight.as_f32()?;
+    let mut weight = symmetric_weight.into_f32()?;
+    let center = kernel_height / 2;
+    for output in 0..out_channels {
+        for input in 0..in_channels {
+            let branch_offset = (output * in_channels + input) * kernel_height;
+            let symmetric_offset = branch_offset * kernel_width;
+            for row in 0..kernel_height {
+                weight[symmetric_offset + row * kernel_width + center] +=
+                    vertical[branch_offset + row];
+            }
+            for column in 0..kernel_width {
+                weight[symmetric_offset + center * kernel_width + column] +=
+                    horizontal[branch_offset + column];
+            }
+        }
+    }
+
+    let vertical_bias = vertical_bias.as_f32()?;
+    let horizontal_bias = horizontal_bias.as_f32()?;
+    let mut bias = symmetric_bias.into_f32()?;
+    for channel in 0..out_channels {
+        bias[channel] += vertical_bias[channel];
+        bias[channel] += horizontal_bias[channel];
+    }
+    Ok((
+        Tensor::new_f32(shape, weight),
+        Tensor::new_f32(vec![out_channels], bias),
+    ))
+}
+
+fn load_fused_intraclass_conv(vb: VarBuilder<'_>, ratio: &str, kernel: usize) -> Result<Conv2d> {
+    let symmetric = vb.pp(format!("symmetric_conv_long_{ratio}"));
+    let vertical = vb.pp(format!("vertical_long_to_small_conv_{ratio}"));
+    let horizontal = vb.pp(format!("horizontal_small_to_long_conv_{ratio}"));
+    let (weight, bias) = fuse_intraclass_conv(
+        symmetric.get([32, 32, kernel, kernel], "weight")?,
+        symmetric.get(32, "bias")?,
+        vertical.get([32, 32, kernel, 1], "weight")?,
+        vertical.get(32, "bias")?,
+        horizontal.get([32, 32, 1, kernel], "weight")?,
+        horizontal.get(32, "bias")?,
+    )?;
+    let padding = kernel / 2;
+    Ok(Conv2d {
+        convolution: BackendConv2d::new(weight, Some(bias), [1, 1], [padding; 4], 1)?,
+    })
 }
 
 impl IntraclassBlock {
     fn load(vb: VarBuilder<'_>) -> Result<Self> {
-        let regular = |name, kernel: [usize; 2], pads| {
-            Conv2d::load(vb.pp(name), 32, 32, kernel, [1, 1], pads, true, 1)
-        };
         Ok(Self {
             reduce: Conv2d::load(
                 vb.pp("conv_reduce_channel"),
@@ -622,35 +923,9 @@ impl IntraclassBlock {
                 true,
                 1,
             )?,
-            vertical_long: regular(
-                "vertical_long_to_small_conv_longratio",
-                [7, 1],
-                [3, 0, 3, 0],
-            )?,
-            vertical_mid: regular("vertical_long_to_small_conv_midratio", [5, 1], [2, 0, 2, 0])?,
-            vertical_short: regular(
-                "vertical_long_to_small_conv_shortratio",
-                [3, 1],
-                [1, 0, 1, 0],
-            )?,
-            horizontal_long: regular(
-                "horizontal_small_to_long_conv_longratio",
-                [1, 7],
-                [0, 3, 0, 3],
-            )?,
-            horizontal_mid: regular(
-                "horizontal_small_to_long_conv_midratio",
-                [1, 5],
-                [0, 2, 0, 2],
-            )?,
-            horizontal_short: regular(
-                "horizontal_small_to_long_conv_shortratio",
-                [1, 3],
-                [0, 1, 0, 1],
-            )?,
-            symmetric_long: regular("symmetric_conv_long_longratio", [7, 7], [3; 4])?,
-            symmetric_mid: regular("symmetric_conv_long_midratio", [5, 5], [2; 4])?,
-            symmetric_short: regular("symmetric_conv_long_shortratio", [3, 3], [1; 4])?,
+            long: load_fused_intraclass_conv(vb.clone(), "longratio", 7)?,
+            mid: load_fused_intraclass_conv(vb.clone(), "midratio", 5)?,
+            short: load_fused_intraclass_conv(vb.clone(), "shortratio", 3)?,
             final_conv: ConvBnAct::load(
                 vb.pp("conv_final"),
                 32,
@@ -668,30 +943,18 @@ impl IntraclassBlock {
 
     fn forward(&self, input: Tensor) -> Result<Tensor> {
         let reduced = self.reduce.forward(&input)?;
-        let layer7 = self
-            .symmetric_long
-            .forward(&reduced)?
-            .into_add(&self.vertical_long.forward(&reduced)?)?
-            .into_add(&self.horizontal_long.forward(&reduced)?)?;
-        let layer5 = self
-            .symmetric_mid
-            .forward(&layer7)?
-            .into_add(&self.vertical_mid.forward(&layer7)?)?
-            .into_add(&self.horizontal_mid.forward(&layer7)?)?;
-        let layer3 = self
-            .symmetric_short
-            .forward(&layer5)?
-            .into_add(&self.vertical_short.forward(&layer5)?)?
-            .into_add(&self.horizontal_short.forward(&layer5)?)?;
+        let layer7 = self.long.forward(&reduced)?;
+        let layer5 = self.mid.forward(&layer7)?;
+        let layer3 = self.short.forward(&layer5)?;
         input.into_add(&self.final_conv.forward(&layer3)?)
     }
 }
 
 struct DetectorNeck {
     adjust: Vec<Conv2d>,
-    project: Vec<Conv2d>,
+    project: Vec<RankOneConv2d>,
     pan_head: Vec<Conv2d>,
-    pan_lateral: Vec<Conv2d>,
+    pan_lateral: Vec<RankOneConv2d>,
     intraclass: Vec<IntraclassBlock>,
 }
 
@@ -715,16 +978,13 @@ impl DetectorNeck {
             .collect::<Result<Vec<_>>>()?;
         let project = (0..4)
             .map(|index| {
-                Conv2d::load(
+                RankOneConv2d::load(
                     vb.pp("input_feature_projection_convolution").pp(index),
                     256,
                     64,
-                    [9, 9],
-                    [1, 1],
-                    [4; 4],
-                    true,
-                    1,
+                    9,
                 )
+                .with_context(|| format!("factor medium neck projection {index}"))
             })
             .collect::<Result<Vec<_>>>()?;
         let pan_head = (0..3)
@@ -743,16 +1003,13 @@ impl DetectorNeck {
             .collect::<Result<Vec<_>>>()?;
         let pan_lateral = (0..4)
             .map(|index| {
-                Conv2d::load(
+                RankOneConv2d::load(
                     vb.pp("path_aggregation_lateral_convolution").pp(index),
                     64,
                     64,
-                    [9, 9],
-                    [1, 1],
-                    [4; 4],
-                    true,
-                    1,
+                    9,
                 )
+                .with_context(|| format!("factor medium neck lateral {index}"))
             })
             .collect::<Result<Vec<_>>>()?;
         let intraclass = (0..4)
@@ -1552,7 +1809,10 @@ impl Recognizer {
     pub fn load(path: impl AsRef<Path>, size: ModelSize, options: CpuOptions) -> Result<Self> {
         let pool = thread_pool(options)?;
         let weights = Weights::load(path)?;
-        let vb = weights.builder();
+        let vb = weights.builder_with_pointwise_prune_threshold(match size {
+            ModelSize::Medium => 7.5e-2,
+            ModelSize::Small | ModelSize::Tiny => 4.0e-2,
+        });
         let encoder = vb.pp("model").pp("backbone").pp("encoder");
         let (backbone, head) = match size {
             ModelSize::Medium => (
@@ -1720,5 +1980,201 @@ mod tests {
         assert!(validate_input(&input(32, 31), true).is_err());
         assert!(validate_input(&input(48, 5), false).is_ok());
         assert!(validate_input(&input(48, 4), false).is_err());
+    }
+
+    #[test]
+    fn rank_one_conv_matches_dense_fused_weight() -> Result<()> {
+        let (in_channels, out_channels, kernel, height, width) = (4, 5, 9, 11, 19);
+        let spatial = kernel * kernel;
+        let depthwise = (0..in_channels * spatial)
+            .map(|index| ((index * 17 % 43) as f32 - 21.0) / 97.0)
+            .collect::<Vec<_>>();
+        let pointwise = (0..out_channels * in_channels)
+            .map(|index| ((index * 11 % 29) as f32 - 14.0) / 31.0)
+            .collect::<Vec<_>>();
+        let mut fused = vec![0.0; out_channels * in_channels * spatial];
+        for output_channel in 0..out_channels {
+            for input_channel in 0..in_channels {
+                let scale = pointwise[output_channel * in_channels + input_channel];
+                let offset = (output_channel * in_channels + input_channel) * spatial;
+                for index in 0..spatial {
+                    fused[offset + index] = scale * depthwise[input_channel * spatial + index];
+                }
+            }
+        }
+        let weight = Tensor::new_f32(vec![out_channels, in_channels, kernel, kernel], fused);
+        let bias = Tensor::new_f32(
+            vec![out_channels],
+            (0..out_channels)
+                .map(|channel| (channel as f32 - 2.0) / 13.0)
+                .collect(),
+        );
+        let dense = BackendConv2d::new(
+            weight.clone(),
+            Some(bias.clone()),
+            [1, 1],
+            [kernel / 2; 4],
+            1,
+        )?;
+        let rank_one = RankOneConv2d::from_fused(weight, bias, in_channels, out_channels, kernel)?;
+        let input = Tensor::new_f32(
+            vec![1, in_channels, height, width],
+            (0..in_channels * height * width)
+                .map(|index| ((index * 23 % 61) as f32 - 30.0) / 37.0)
+                .collect(),
+        );
+
+        let expected = dense.forward(&input)?;
+        let actual = rank_one.forward(&input)?;
+        let maximum_error = expected
+            .as_f32()?
+            .iter()
+            .zip(actual.as_f32()?)
+            .map(|(expected, actual)| (expected - actual).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            maximum_error < 2.0e-5,
+            "rank-one convolution maximum error: {maximum_error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rank_one_factorization_rejects_nonseparable_weight() {
+        let mut values = vec![0.0; 2 * 3 * 3];
+        values[0] = 1.0;
+        values[3 * 3 + 1] = 1.0;
+        let weight = Tensor::new_f32(vec![2, 1, 3, 3], values);
+        assert!(factor_rank_one_conv_weight(&weight, 1, 2, 3).is_err());
+    }
+
+    #[test]
+    fn fuses_intraclass_weights_into_center_axes() -> Result<()> {
+        let (out_channels, in_channels, kernel) = (2, 2, 3);
+        let symmetric = (0..out_channels * in_channels * kernel * kernel)
+            .map(|index| index as f32)
+            .collect::<Vec<_>>();
+        let vertical = (0..out_channels * in_channels * kernel)
+            .map(|index| 100.0 + index as f32)
+            .collect::<Vec<_>>();
+        let horizontal = (0..out_channels * in_channels * kernel)
+            .map(|index| 200.0 + index as f32)
+            .collect::<Vec<_>>();
+        let (weight, bias) = fuse_intraclass_conv(
+            Tensor::new_f32(
+                vec![out_channels, in_channels, kernel, kernel],
+                symmetric.clone(),
+            ),
+            Tensor::new_f32(vec![out_channels], vec![1.0, 2.0]),
+            Tensor::new_f32(vec![out_channels, in_channels, kernel, 1], vertical.clone()),
+            Tensor::new_f32(vec![out_channels], vec![3.0, 4.0]),
+            Tensor::new_f32(
+                vec![out_channels, in_channels, 1, kernel],
+                horizontal.clone(),
+            ),
+            Tensor::new_f32(vec![out_channels], vec![5.0, 6.0]),
+        )?;
+
+        let weight = weight.as_f32()?;
+        let center = kernel / 2;
+        for output in 0..out_channels {
+            for input in 0..in_channels {
+                let branch_offset = (output * in_channels + input) * kernel;
+                let symmetric_offset = branch_offset * kernel;
+                for row in 0..kernel {
+                    for column in 0..kernel {
+                        let mut expected = symmetric[symmetric_offset + row * kernel + column];
+                        if column == center {
+                            expected += vertical[branch_offset + row];
+                        }
+                        if row == center {
+                            expected += horizontal[branch_offset + column];
+                        }
+                        assert_eq!(weight[symmetric_offset + row * kernel + column], expected);
+                    }
+                }
+            }
+        }
+        assert_eq!(bias.as_f32()?, [9.0, 12.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn fused_intraclass_conv_matches_three_padded_branches() -> Result<()> {
+        let (out_channels, in_channels, kernel) = (2, 3, 5);
+        let patterned = |length: usize, multiplier: usize, scale: f32| {
+            (0..length)
+                .map(|index| ((index * multiplier % 31) as f32 - 15.0) * scale)
+                .collect::<Vec<_>>()
+        };
+        let symmetric_weight = Tensor::new_f32(
+            vec![out_channels, in_channels, kernel, kernel],
+            patterned(out_channels * in_channels * kernel * kernel, 7, 0.01),
+        );
+        let vertical_weight = Tensor::new_f32(
+            vec![out_channels, in_channels, kernel, 1],
+            patterned(out_channels * in_channels * kernel, 11, 0.015),
+        );
+        let horizontal_weight = Tensor::new_f32(
+            vec![out_channels, in_channels, 1, kernel],
+            patterned(out_channels * in_channels * kernel, 13, 0.012),
+        );
+        let symmetric_bias = Tensor::new_f32(vec![out_channels], vec![0.07, -0.03]);
+        let vertical_bias = Tensor::new_f32(vec![out_channels], vec![-0.02, 0.05]);
+        let horizontal_bias = Tensor::new_f32(vec![out_channels], vec![0.01, -0.04]);
+        let padding = kernel / 2;
+
+        let symmetric_conv = BackendConv2d::new(
+            symmetric_weight.clone(),
+            Some(symmetric_bias.clone()),
+            [1, 1],
+            [padding; 4],
+            1,
+        )?;
+        let vertical_conv = BackendConv2d::new(
+            vertical_weight.clone(),
+            Some(vertical_bias.clone()),
+            [1, 1],
+            [padding, 0, padding, 0],
+            1,
+        )?;
+        let horizontal_conv = BackendConv2d::new(
+            horizontal_weight.clone(),
+            Some(horizontal_bias.clone()),
+            [1, 1],
+            [0, padding, 0, padding],
+            1,
+        )?;
+        let (fused_weight, fused_bias) = fuse_intraclass_conv(
+            symmetric_weight,
+            symmetric_bias,
+            vertical_weight,
+            vertical_bias,
+            horizontal_weight,
+            horizontal_bias,
+        )?;
+        let fused_conv =
+            BackendConv2d::new(fused_weight, Some(fused_bias), [1, 1], [padding; 4], 1)?;
+        let input = Tensor::new_f32(
+            vec![1, in_channels, 7, 8],
+            patterned(in_channels * 7 * 8, 17, 0.02),
+        );
+
+        let expected = symmetric_conv
+            .forward(&input)?
+            .into_add(&vertical_conv.forward(&input)?)?
+            .into_add(&horizontal_conv.forward(&input)?)?;
+        let actual = fused_conv.forward(&input)?;
+        assert_eq!(actual.shape(), expected.shape());
+        for (index, (actual, expected)) in
+            actual.as_f32()?.iter().zip(expected.as_f32()?).enumerate()
+        {
+            let tolerance = 2e-5 * expected.abs().max(1.0);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "output {index} differs: fused={actual}, branches={expected}"
+            );
+        }
+        Ok(())
     }
 }

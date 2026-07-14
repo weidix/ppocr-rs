@@ -295,6 +295,17 @@ impl Conv2d {
         pads: [usize; 4],
         groups: usize,
     ) -> Result<Self> {
+        Self::new_with_pointwise_prune_threshold(weight, bias, strides, pads, groups, 4.0e-2)
+    }
+
+    pub(crate) fn new_with_pointwise_prune_threshold(
+        weight: Tensor,
+        bias: Option<Tensor>,
+        strides: [usize; 2],
+        pads: [usize; 4],
+        groups: usize,
+        pointwise_prune_threshold: f32,
+    ) -> Result<Self> {
         let [
             output_channels,
             channels_per_group,
@@ -306,6 +317,10 @@ impl Conv2d {
             })?;
         weight.as_f32()?;
         ensure!(groups > 0, "Conv group count must be positive");
+        ensure!(
+            pointwise_prune_threshold.is_finite() && pointwise_prune_threshold >= 0.0,
+            "pointwise prune threshold must be finite and non-negative"
+        );
         ensure!(
             strides.into_iter().all(|stride| stride > 0),
             "Conv strides must be positive"
@@ -321,7 +336,7 @@ impl Conv2d {
         let tiled_spatial = groups == 1
             && (kernel_height != 1 || kernel_width != 1)
             && inner >= 128
-            && output_channels >= 32;
+            && output_channels >= 16;
         let sparse_pointwise = groups == 1
             && kernel_height == 1
             && kernel_width == 1
@@ -330,7 +345,11 @@ impl Conv2d {
         // Projection weights are strongly block-pruned. The tighter spatial
         // threshold preserves detector scores; large pointwise layers use the
         // OCR decision-preserving threshold measured by the CPU benchmark.
-        let prune_threshold = if tiled_spatial { 2.0e-6 } else { 4.0e-2 };
+        let prune_threshold = if tiled_spatial {
+            2.0e-6
+        } else {
+            pointwise_prune_threshold
+        };
         let sparse_weights = ((tiled_spatial || sparse_pointwise)
             && output_channels.is_multiple_of(4))
         .then(|| {
@@ -528,8 +547,11 @@ impl LayerNorm {
 
 #[derive(Clone)]
 pub(crate) struct Linear {
-    // Safetensors stores Linear weights as [out, in]; inference reuses [in, out].
-    weight: Tensor,
+    // Safetensors stores Linear weights as [out, in]. Keep that orientation and
+    // interleave blocks of output rows for the packed-left GEMM kernels.
+    packed_weight: Tensor,
+    input_features: usize,
+    output_features: usize,
     bias: Option<Tensor>,
 }
 
@@ -540,39 +562,88 @@ impl Linear {
             "Linear weight must have rank two, found {:?}",
             weight.shape
         );
-        let weight = weight.transpose(0, 1)?;
-        Self::from_transposed(weight, bias)
-    }
-
-    pub(crate) fn from_transposed(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
-        let (_, output_features) = weight.dims2()?;
+        let (output_features, input_features) = weight.dims2()?;
+        ensure!(
+            input_features > 0 && output_features > 0,
+            "Linear feature counts must be positive"
+        );
         if let Some(bias) = &bias {
             ensure!(
                 bias.rank() == 1 && bias.as_f32()?.len() == output_features,
                 "Linear bias length does not match output features"
             );
         }
-        weight.as_f32()?;
-        Ok(Self { weight, bias })
+        let packed_weight = pack_conv_rows(weight, output_features, 12)?;
+        Ok(Self {
+            packed_weight,
+            input_features,
+            output_features,
+            bias,
+        })
     }
 
     pub(crate) fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        let output = input.matmul(&self.weight)?;
-        match &self.bias {
-            Some(bias) => output.into_add(bias),
-            None => Ok(output),
-        }
+        self.run(input, false)
     }
 
     pub(crate) fn forward_softmax(&self, input: &Tensor) -> Result<Tensor> {
-        match &self.bias {
-            Some(bias) => run(
-                Operation::MatMulBiasSoftmax { axis: -1 },
-                vec![input.clone(), self.weight.clone(), bias.clone()],
-            ),
-            None => input.matmul(&self.weight)?.into_softmax(-1),
-        }
+        self.run(input, true)
     }
+
+    fn run(&self, input: &Tensor, apply_softmax: bool) -> Result<Tensor> {
+        ensure!(
+            !input.shape.is_empty(),
+            "Linear input must have at least one dimension"
+        );
+        ensure!(
+            input.shape.last() == Some(&self.input_features),
+            "Linear input feature count does not match input shape {:?}",
+            input.shape
+        );
+        let rows = element_count(&input.shape[..input.shape.len() - 1])
+            .context("Linear input shape overflow")?;
+        let output_len = rows
+            .checked_mul(self.output_features)
+            .context("Linear output shape overflow")?;
+        let mut output_shape = input.shape.clone();
+        *output_shape.last_mut().expect("non-empty Linear shape") = self.output_features;
+        if output_len == 0 {
+            return Ok(Tensor::new_f32(output_shape, Vec::new()));
+        }
+
+        let transposed_input = transpose_matrix(input.as_f32()?, rows, self.input_features);
+        let mut transposed_output = vec![0.0; output_len];
+        kernels::gemm_packed_left(
+            &mut transposed_output,
+            self.packed_weight.as_f32()?,
+            &transposed_input,
+            self.output_features,
+            self.input_features,
+            rows,
+            self.bias.as_ref().map(Tensor::as_f32).transpose()?,
+        );
+        let mut output = transpose_matrix(&transposed_output, self.output_features, rows);
+        if apply_softmax {
+            output
+                .par_chunks_mut(self.output_features)
+                .for_each(kernels::softmax_in_place);
+        }
+        Ok(Tensor::new_f32(output_shape, output))
+    }
+}
+
+fn transpose_matrix(input: &[f32], rows: usize, columns: usize) -> Vec<f32> {
+    assert_eq!(rows.checked_mul(columns), Some(input.len()));
+    let mut output = vec![0.0; input.len()];
+    output
+        .par_chunks_mut(rows)
+        .enumerate()
+        .for_each(|(column, output_row)| {
+            for (row, output) in output_row.iter_mut().enumerate() {
+                *output = input[row * columns + column];
+            }
+        });
+    output
 }
 
 #[cfg(test)]
@@ -617,6 +688,44 @@ mod tests {
         let values = probabilities.as_f32().unwrap();
         assert!((values[0] + values[1] - 1.0).abs() < 1e-6);
         assert!(values[1] > values[0]);
+    }
+
+    #[test]
+    fn packed_linear_matches_dynamic_matmul_with_leading_dimensions() {
+        let weight = tensor(
+            [4, 3],
+            &[
+                1.0, 0.0, -1.0, 0.5, -0.25, 2.0, 1.5, 0.75, -0.5, -1.0, 1.0, 0.25,
+            ],
+        );
+        let bias = tensor([4], &[0.5, -0.25, 1.0, -0.75]);
+        let transposed = weight.transpose(0, 1).unwrap();
+        let linear = Linear::new(weight, Some(bias.clone())).unwrap();
+        let input_values = (0..36)
+            .map(|index| ((index * 7 % 19) as f32 - 9.0) / 5.0)
+            .collect::<Vec<_>>();
+        let input = Tensor::new_f32(vec![2, 3, 2, 3], input_values);
+
+        let expected = input.matmul(&transposed).unwrap().into_add(&bias).unwrap();
+        let actual = linear.forward(&input).unwrap();
+        assert_eq!(actual.shape(), [2, 3, 2, 4]);
+        assert_tensors_close(&actual, &expected);
+
+        let expected_softmax = expected.clone().into_softmax(-1).unwrap();
+        let actual = linear.forward_softmax(&input).unwrap();
+        assert_tensors_close(&actual, &expected_softmax);
+    }
+
+    fn assert_tensors_close(actual: &Tensor, expected: &Tensor) {
+        assert_eq!(actual.shape(), expected.shape());
+        for (&actual, &expected) in actual
+            .as_f32()
+            .unwrap()
+            .iter()
+            .zip(expected.as_f32().unwrap())
+        {
+            assert!((actual - expected).abs() <= 3.0e-5 * (1.0 + expected.abs()));
+        }
     }
 
     #[test]

@@ -8,33 +8,17 @@ dependency set.
 
 ## Reproducible Run
 
-Download the exact Hugging Face revisions outside the repository:
+Download and verify the pinned Hugging Face revisions into the repository-local `models/`
+directory:
 
 ```sh
-hf download PaddlePaddle/PP-OCRv6_medium_det_safetensors model.safetensors \
-  --revision 4236c2b61741a259c091fd879dcc4edc339e916c \
-  --local-dir /tmp/ppocr-v6-models/det
-hf download PaddlePaddle/PP-OCRv6_medium_rec_safetensors model.safetensors \
-  --revision 024cad6a831de75c2c3c26e711ba8c4a82ccd24b \
-  --local-dir /tmp/ppocr-v6-models/rec
-hf download PaddlePaddle/PP-OCRv6_small_det_safetensors model.safetensors \
-  --revision eae2ee920a39fb3087637d3dbb58df1896ec1f24 \
-  --local-dir /tmp/ppocr-v6-models/small-det
-hf download PaddlePaddle/PP-OCRv6_small_rec_safetensors model.safetensors \
-  --revision fe049fb103f57443fe8840c54ed06b702f3c1de5 \
-  --local-dir /tmp/ppocr-v6-models/small-rec
-hf download PaddlePaddle/PP-OCRv6_tiny_det_safetensors model.safetensors \
-  --revision 07595f982703daf0d4e120a12a01da8073542f3a \
-  --local-dir /tmp/ppocr-v6-models/tiny-det
-hf download PaddlePaddle/PP-OCRv6_tiny_rec_safetensors model.safetensors \
-  --revision 6f2d2d51b4b4226d7a2329a02f416f4994106f3a \
-  --local-dir /tmp/ppocr-v6-models/tiny-rec
+./scripts/download-models.sh
 
 cargo run --release -- \
-  --det-model /tmp/ppocr-v6-models/det/model.safetensors \
-  --rec-model /tmp/ppocr-v6-models/rec/model.safetensors \
+  --det-model models/medium-det/model.safetensors \
+  --rec-model models/medium-rec/model.safetensors \
   --image /path/to/validation/images/video0001_f00000060.jpg \
-  --dict /path/to/PP-OCRv6_medium_rec_onnx/inference.yml \
+  --dict models/medium-rec/inference.yml \
   --det-max-side 736 \
   --device metal --output /tmp/candle-ocr.json
 ```
@@ -43,12 +27,12 @@ Use `--device cpu` for the CPU path. To run a smaller model, add matching size f
 
 ```sh
 cargo run --release -- \
-  --det-model /tmp/ppocr-v6-models/tiny-det/model.safetensors \
-  --rec-model /tmp/ppocr-v6-models/tiny-rec/model.safetensors \
+  --det-model models/tiny-det/model.safetensors \
+  --rec-model models/tiny-rec/model.safetensors \
   --det-size tiny --rec-size tiny \
   --det-max-side 736 --rec-max-width 320 \
   --image /path/to/validation/images/video0001_f00000060.jpg \
-  --dict /path/to/PP-OCRv6_tiny_rec_onnx/inference.yml \
+  --dict models/tiny-rec/inference.yml \
   --device metal --output /tmp/candle-ocr.json
 ```
 
@@ -205,12 +189,46 @@ Medium, small, and tiny recognizers matched ORT argmax at `40/40` time steps. Ti
 per-logit ORT difference is also reproduced by the independent CPU Safetensors implementation;
 against the strict Safetensors reference, GPU maximum absolute error is about `4.83e-6`.
 
-## Native CPU ONNX Control
+## Converted ONNX CPU Probe
+
+The self-contained `cpu_onnx` runtime was measured using converted fixed-shape ONNX models on the
+same M4 host. Each model uses four worker threads, five warmups, and 30 timed runs; model loading,
+input generation, and output validation are outside the timed interval.
+
+| Model | Input | cpu_onnx p50 | p90 | Throughput at p50 |
+| --- | --- | ---: | ---: | ---: |
+| medium detector | `[1,3,416,736]` | 342.201 ms | 347.293 ms | 2.92 frames/s |
+| medium recognizer | `[1,3,48,320]` | 38.137 ms | 38.689 ms | 26.22 lines/s |
+| small detector | `[1,3,416,736]` | 47.542 ms | 49.026 ms | 21.03 frames/s |
+| small recognizer | `[1,3,48,320]` | 9.983 ms | 10.764 ms | 100.17 lines/s |
+| tiny detector | `[1,3,416,736]` | 21.603 ms | 22.386 ms | 46.29 frames/s |
+| tiny recognizer | `[1,3,48,320]` | 2.149 ms | 2.501 ms | 465.33 lines/s |
+
+## Direct Safetensors CPU Probe
+
+The direct `cpu` runtime was measured from the official Safetensors weights on the same M4 host.
+Each model uses four worker threads, five warmups, and 30 timed runs; model loading, input
+generation, and output validation are outside the timed interval.
+
+| Model | Input | cpu p50 | p90 | Throughput at p50 |
+| --- | --- | ---: | ---: | ---: |
+| medium detector | `[1,3,416,736]` | 187.865 ms | 188.953 ms | 5.32 frames/s |
+| medium recognizer | `[1,3,48,320]` | 22.061 ms | 23.239 ms | 45.33 lines/s |
+| small detector | `[1,3,416,736]` | 35.644 ms | 37.001 ms | 28.06 frames/s |
+| small recognizer | `[1,3,48,320]` | 8.240 ms | 9.562 ms | 121.36 lines/s |
+| tiny detector | `[1,3,416,736]` | 17.611 ms | 18.130 ms | 56.78 frames/s |
+| tiny recognizer | `[1,3,48,320]` | 1.720 ms | 2.607 ms | 581.40 lines/s |
+
+The medium recognizer uses model-specific load-time block pruning. Against the prior `0.04`
+pruning baseline on the deterministic benchmark input, all `40/40` time-step argmax values match;
+maximum and mean absolute probability differences are `0.153469324` and `0.000018419`.
+
+## RTen CPU ONNX Control
 
 RTen 0.24 is a separate pure-Rust CPU control using the official matching ONNX repositories, not a
 conversion performed in this assessment and not a replacement for direct Safetensors loading. Each
-model was freshly measured with four worker threads, five warmups, and 30 timed runs. RTen
-receives one fixed randomly generated F32 input per model, reused for all runs.
+model was measured with four worker threads, five warmups, and 30 timed runs. RTen receives one
+fixed randomly generated F32 input per model, reused for all runs.
 
 Install `rten-cli` 0.24, then run the following commands for each medium, small, and tiny official
 ONNX repository. `-n 35` performs five warmups followed by 30 samples; p50 and p90 are calculated
@@ -240,9 +258,6 @@ $RTEN /path/to/PP-OCRv6_tiny_rec_onnx/inference.onnx \
 | small recognizer | `[1,3,48,320]` | 9.290 ms | 10.830 ms | 107.64 lines/s |
 | tiny detector | `[1,3,416,736]` | 18.130 ms | 19.490 ms | 55.16 frames/s |
 | tiny recognizer | `[1,3,48,320]` | 2.100 ms | 2.290 ms | 476.19 lines/s |
-
-Throughput in both native-runtime tables is calculated as `1000 / p50_ms`; it excludes model
-loading, image decoding, preprocessing, and OCR postprocessing.
 
 ## ONNX Runtime Fixed-Shape Probe
 
@@ -283,8 +298,10 @@ The medium detector is roughly 451 GMAC at the validation-frame input size. Cand
 | --- | --- | --- | --- | --- |
 | Direct WGPU | Requested Safetensors | No | Metal/Vulkan | Fixed-shape medium/small/tiny detector and recognizer graphs. WGPU beats the ORT GPU baseline for all six; small/tiny beat Burn, while medium is within 8%. |
 | Candle 0.10.2 | Requested Safetensors | Yes | Metal/CUDA | End-to-end OCR is implemented for medium/small/tiny. Tiny is usable for reduced-resolution local inference; medium needs custom fused/grouped convolution kernels for a materially higher ceiling. |
+| cpu_onnx | Converted fixed-shape ONNX | Yes | No | Four-worker-thread p50 detector/recognizer latency (ms): medium 342.201/38.137, small 47.542/9.983, tiny 21.603/2.149. |
+| cpu | Requested Safetensors | Yes | No | Four-worker-thread p50 detector/recognizer latency (ms): medium 187.865/22.061, small 35.644/8.240, tiny 17.611/1.720. |
 | Burn 0.21 with WGPU/CubeCL | Official ONNX imported at build time | Yes | Metal/WGPU/CUDA backends | Fresh guarded-path p50 detector/recognizer latency (ms): medium 166.927/17.634, small 47.855/10.278, tiny 28.606/3.918. |
-| RTen 0.24 | Official matching ONNX | Yes | No | Fresh four-worker-thread p50 detector/recognizer latency (ms): medium 222.560/36.250, small 39.890/9.290, tiny 18.130/2.100. It does not read the supplied Safetensors directly. |
+| RTen 0.24 | Official matching ONNX | Yes | No | Four-worker-thread p50 detector/recognizer latency (ms): medium 222.560/36.250, small 39.890/9.290, tiny 18.130/2.100. It does not read the supplied Safetensors directly. |
 | ONNX Runtime (ORT) | ONNX | Yes | GPU/ANE | Fixed-shape p50 detector/recognizer latency (ms): CPU medium 303.26/22.68, small 56.13/8.54, tiny 27.84/1.81; GPU medium 184.75/34.35, small 55.58/13.35, tiny 29.65/4.34; ANE medium 180.73/31.87, small 52.87/11.91, tiny 27.40/4.52. |
 | Wonnx 0.5 | Official ONNX | No practical result | WGPU/Metal | Current model preparation fails on unsupported HardSigmoid; detector also needs ConvTranspose support. |
 | Tract 0.23 | Official ONNX | Yes | No | Current dynamic PP-OCRv6 ONNX optimization fails at the first convolution. |

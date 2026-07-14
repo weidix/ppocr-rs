@@ -35,10 +35,16 @@ The `cpu` feature provides direct PP-OCRv6 Safetensors CPU inference for the med
 detector and recognizer models from the PaddlePaddle PP-OCRv6 collection.
 
 ```sh
+./scripts/download-models.sh
+
 cargo run --release --no-default-features --features cpu --bin ppocr-cpu-bench -- \
-  --model /path/to/model.safetensors --kind det --size tiny \
+  --kind det --size tiny \
   --height 416 --width 736 --threads 4 --warmup 5 --runs 30
 ```
+
+The benchmark defaults to the pinned local weight at
+`models/<medium|small|tiny>-<det|rec>/model.safetensors`. Revisions, sizes, and SHA256 values are
+recorded in `models.json`; pass `--model` only to override the local model explicitly.
 
 The Rust API is available under `ppocr_rs::cpu`.
 

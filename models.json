@@ -1,0 +1,48 @@
+{
+  "format": 1,
+  "source": "https://huggingface.co/PaddlePaddle",
+  "models": [
+    {
+      "name": "medium-det",
+      "repository": "PaddlePaddle/PP-OCRv6_medium_det_safetensors",
+      "revision": "4236c2b61741a259c091fd879dcc4edc339e916c",
+      "bytes": 88020412,
+      "sha256": "bd393266c02e1a680b1b34c301d5d0d81e6290440b7f8ab0f5d5032276b17eb1"
+    },
+    {
+      "name": "medium-rec",
+      "repository": "PaddlePaddle/PP-OCRv6_medium_rec_safetensors",
+      "revision": "024cad6a831de75c2c3c26e711ba8c4a82ccd24b",
+      "bytes": 76741720,
+      "sha256": "5f43c16f2a684b1d2284662178bdb604febd3d6bfdb5ca73828d08d0f7c0c3e9"
+    },
+    {
+      "name": "small-det",
+      "repository": "PaddlePaddle/PP-OCRv6_small_det_safetensors",
+      "revision": "eae2ee920a39fb3087637d3dbb58df1896ec1f24",
+      "bytes": 9938124,
+      "sha256": "89a96a8adc4e9cd0c994098edc76022e496d35844392562b4694c8fbc583f2da"
+    },
+    {
+      "name": "small-rec",
+      "repository": "PaddlePaddle/PP-OCRv6_small_rec_safetensors",
+      "revision": "fe049fb103f57443fe8840c54ed06b702f3c1de5",
+      "bytes": 21204736,
+      "sha256": "f65a332afe5aa663f0b9d5706f4ae8457b5b4058a842d5c1eb22df505c27d642"
+    },
+    {
+      "name": "tiny-det",
+      "repository": "PaddlePaddle/PP-OCRv6_tiny_det_safetensors",
+      "revision": "07595f982703daf0d4e120a12a01da8073542f3a",
+      "bytes": 1786412,
+      "sha256": "cae3c88d2a9902fd0293e6b17990428f54bfa7ec98f800a4368e95423a754d16"
+    },
+    {
+      "name": "tiny-rec",
+      "repository": "PaddlePaddle/PP-OCRv6_tiny_rec_safetensors",
+      "revision": "6f2d2d51b4b4226d7a2329a02f416f4994106f3a",
+      "bytes": 4474264,
+      "sha256": "cc3892aba0fbd89afbf6a76d8b7817bb58802668be7a1384ca761ce65612f3f7"
+    }
+  ]
+}

@@ -45,6 +45,77 @@ pub(crate) fn add_in_place(output: &mut [f32], input: &[f32]) {
     axpy(output, input, 1.0);
 }
 
+pub(crate) fn depthwise_conv2d_same(
+    output: &mut [f32],
+    input: &[f32],
+    weights: &[f32],
+    height: usize,
+    width: usize,
+    kernel: usize,
+    bias: f32,
+) {
+    assert!(height > 0 && width > 0);
+    assert!(matches!(kernel, 3 | 5 | 7 | 9));
+    assert_eq!(output.len(), height * width);
+    assert_eq!(input.len(), height * width);
+    assert_eq!(weights.len(), kernel * kernel);
+
+    macro_rules! dispatch {
+        ($kernel:literal) => {{
+            #[cfg(target_arch = "aarch64")]
+            {
+                // SAFETY: Slice dimensions are checked above. The NEON kernel
+                // vectorizes only columns whose complete KxK window is in bounds.
+                unsafe {
+                    neon::depthwise_conv2d_same::<$kernel>(
+                        output, input, weights, height, width, bias,
+                    )
+                };
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            depthwise_conv2d_same_scalar::<$kernel>(output, input, weights, height, width, bias);
+        }};
+    }
+
+    match kernel {
+        3 => dispatch!(3),
+        5 => dispatch!(5),
+        7 => dispatch!(7),
+        9 => dispatch!(9),
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn depthwise_conv2d_same_scalar<const K: usize>(
+    output: &mut [f32],
+    input: &[f32],
+    weights: &[f32],
+    height: usize,
+    width: usize,
+    bias: f32,
+) {
+    let padding = K / 2;
+    for y in 0..height {
+        let kernel_y_start = padding.saturating_sub(y);
+        let kernel_y_end = K.min(height + padding - y);
+        for x in 0..width {
+            let kernel_x_start = padding.saturating_sub(x);
+            let kernel_x_end = K.min(width + padding - x);
+            let mut sum = bias;
+            for kernel_y in kernel_y_start..kernel_y_end {
+                let input_y = y + kernel_y - padding;
+                for kernel_x in kernel_x_start..kernel_x_end {
+                    let input_x = x + kernel_x - padding;
+                    sum = input[input_y * width + input_x]
+                        .mul_add(weights[kernel_y * K + kernel_x], sum);
+                }
+            }
+            output[y * width + x] = sum;
+        }
+    }
+}
+
 pub(crate) fn mul_in_place(output: &mut [f32], input: &[f32]) {
     assert_eq!(output.len(), input.len());
     #[cfg(target_arch = "aarch64")]
@@ -474,7 +545,7 @@ fn gemm_packed_panels_blocked(
     gelu: bool,
 ) {
     const PANEL_COLUMNS: usize = 16;
-    const DEPTH_BLOCK: usize = 1024;
+    const DEPTH_BLOCK: usize = 256;
 
     for depth_start in (0..inner).step_by(DEPTH_BLOCK) {
         let depth = (inner - depth_start).min(DEPTH_BLOCK);
@@ -968,6 +1039,55 @@ mod tests {
             .map(|(expected, actual)| (expected - actual).abs())
             .fold(0.0f32, f32::max);
         assert!(maximum_error < 2e-6, "maximum error: {maximum_error}");
+    }
+
+    #[test]
+    fn depthwise_same_matches_scalar_reference() {
+        for kernel in [3, 5, 7, 9] {
+            for (height, width) in [(2, 3), (9, 37)] {
+                let input = (0..height * width)
+                    .map(|index| ((index * 17 % 43) as f32 - 21.0) / 13.0)
+                    .collect::<Vec<_>>();
+                let weights = (0..kernel * kernel)
+                    .map(|index| ((index * 11 % 31) as f32 - 15.0) / 19.0)
+                    .collect::<Vec<_>>();
+                let bias = -0.375;
+                let padding = kernel / 2;
+                let mut expected = vec![0.0; input.len()];
+                for y in 0..height {
+                    for x in 0..width {
+                        let mut sum = bias;
+                        for kernel_y in 0..kernel {
+                            let padded_y = y + kernel_y;
+                            if padded_y < padding || padded_y - padding >= height {
+                                continue;
+                            }
+                            for kernel_x in 0..kernel {
+                                let padded_x = x + kernel_x;
+                                if padded_x < padding || padded_x - padding >= width {
+                                    continue;
+                                }
+                                sum = input[(padded_y - padding) * width + padded_x - padding]
+                                    .mul_add(weights[kernel_y * kernel + kernel_x], sum);
+                            }
+                        }
+                        expected[y * width + x] = sum;
+                    }
+                }
+
+                let mut actual = vec![0.0; input.len()];
+                depthwise_conv2d_same(&mut actual, &input, &weights, height, width, kernel, bias);
+                let maximum_error = expected
+                    .iter()
+                    .zip(&actual)
+                    .map(|(expected, actual)| (expected - actual).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    maximum_error < 2e-5,
+                    "kernel={kernel}, shape={height}x{width}, maximum error={maximum_error}"
+                );
+            }
+        }
     }
 
     #[test]

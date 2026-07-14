@@ -35,6 +35,94 @@ pub(super) unsafe fn axpy(output: &mut [f32], input: &[f32], scale: f32) {
         output[index] = input[index].mul_add(scale, output[index]);
     }
 }
+
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn depthwise_conv2d_same<const K: usize>(
+    output: &mut [f32],
+    input: &[f32],
+    weights: &[f32],
+    height: usize,
+    width: usize,
+    bias: f32,
+) {
+    debug_assert!(matches!(K, 3 | 5 | 7 | 9));
+    debug_assert_eq!(output.len(), height * width);
+    debug_assert_eq!(input.len(), height * width);
+    debug_assert_eq!(weights.len(), K * K);
+    let padding = K / 2;
+
+    for y in 0..height {
+        let kernel_y_start = padding.saturating_sub(y);
+        let kernel_y_end = K.min(height + padding - y);
+        let vector_start = if width >= K { padding } else { 0 };
+        let vector_columns = if width >= K {
+            (width - 2 * padding) / 16 * 16
+        } else {
+            0
+        };
+        let vector_end = vector_start + vector_columns;
+
+        for x in 0..vector_start {
+            output[y * width + x] =
+                unsafe { depthwise_conv2d_pixel::<K>(input, weights, height, width, y, x, bias) };
+        }
+
+        for x in (vector_start..vector_end).step_by(16) {
+            let mut sums = [vdupq_n_f32(bias); 4];
+            for kernel_y in kernel_y_start..kernel_y_end {
+                let input_y = y + kernel_y - padding;
+                for kernel_x in 0..K {
+                    let input_x = x + kernel_x - padding;
+                    let input_base = unsafe { input.as_ptr().add(input_y * width + input_x) };
+                    let weight = unsafe { *weights.get_unchecked(kernel_y * K + kernel_x) };
+                    for (vector, sum) in sums.iter_mut().enumerate() {
+                        let values = unsafe { vld1q_f32(input_base.add(vector * 4)) };
+                        *sum = vfmaq_n_f32(*sum, values, weight);
+                    }
+                }
+            }
+            let output_base = unsafe { output.as_mut_ptr().add(y * width + x) };
+            for (vector, sum) in sums.into_iter().enumerate() {
+                unsafe { vst1q_f32(output_base.add(vector * 4), sum) };
+            }
+        }
+
+        for x in vector_end..width {
+            output[y * width + x] =
+                unsafe { depthwise_conv2d_pixel::<K>(input, weights, height, width, y, x, bias) };
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn depthwise_conv2d_pixel<const K: usize>(
+    input: &[f32],
+    weights: &[f32],
+    height: usize,
+    width: usize,
+    y: usize,
+    x: usize,
+    bias: f32,
+) -> f32 {
+    let padding = K / 2;
+    let kernel_y_start = padding.saturating_sub(y);
+    let kernel_y_end = K.min(height + padding - y);
+    let kernel_x_start = padding.saturating_sub(x);
+    let kernel_x_end = K.min(width + padding - x);
+    let mut sum = bias;
+    for kernel_y in kernel_y_start..kernel_y_end {
+        let input_y = y + kernel_y - padding;
+        for kernel_x in kernel_x_start..kernel_x_end {
+            let input_x = x + kernel_x - padding;
+            sum = unsafe { *input.get_unchecked(input_y * width + input_x) }.mul_add(
+                unsafe { *weights.get_unchecked(kernel_y * K + kernel_x) },
+                sum,
+            );
+        }
+    }
+    sum
+}
+
 #[target_feature(enable = "neon")]
 pub(super) unsafe fn relu(values: &mut [f32]) {
     let zero = vdupq_n_f32(0.0);
@@ -557,38 +645,53 @@ pub(super) unsafe fn gemm_12x8_packed(
                 accumulators[row * 2 + 1] = initial;
             }
         }
-        for index in 0..inner {
-            let right_base = unsafe { right.as_ptr().add(index * right_stride + column) };
-            let right0 = unsafe { vld1q_f32(right_base) };
-            let right1 = unsafe { vld1q_f32(right_base.add(4)) };
-            // SAFETY: `left` contains `inner` complete groups of twelve packed rows.
-            let weights0 = unsafe { vld1q_f32(left.as_ptr().add(index * 12)) };
-            let weights1 = unsafe { vld1q_f32(left.as_ptr().add(index * 12 + 4)) };
-            let weights2 = unsafe { vld1q_f32(left.as_ptr().add(index * 12 + 8)) };
-            accumulators[0] = vfmaq_laneq_f32::<0>(accumulators[0], right0, weights0);
-            accumulators[1] = vfmaq_laneq_f32::<0>(accumulators[1], right1, weights0);
-            accumulators[2] = vfmaq_laneq_f32::<1>(accumulators[2], right0, weights0);
-            accumulators[3] = vfmaq_laneq_f32::<1>(accumulators[3], right1, weights0);
-            accumulators[4] = vfmaq_laneq_f32::<2>(accumulators[4], right0, weights0);
-            accumulators[5] = vfmaq_laneq_f32::<2>(accumulators[5], right1, weights0);
-            accumulators[6] = vfmaq_laneq_f32::<3>(accumulators[6], right0, weights0);
-            accumulators[7] = vfmaq_laneq_f32::<3>(accumulators[7], right1, weights0);
-            accumulators[8] = vfmaq_laneq_f32::<0>(accumulators[8], right0, weights1);
-            accumulators[9] = vfmaq_laneq_f32::<0>(accumulators[9], right1, weights1);
-            accumulators[10] = vfmaq_laneq_f32::<1>(accumulators[10], right0, weights1);
-            accumulators[11] = vfmaq_laneq_f32::<1>(accumulators[11], right1, weights1);
-            accumulators[12] = vfmaq_laneq_f32::<2>(accumulators[12], right0, weights1);
-            accumulators[13] = vfmaq_laneq_f32::<2>(accumulators[13], right1, weights1);
-            accumulators[14] = vfmaq_laneq_f32::<3>(accumulators[14], right0, weights1);
-            accumulators[15] = vfmaq_laneq_f32::<3>(accumulators[15], right1, weights1);
-            accumulators[16] = vfmaq_laneq_f32::<0>(accumulators[16], right0, weights2);
-            accumulators[17] = vfmaq_laneq_f32::<0>(accumulators[17], right1, weights2);
-            accumulators[18] = vfmaq_laneq_f32::<1>(accumulators[18], right0, weights2);
-            accumulators[19] = vfmaq_laneq_f32::<1>(accumulators[19], right1, weights2);
-            accumulators[20] = vfmaq_laneq_f32::<2>(accumulators[20], right0, weights2);
-            accumulators[21] = vfmaq_laneq_f32::<2>(accumulators[21], right1, weights2);
-            accumulators[22] = vfmaq_laneq_f32::<3>(accumulators[22], right0, weights2);
-            accumulators[23] = vfmaq_laneq_f32::<3>(accumulators[23], right1, weights2);
+        macro_rules! depth_step {
+            ($index:expr) => {{
+                let index = $index;
+                let right_base = unsafe { right.as_ptr().add(index * right_stride + column) };
+                let right0 = unsafe { vld1q_f32(right_base) };
+                let right1 = unsafe { vld1q_f32(right_base.add(4)) };
+                // SAFETY: `left` contains `inner` complete groups of twelve packed rows.
+                let weights0 = unsafe { vld1q_f32(left.as_ptr().add(index * 12)) };
+                let weights1 = unsafe { vld1q_f32(left.as_ptr().add(index * 12 + 4)) };
+                let weights2 = unsafe { vld1q_f32(left.as_ptr().add(index * 12 + 8)) };
+                accumulators[0] = vfmaq_laneq_f32::<0>(accumulators[0], right0, weights0);
+                accumulators[1] = vfmaq_laneq_f32::<0>(accumulators[1], right1, weights0);
+                accumulators[2] = vfmaq_laneq_f32::<1>(accumulators[2], right0, weights0);
+                accumulators[3] = vfmaq_laneq_f32::<1>(accumulators[3], right1, weights0);
+                accumulators[4] = vfmaq_laneq_f32::<2>(accumulators[4], right0, weights0);
+                accumulators[5] = vfmaq_laneq_f32::<2>(accumulators[5], right1, weights0);
+                accumulators[6] = vfmaq_laneq_f32::<3>(accumulators[6], right0, weights0);
+                accumulators[7] = vfmaq_laneq_f32::<3>(accumulators[7], right1, weights0);
+                accumulators[8] = vfmaq_laneq_f32::<0>(accumulators[8], right0, weights1);
+                accumulators[9] = vfmaq_laneq_f32::<0>(accumulators[9], right1, weights1);
+                accumulators[10] = vfmaq_laneq_f32::<1>(accumulators[10], right0, weights1);
+                accumulators[11] = vfmaq_laneq_f32::<1>(accumulators[11], right1, weights1);
+                accumulators[12] = vfmaq_laneq_f32::<2>(accumulators[12], right0, weights1);
+                accumulators[13] = vfmaq_laneq_f32::<2>(accumulators[13], right1, weights1);
+                accumulators[14] = vfmaq_laneq_f32::<3>(accumulators[14], right0, weights1);
+                accumulators[15] = vfmaq_laneq_f32::<3>(accumulators[15], right1, weights1);
+                accumulators[16] = vfmaq_laneq_f32::<0>(accumulators[16], right0, weights2);
+                accumulators[17] = vfmaq_laneq_f32::<0>(accumulators[17], right1, weights2);
+                accumulators[18] = vfmaq_laneq_f32::<1>(accumulators[18], right0, weights2);
+                accumulators[19] = vfmaq_laneq_f32::<1>(accumulators[19], right1, weights2);
+                accumulators[20] = vfmaq_laneq_f32::<2>(accumulators[20], right0, weights2);
+                accumulators[21] = vfmaq_laneq_f32::<2>(accumulators[21], right1, weights2);
+                accumulators[22] = vfmaq_laneq_f32::<3>(accumulators[22], right0, weights2);
+                accumulators[23] = vfmaq_laneq_f32::<3>(accumulators[23], right1, weights2);
+            }};
+        }
+        let mut index = 0;
+        while index + 4 <= inner {
+            depth_step!(index);
+            depth_step!(index + 1);
+            depth_step!(index + 2);
+            depth_step!(index + 3);
+            index += 4;
+        }
+        while index < inner {
+            depth_step!(index);
+            index += 1;
         }
         for row in 0..12 {
             let output_base = unsafe { output.as_mut_ptr().add(row * columns + column) };
