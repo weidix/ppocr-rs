@@ -1,18 +1,21 @@
-use super::{
+use crate::cpu_onnx::{
     kernels::{self, UnaryOperation},
     tensor::{Tensor, TensorData, element_count, strides},
 };
 use anyhow::{Context, Result, bail, ensure};
 use rayon::prelude::*;
 
+pub(crate) type ValueId = usize;
+
 #[derive(Clone, Debug)]
 pub(crate) struct Node {
     pub name: String,
+    pub inputs: Vec<Option<ValueId>>,
+    pub output: ValueId,
     pub operation: Operation,
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) enum Operation {
     Add,
     AveragePool(PoolOptions),
@@ -115,9 +118,11 @@ impl Node {
 
 fn unary(mut inputs: Vec<Tensor>, operation: UnaryOperation) -> Result<Tensor> {
     ensure_input_count(&inputs, 1)?;
-    let mut input = inputs.pop().expect("one input");
-    kernels::unary_in_place(input.f32_mut()?, operation);
-    Ok(input)
+    let input = inputs.pop().expect("one input");
+    let shape = input.shape.clone();
+    let mut values = input.into_f32()?;
+    kernels::unary_in_place(&mut values, operation);
+    Ok(Tensor::new_f32(shape, values))
 }
 
 #[derive(Clone, Copy)]
@@ -137,41 +142,39 @@ fn binary(mut inputs: Vec<Tensor>, operation: BinaryOperation) -> Result<Tensor>
     let right_values = right.as_f32()?;
 
     if left.shape == output_shape && right.shape == output_shape {
-        let mut output = left;
-        let output_values = output.f32_mut()?;
-        if apply_binary_vector(operation, output_values, right_values) {
-            return Ok(output);
+        let mut output = left.into_f32()?;
+        if apply_binary_vector(operation, &mut output, right_values) {
+            return Ok(Tensor::new_f32(output_shape, output));
         } else {
-            output_values
+            output
                 .par_iter_mut()
                 .zip(right_values.par_iter())
                 .for_each(|(left, right)| *left = apply_binary(operation, *left, *right));
         }
-        return Ok(output);
+        return Ok(Tensor::new_f32(output_shape, output));
     }
 
     if right_values.len() == 1 && left.shape == output_shape {
         let right = right_values[0];
-        let mut output = left;
-        let output_values = output.f32_mut()?;
-        if !apply_binary_scalar(operation, output_values, right) {
-            output_values
+        let mut output = left.into_f32()?;
+        if !apply_binary_scalar(operation, &mut output, right) {
+            output
                 .par_iter_mut()
                 .for_each(|left| *left = apply_binary(operation, *left, right));
         }
-        return Ok(output);
+        return Ok(Tensor::new_f32(output_shape, output));
     }
 
     if left.shape == output_shape && is_repeated_suffix(&right.shape, &output_shape) {
-        let mut output = left;
-        for chunk in output.f32_mut()?.chunks_mut(right_values.len()) {
+        let mut output = left.into_f32()?;
+        for chunk in output.chunks_mut(right_values.len()) {
             if !apply_binary_vector(operation, chunk, right_values) {
                 for (left, right) in chunk.iter_mut().zip(right_values) {
                     *left = apply_binary(operation, *left, *right);
                 }
             }
         }
-        return Ok(output);
+        return Ok(Tensor::new_f32(output_shape, output));
     }
 
     if left.shape == output_shape
@@ -181,9 +184,9 @@ fn binary(mut inputs: Vec<Tensor>, operation: BinaryOperation) -> Result<Tensor>
         && right.shape[1] == output_shape[1]
         && right.shape[2..] == [1, 1]
     {
-        let mut output = left;
+        let mut output = left.into_f32()?;
         let channel_size = output_shape[2] * output_shape[3];
-        for (channel, values) in output.f32_mut()?.chunks_mut(channel_size).enumerate() {
+        for (channel, values) in output.chunks_mut(channel_size).enumerate() {
             let right = right_values[channel % output_shape[1]];
             if !apply_binary_scalar(operation, values, right) {
                 for value in values {
@@ -191,7 +194,7 @@ fn binary(mut inputs: Vec<Tensor>, operation: BinaryOperation) -> Result<Tensor>
                 }
             }
         }
-        return Ok(output);
+        return Ok(Tensor::new_f32(output_shape, output));
     }
 
     let left_values = left.as_f32()?;
@@ -1465,24 +1468,23 @@ fn unsqueeze(mut inputs: Vec<Tensor>, attribute_axes: &[i64]) -> Result<Tensor> 
 
 fn softmax(mut inputs: Vec<Tensor>, axis: i64) -> Result<Tensor> {
     ensure_input_count(&inputs, 1)?;
-    let mut input = inputs.pop().expect("one input");
+    let input = inputs.pop().expect("one input");
     let axis = normalize_axis(axis, input.shape.len())?;
     let axis_len = input.shape[axis];
     let inner = element_count(&input.shape[axis + 1..]).context("Softmax shape overflow")?;
     ensure!(inner == 1, "only last-dimension Softmax is supported");
-    input
-        .f32_mut()?
-        .par_chunks_mut(axis_len)
-        .for_each(|values| {
-            kernels::softmax_in_place(values);
-        });
-    Ok(input)
+    let shape = input.shape.clone();
+    let mut output = input.into_f32()?;
+    output.par_chunks_mut(axis_len).for_each(|values| {
+        kernels::softmax_in_place(values);
+    });
+    Ok(Tensor::new_f32(shape, output))
 }
 
 fn bias_softmax(mut inputs: Vec<Tensor>, axis: i64) -> Result<Tensor> {
     ensure_input_count(&inputs, 2)?;
     let bias = inputs.pop().expect("bias input");
-    let mut input = inputs.pop().expect("data input");
+    let input = inputs.pop().expect("data input");
     let axis = normalize_axis(axis, input.shape.len())?;
     let axis_len = input.shape[axis];
     let inner = element_count(&input.shape[axis + 1..]).context("Softmax shape overflow")?;
@@ -1492,14 +1494,13 @@ fn bias_softmax(mut inputs: Vec<Tensor>, axis: i64) -> Result<Tensor> {
         bias.len() == axis_len,
         "Softmax bias length does not match its axis"
     );
-    input
-        .f32_mut()?
-        .par_chunks_mut(axis_len)
-        .for_each(|values| {
-            kernels::add_in_place(values, bias);
-            kernels::softmax_in_place(values);
-        });
-    Ok(input)
+    let shape = input.shape.clone();
+    let mut output = input.into_f32()?;
+    output.par_chunks_mut(axis_len).for_each(|values| {
+        kernels::add_in_place(values, bias);
+        kernels::softmax_in_place(values);
+    });
+    Ok(Tensor::new_f32(shape, output))
 }
 
 fn broadcast_shape(left: &[usize], right: &[usize]) -> Result<Vec<usize>> {

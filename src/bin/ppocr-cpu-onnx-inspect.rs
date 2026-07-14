@@ -11,7 +11,7 @@ fn main() -> Result<()> {
     let mut arguments = env::args().skip(1);
     let path = arguments
         .next()
-        .context("usage: ppocr-cpu-inspect MODEL.onnx")?;
+        .context("usage: ppocr-cpu-onnx-inspect MODEL.onnx")?;
     let conv_shapes = arguments.next().as_deref() == Some("--conv-shapes");
     inspect(Path::new(&path), conv_shapes)
 }

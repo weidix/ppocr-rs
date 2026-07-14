@@ -1,19 +1,17 @@
 use anyhow::{Context, Result, bail};
-use ppocr_rs::cpu::convert_onnx;
+use ppocr_rs::cpu_onnx::convert_onnx;
 use std::{env, path::PathBuf};
 
 fn main() -> Result<()> {
     let mut arguments = env::args_os().skip(1);
-    let input = PathBuf::from(
-        arguments
-            .next()
-            .context("usage: ppocr-cpu-convert INPUT.onnx OUTPUT.ppocr-cpu --shape N C H W")?,
-    );
-    let output = PathBuf::from(
-        arguments
-            .next()
-            .context("usage: ppocr-cpu-convert INPUT.onnx OUTPUT.ppocr-cpu --shape N C H W")?,
-    );
+    let input =
+        PathBuf::from(arguments.next().context(
+            "usage: ppocr-cpu-onnx-convert INPUT.onnx OUTPUT.ppocr-cpu --shape N C H W",
+        )?);
+    let output =
+        PathBuf::from(arguments.next().context(
+            "usage: ppocr-cpu-onnx-convert INPUT.onnx OUTPUT.ppocr-cpu --shape N C H W",
+        )?);
     ensure_flag(arguments.next(), "--shape")?;
     let mut shape = [0usize; 4];
     for dimension in &mut shape {

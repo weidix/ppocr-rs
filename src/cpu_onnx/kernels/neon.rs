@@ -1,5 +1,3 @@
-//! AArch64 NEON kernels.
-
 use core::arch::aarch64::*;
 
 #[target_feature(enable = "neon")]
@@ -49,10 +47,10 @@ pub(super) unsafe fn relu(values: &mut [f32]) {
         let v2 = unsafe { vld1q_f32(values.as_ptr().add(index + 8)) };
         let v3 = unsafe { vld1q_f32(values.as_ptr().add(index + 12)) };
         unsafe {
-            vst1q_f32(values.as_mut_ptr().add(index), vmaxnmq_f32(v0, zero));
-            vst1q_f32(values.as_mut_ptr().add(index + 4), vmaxnmq_f32(v1, zero));
-            vst1q_f32(values.as_mut_ptr().add(index + 8), vmaxnmq_f32(v2, zero));
-            vst1q_f32(values.as_mut_ptr().add(index + 12), vmaxnmq_f32(v3, zero));
+            vst1q_f32(values.as_mut_ptr().add(index), vmaxq_f32(v0, zero));
+            vst1q_f32(values.as_mut_ptr().add(index + 4), vmaxq_f32(v1, zero));
+            vst1q_f32(values.as_mut_ptr().add(index + 8), vmaxq_f32(v2, zero));
+            vst1q_f32(values.as_mut_ptr().add(index + 12), vmaxq_f32(v3, zero));
         }
         index += 16;
     }
@@ -95,26 +93,6 @@ pub(super) unsafe fn affine(values: &mut [f32], scale: f32, bias: f32) {
     }
     for value in &mut values[vector_len..] {
         *value = value.mul_add(scale, vgetq_lane_f32::<0>(bias));
-    }
-}
-
-#[target_feature(enable = "neon")]
-pub(super) unsafe fn residual_mul(values: &mut [f32], gate: f32) {
-    let zero = vdupq_n_f32(0.0);
-    let vector_len = values.len() / 16 * 16;
-    for index in (0..vector_len).step_by(16) {
-        for vector in 0..4 {
-            let offset = index + vector * 4;
-            let original = unsafe { vld1q_f32(values.as_ptr().add(offset)) };
-            let scaled = vfmaq_n_f32(zero, original, gate);
-            let output = vfmaq_n_f32(original, scaled, 1.0);
-            unsafe { vst1q_f32(values.as_mut_ptr().add(offset), output) };
-        }
-    }
-    for value in &mut values[vector_len..] {
-        let original = *value;
-        let scaled = original.mul_add(gate, 0.0);
-        *value = scaled.mul_add(1.0, original);
     }
 }
 
@@ -531,13 +509,13 @@ pub(super) unsafe fn max_pool_2x2_row(output: &mut [f32], current: &[f32], next:
         for vector in 0..4 {
             let offset = x + vector * 4;
             let mut maximum =
-                vmaxnmq_f32(unsafe { vld1q_f32(current.as_ptr().add(offset)) }, unsafe {
+                vmaxq_f32(unsafe { vld1q_f32(current.as_ptr().add(offset)) }, unsafe {
                     vld1q_f32(current.as_ptr().add(offset + 1))
                 });
             if let Some(next) = next {
-                maximum = vmaxnmq_f32(
+                maximum = vmaxq_f32(
                     maximum,
-                    vmaxnmq_f32(unsafe { vld1q_f32(next.as_ptr().add(offset)) }, unsafe {
+                    vmaxq_f32(unsafe { vld1q_f32(next.as_ptr().add(offset)) }, unsafe {
                         vld1q_f32(next.as_ptr().add(offset + 1))
                     }),
                 );

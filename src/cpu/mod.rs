@@ -1,9 +1,11 @@
+//! Direct Safetensors CPU inference.
+
+mod backend;
 mod kernels;
 mod model;
 mod ops;
 mod tensor;
+mod weights;
 
-#[cfg(feature = "cpu-convert")]
-pub use model::convert_onnx;
-pub use model::{CpuModel, CpuOptions};
+pub use model::{CpuOptions, Detector, ModelSize, Recognizer};
 pub use tensor::Tensor;

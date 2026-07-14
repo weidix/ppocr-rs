@@ -1,54 +1,5 @@
-//! Tensor storage used by the native CPU runtime.
-
 use anyhow::{Result, bail};
 use std::sync::Arc;
-
-pub(crate) trait IntoShape {
-    fn into_shape(self) -> Vec<usize>;
-}
-
-impl IntoShape for usize {
-    fn into_shape(self) -> Vec<usize> {
-        vec![self]
-    }
-}
-
-impl IntoShape for Vec<usize> {
-    fn into_shape(self) -> Vec<usize> {
-        self
-    }
-}
-
-impl IntoShape for &[usize] {
-    fn into_shape(self) -> Vec<usize> {
-        self.to_vec()
-    }
-}
-
-impl<const N: usize> IntoShape for [usize; N] {
-    fn into_shape(self) -> Vec<usize> {
-        self.to_vec()
-    }
-}
-
-macro_rules! tuple_shape {
-    ($($name:ident),+) => {
-        impl IntoShape for ($(tuple_shape!(@ty $name),)+) {
-            #[allow(non_snake_case)]
-            fn into_shape(self) -> Vec<usize> {
-                let ($($name,)+) = self;
-                vec![$($name),+]
-            }
-        }
-    };
-    (@ty $name:ident) => { usize };
-}
-
-tuple_shape!(A);
-tuple_shape!(A, B);
-tuple_shape!(A, B, C);
-tuple_shape!(A, B, C, D);
-tuple_shape!(A, B, C, D, E);
 
 #[derive(Clone, Debug)]
 pub struct Tensor {
@@ -82,7 +33,7 @@ impl Tensor {
     }
 
     pub(crate) fn new_f32(shape: Vec<usize>, data: Vec<f32>) -> Self {
-        assert_eq!(element_count(&shape), Some(data.len()));
+        debug_assert_eq!(element_count(&shape), Some(data.len()));
         Self {
             shape,
             data: TensorData::F32(Arc::new(data)),
@@ -90,7 +41,7 @@ impl Tensor {
     }
 
     pub(crate) fn new_i64(shape: Vec<usize>, data: Vec<i64>) -> Self {
-        assert_eq!(element_count(&shape), Some(data.len()));
+        debug_assert_eq!(element_count(&shape), Some(data.len()));
         Self {
             shape,
             data: TensorData::I64(Arc::new(data)),
@@ -123,13 +74,6 @@ impl Tensor {
         match &self.data {
             TensorData::I64(data) => Ok(data),
             TensorData::F32(_) => bail!("expected an i64 tensor"),
-        }
-    }
-
-    pub(crate) fn f32_mut(&mut self) -> Result<&mut Vec<f32>> {
-        match &mut self.data {
-            TensorData::F32(data) => Ok(Arc::make_mut(data)),
-            TensorData::I64(_) => bail!("expected an f32 tensor"),
         }
     }
 

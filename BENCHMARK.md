@@ -176,6 +176,35 @@ optional autotune feature is not usable on this macOS Metal/WGPU combination: it
 tuning-buffer map fails validation and the fusion scheduler subsequently panics. No autotuned
 latency is reported.
 
+## Direct Safetensors WGPU Probe
+
+The root package's `gpu` feature executes the released F32 Safetensors directly. It uses
+Metal exclusively on macOS and Vulkan exclusively on other supported platforms. Model loading,
+input upload, and output readback are excluded from timing; each sample records the fixed-shape
+graph, submits it, and waits for completion. These Apple M4 measurements use the same fixed raw
+F32 inputs as the ORT probe, with five warmups and 30 timed runs.
+
+| Model | WGPU p50 | p90 | Throughput | Burn p50 | WGPU vs Burn | ORT CPU / GPU / ANE p50 | WGPU vs ORT GPU |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| medium detector | 173.197 ms | 174.520 ms | 5.77 frames/s | 166.927 ms | 3.8% slower | 303.26 / 184.75 / 180.73 ms | 6.3% faster |
+| medium recognizer | 19.050 ms | 20.177 ms | 52.49 lines/s | 17.634 ms | 8.0% slower | 22.68 / 34.35 / 31.87 ms | 44.5% faster |
+| small detector | 36.589 ms | 36.778 ms | 27.33 frames/s | 47.855 ms | 23.5% faster | 56.13 / 55.58 / 52.87 ms | 34.2% faster |
+| small recognizer | 8.843 ms | 8.945 ms | 113.08 lines/s | 10.278 ms | 14.0% faster | 8.54 / 13.35 / 11.91 ms | 33.8% faster |
+| tiny detector | 20.337 ms | 21.575 ms | 49.17 frames/s | 28.606 ms | 28.9% faster | 27.84 / 29.65 / 27.40 ms | 31.4% faster |
+| tiny recognizer | 3.837 ms | 3.870 ms | 260.61 lines/s | 3.918 ms | 2.1% faster | 1.81 / 4.34 / 4.52 ms | 11.6% faster |
+
+WGPU beats Burn for both small and tiny models. Medium is within 3.8% for detection and 8.0% for
+recognition, so the current implementation does not claim a clean Burn win at that size. All six
+WGPU results beat the documented ORT GPU row. That ORT row is CoreML `CPUAndGPU`, which permits CPU
+fallback and is not a pure Metal baseline. ORT CPU remains faster for the small and tiny
+recognizers.
+
+The synchronized validation forward produced finite, nonzero output at the expected shape for all
+six models. Detector comparison against ORT stayed below `3.734604e-7` maximum absolute error.
+Medium, small, and tiny recognizers matched ORT argmax at `40/40` time steps. Tiny's larger
+per-logit ORT difference is also reproduced by the independent CPU Safetensors implementation;
+against the strict Safetensors reference, GPU maximum absolute error is about `4.83e-6`.
+
 ## Native CPU ONNX Control
 
 RTen 0.24 is a separate pure-Rust CPU control using the official matching ONNX repositories, not a
@@ -252,6 +281,7 @@ The medium detector is roughly 451 GMAC at the validation-frame input size. Cand
 
 | Runtime | Model format | CPU | GPU | Assessment |
 | --- | --- | --- | --- | --- |
+| Direct WGPU | Requested Safetensors | No | Metal/Vulkan | Fixed-shape medium/small/tiny detector and recognizer graphs. WGPU beats the ORT GPU baseline for all six; small/tiny beat Burn, while medium is within 8%. |
 | Candle 0.10.2 | Requested Safetensors | Yes | Metal/CUDA | End-to-end OCR is implemented for medium/small/tiny. Tiny is usable for reduced-resolution local inference; medium needs custom fused/grouped convolution kernels for a materially higher ceiling. |
 | Burn 0.21 with WGPU/CubeCL | Official ONNX imported at build time | Yes | Metal/WGPU/CUDA backends | Fresh guarded-path p50 detector/recognizer latency (ms): medium 166.927/17.634, small 47.855/10.278, tiny 28.606/3.918. |
 | RTen 0.24 | Official matching ONNX | Yes | No | Fresh four-worker-thread p50 detector/recognizer latency (ms): medium 222.560/36.250, small 39.890/9.290, tiny 18.130/2.100. It does not read the supplied Safetensors directly. |

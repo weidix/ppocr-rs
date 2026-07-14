@@ -1,27 +1,52 @@
-use crate::cpu::{
-    ops::{ConvOptions, Node, Operation, PoolOptions, ValueId},
-    tensor::{Tensor, element_count},
+use super::{
+    backend::{
+        Conv2d as BackendConv2d, ConvTranspose2d as BackendConvTranspose2d, LayerNorm, Linear,
+    },
+    tensor::Tensor,
+    weights::{VarBuilder, Weights},
 };
-
-#[cfg(feature = "cpu-convert")]
-use crate::cpu::tensor::TensorData;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use std::{
-    fs::File,
-    io::{BufReader, Read},
-    path::Path,
-};
+use std::{path::Path, str::FromStr};
 
-#[cfg(feature = "cpu-convert")]
-use std::io::{BufWriter, Write};
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelSize {
+    Medium,
+    Small,
+    Tiny,
+}
 
-const MAGIC: &[u8; 8] = b"PPOCRCPU";
-const FORMAT_VERSION: u32 = 1;
-const NONE_VALUE_ID: u32 = u32::MAX;
-const MAX_RANK: usize = 16;
-const MAX_NODES: usize = 10_000;
-const MAX_VALUES: usize = 20_000;
+impl ModelSize {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Medium => "medium",
+            Self::Small => "small",
+            Self::Tiny => "tiny",
+        }
+    }
+
+    pub const fn recognizer_classes(self) -> usize {
+        match self {
+            Self::Medium | Self::Small => 18_710,
+            Self::Tiny => 6_906,
+        }
+    }
+}
+
+impl FromStr for ModelSize {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "medium" => Ok(Self::Medium),
+            "small" => Ok(Self::Small),
+            "tiny" => Ok(Self::Tiny),
+            _ => Err(format!(
+                "unsupported model size {value:?}; expected medium, small, or tiny"
+            )),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct CpuOptions {
@@ -38,1412 +63,1662 @@ impl Default for CpuOptions {
     }
 }
 
-pub struct CpuModel {
-    data: ModelData,
-    pool: ThreadPool,
+fn thread_pool(options: CpuOptions) -> Result<ThreadPool> {
+    ensure!(options.threads > 0, "CPU thread count must be positive");
+    ThreadPoolBuilder::new()
+        .num_threads(options.threads)
+        .thread_name(|index| format!("ppocr-cpu-{index}"))
+        .build()
+        .context("create CPU inference thread pool")
 }
 
-struct ModelData {
-    input: ValueId,
-    output: ValueId,
-    input_shape: Vec<usize>,
-    initial_values: Vec<Option<Tensor>>,
-    nodes: Vec<Node>,
-    use_counts: Vec<usize>,
+#[derive(Clone, Copy)]
+enum Activation {
+    None,
+    Relu,
+    Silu,
+    HardSigmoid,
+    HardSigmoidFive,
 }
 
-impl CpuModel {
-    pub fn load(path: impl AsRef<Path>, options: CpuOptions) -> Result<Self> {
-        ensure!(options.threads > 0, "CPU thread count must be positive");
-        let path = path.as_ref();
-        let file = File::open(path).with_context(|| format!("open model {}", path.display()))?;
-        let mut data = ModelData::read(&mut BufReader::new(file))
-            .with_context(|| format!("decode model {}", path.display()))?;
-        data.prepare_pointwise_weights()?;
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(options.threads)
-            .thread_name(|index| format!("ppocr-cpu-{index}"))
-            .build()
-            .context("create CPU inference thread pool")?;
-        Ok(Self { data, pool })
-    }
-
-    pub fn input_shape(&self) -> &[usize] {
-        &self.data.input_shape
-    }
-
-    pub fn run(&self, input: Tensor) -> Result<Tensor> {
-        ensure!(
-            input.shape() == self.data.input_shape,
-            "model expects input shape {:?}, found {:?}",
-            self.data.input_shape,
-            input.shape()
-        );
-        self.pool.install(|| self.data.run(input))
+impl Activation {
+    fn forward(self, input: Tensor) -> Result<Tensor> {
+        match self {
+            Self::None => Ok(input),
+            Self::Relu => input.into_relu(),
+            Self::Silu => input.into_silu(),
+            Self::HardSigmoid => input.into_hard_sigmoid(1.0 / 6.0, 0.5),
+            Self::HardSigmoidFive => input.into_hard_sigmoid(0.2, 0.5),
+        }
     }
 }
 
-impl ModelData {
-    fn prepare_pointwise_weights(&mut self) -> Result<()> {
-        use std::collections::HashSet;
+struct Conv2d {
+    convolution: BackendConv2d,
+}
 
-        let mut packed = HashSet::new();
-        for node in &mut self.nodes {
-            let (Operation::Conv(options) | Operation::ConvGelu(options)) = &mut node.operation
-            else {
-                continue;
-            };
-            if options.groups != 1 {
-                continue;
-            }
-            let weight_id = node
-                .inputs
-                .get(1)
-                .copied()
-                .flatten()
-                .context("Conv node has no weight input")?;
-            let weight = self.initial_values[weight_id]
-                .as_ref()
-                .context("Conv weight is not an initializer")?;
-            if weight.shape.len() != 4
-                || (weight.shape[2..] != [1, 1]
-                    && !(options.strides != [1, 1] && weight.shape[0] >= 48))
-            {
-                continue;
-            }
-            options.packed_pointwise = true;
-            if !packed.insert(weight_id) {
-                continue;
-            }
-            let rows = weight.shape[0];
-            let source = weight.as_f32()?;
-            let inner = source
-                .len()
-                .checked_div(rows)
-                .context("Conv weight has zero output channels")?;
-            let mut values = Vec::with_capacity(source.len());
-            for row_start in (0..rows).step_by(12) {
-                let block_rows = (rows - row_start).min(12);
-                for index in 0..inner {
-                    for row in 0..block_rows {
-                        values.push(source[(row_start + row) * inner + index]);
-                    }
-                }
-            }
-            self.initial_values[weight_id] = Some(Tensor::new_f32(weight.shape.clone(), values));
-        }
-        Ok(())
+impl Conv2d {
+    #[allow(clippy::too_many_arguments)]
+    fn load(
+        vb: VarBuilder<'_>,
+        in_channels: usize,
+        out_channels: usize,
+        kernel: [usize; 2],
+        stride: [usize; 2],
+        pads: [usize; 4],
+        bias: bool,
+        groups: usize,
+    ) -> Result<Self> {
+        let weight = vb.get(
+            [out_channels, in_channels / groups, kernel[0], kernel[1]],
+            "weight",
+        )?;
+        let bias = bias.then(|| vb.get(out_channels, "bias")).transpose()?;
+        Ok(Self {
+            convolution: BackendConv2d::new(weight, bias, stride, pads, groups)?,
+        })
     }
 
-    fn run(&self, input: Tensor) -> Result<Tensor> {
-        let mut values = self.initial_values.clone();
-        values[self.input] = Some(input);
-        let mut uses = self.use_counts.clone();
-        let profile = std::env::var_os("PPOCR_CPU_PROFILE").is_some();
-        for node in &self.nodes {
-            let start = profile.then(std::time::Instant::now);
-            let mut inputs = Vec::with_capacity(node.inputs.len());
-            for &input_id in node.inputs.iter().flatten() {
-                let value = values[input_id].as_ref().with_context(|| {
-                    format!("{} references unavailable value {input_id}", node.name)
-                })?;
-                if uses[input_id] == 1 {
-                    inputs.push(values[input_id].take().expect("value checked above"));
-                } else {
-                    inputs.push(value.clone());
-                }
-                uses[input_id] = uses[input_id]
-                    .checked_sub(1)
-                    .with_context(|| format!("invalid use count for value {input_id}"))?;
-            }
-            let output = node.run(inputs)?;
-            let output_shape = profile.then(|| output.shape().to_vec());
-            ensure!(
-                values[node.output].is_none(),
-                "{} writes value {} twice",
-                node.name,
-                node.output
-            );
-            values[node.output] = Some(output);
-            if let Some(start) = start {
-                eprintln!(
-                    "{:.6}\t{}\t{:?}",
-                    start.elapsed().as_secs_f64() * 1_000.0,
-                    node.name,
-                    output_shape.expect("profile shape captured")
-                );
-            }
-        }
-        values[self.output]
-            .take()
-            .context("model did not produce its graph output")
+    #[allow(clippy::too_many_arguments)]
+    fn load_bn(
+        vb: VarBuilder<'_>,
+        in_channels: usize,
+        out_channels: usize,
+        kernel: [usize; 2],
+        stride: [usize; 2],
+        pads: [usize; 4],
+        bias: bool,
+        groups: usize,
+        norm_name: &str,
+    ) -> Result<Self> {
+        let conv = vb.pp("convolution");
+        let weight = conv.get(
+            [out_channels, in_channels / groups, kernel[0], kernel[1]],
+            "weight",
+        )?;
+        let bias = bias.then(|| conv.get(out_channels, "bias")).transpose()?;
+        let (weight, bias) = fold_batch_norm(weight, bias, vb.pp(norm_name), out_channels)?;
+        Ok(Self {
+            convolution: BackendConv2d::new(weight, Some(bias), stride, pads, groups)?,
+        })
     }
 
-    fn finish(mut self) -> Result<Self> {
-        ensure!(
-            self.initial_values.len() <= MAX_VALUES,
-            "model has too many values"
-        );
-        ensure!(self.nodes.len() <= MAX_NODES, "model has too many nodes");
-        let mut use_counts = vec![0usize; self.initial_values.len()];
-        for node in &self.nodes {
-            ensure!(
-                node.output < use_counts.len(),
-                "node output is out of range"
-            );
-            for &input in node.inputs.iter().flatten() {
-                ensure!(input < use_counts.len(), "node input is out of range");
-                use_counts[input] += 1;
-            }
-        }
-        use_counts[self.output] += 1;
-        self.use_counts = use_counts;
-        Ok(self)
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.convolution.forward(input)
     }
 
-    #[cfg(feature = "cpu-convert")]
-    fn optimize(mut self) -> Result<Self> {
-        self.fuse_conv_biases()?;
-        self.fold_conv_batch_normalization()?;
-        let uses = value_uses(&self.nodes, self.initial_values.len());
-        let mut optimized = Vec::with_capacity(self.nodes.len());
-        let mut index = 0;
-        while index < self.nodes.len() {
-            if let Some(node) = match_gelu(&self.nodes[index..], &self.initial_values, &uses) {
-                optimized.push(node);
-                index += 5;
-                continue;
-            }
-            if let Some((node, consumed)) = match_gated_activation(&self.nodes[index..], &uses) {
-                optimized.push(node);
-                index += consumed;
-                continue;
-            }
-            optimized.push(self.nodes[index].clone());
-            index += 1;
-        }
-        let uses = value_uses(&optimized, self.initial_values.len());
-        let mut fused = Vec::with_capacity(optimized.len());
-        let mut index = 0;
-        while index < optimized.len() {
-            let conv = &optimized[index];
-            let gelu = optimized.get(index + 1);
-            if let (Operation::Conv(options), Some(gelu)) = (&conv.operation, gelu)
-                && matches!(gelu.operation, Operation::Gelu)
-                && uses[conv.output] == 1
-                && node_inputs(gelu).as_deref() == Some(&[conv.output])
-            {
-                fused.push(Node {
-                    name: format!("FusedConvGelu.{}", conv.name),
-                    inputs: conv.inputs.clone(),
-                    output: gelu.output,
-                    operation: Operation::ConvGelu(options.clone()),
-                });
-                index += 2;
-            } else {
-                fused.push(conv.clone());
-                index += 1;
-            }
-        }
-        let uses = value_uses(&fused, self.initial_values.len());
-        let mut optimized = Vec::with_capacity(fused.len());
-        let mut index = 0;
-        while index < fused.len() {
-            let add = &fused[index];
-            let softmax = fused.get(index + 1);
-            let inputs = node_inputs(add);
-            let bias_and_data = inputs.as_deref().and_then(|inputs| {
-                if inputs.len() != 2 {
-                    return None;
-                }
-                let first_constant = self.initial_values[inputs[0]].is_some();
-                let second_constant = self.initial_values[inputs[1]].is_some();
-                match (first_constant, second_constant) {
-                    (true, false) => Some((inputs[0], inputs[1])),
-                    (false, true) => Some((inputs[1], inputs[0])),
-                    _ => None,
-                }
-            });
-            if let (Operation::Add, Some(softmax), Some((bias, data))) =
-                (&add.operation, softmax, bias_and_data)
-                && let Operation::Softmax { axis } = softmax.operation
-                && uses[add.output] == 1
-                && node_inputs(softmax).is_some_and(|inputs| inputs == [add.output])
-            {
-                optimized.push(Node {
-                    name: format!("FusedBiasSoftmax.{}", add.name),
-                    inputs: vec![Some(data), Some(bias)],
-                    output: softmax.output,
-                    operation: Operation::BiasSoftmax { axis },
-                });
-                index += 2;
-            } else {
-                optimized.push(add.clone());
-                index += 1;
-            }
-        }
-        let uses = value_uses(&optimized, self.initial_values.len());
-        let mut fused = Vec::with_capacity(optimized.len());
-        let mut index = 0;
-        while index < optimized.len() {
-            let matmul = &optimized[index];
-            let bias_softmax = optimized.get(index + 1);
-            if let (Operation::MatMul, Some(bias_softmax)) = (&matmul.operation, bias_softmax)
-                && let Operation::BiasSoftmax { axis } = bias_softmax.operation
-                && uses[matmul.output] == 1
-                && node_inputs(bias_softmax)
-                    .is_some_and(|inputs| inputs.len() == 2 && inputs[0] == matmul.output)
-            {
-                let mut inputs = matmul.inputs.clone();
-                inputs.push(bias_softmax.inputs[1]);
-                fused.push(Node {
-                    name: format!("FusedMatMulBiasSoftmax.{}", matmul.name),
-                    inputs,
-                    output: bias_softmax.output,
-                    operation: Operation::MatMulBiasSoftmax { axis },
-                });
-                index += 2;
-            } else {
-                fused.push(matmul.clone());
-                index += 1;
-            }
-        }
-        self.nodes = fused;
-        Ok(self)
-    }
-
-    #[cfg(feature = "cpu-convert")]
-    fn fuse_conv_biases(&mut self) -> Result<()> {
-        let uses = value_uses(&self.nodes, self.initial_values.len());
-        let mut fused = Vec::with_capacity(self.nodes.len());
-        let mut index = 0;
-        while index < self.nodes.len() {
-            let Some(add) = self.nodes.get(index + 1) else {
-                fused.push(self.nodes[index].clone());
-                break;
-            };
-            let mut conv = self.nodes[index].clone();
-            let add_inputs = node_inputs(add);
-            let bias_id = add_inputs
-                .as_deref()
-                .filter(|_| matches!(conv.operation, Operation::Conv(_)))
-                .filter(|_| matches!(add.operation, Operation::Add))
-                .filter(|_| uses[conv.output] == 1)
-                .and_then(|inputs| other_input(inputs, conv.output))
-                .filter(|&id| self.initial_values[id].is_some());
-            let Some(bias_id) = bias_id else {
-                fused.push(conv);
-                index += 1;
-                continue;
-            };
-            if conv.inputs.get(2).is_some_and(Option::is_some) {
-                fused.push(conv);
-                index += 1;
-                continue;
-            }
-            let weight_id = conv
-                .inputs
-                .get(1)
-                .copied()
-                .flatten()
-                .context("Conv node has no weight input")?;
-            let output_channels = self.initial_values[weight_id]
-                .as_ref()
-                .context("Conv weight is not an initializer")?
-                .shape
-                .first()
-                .copied()
-                .context("Conv weight has no output-channel dimension")?;
-            if self.initial_values[bias_id]
-                .as_ref()
-                .context("Conv bias is unavailable")?
-                .as_f32()?
-                .len()
-                != output_channels
-            {
-                fused.push(conv);
-                index += 1;
-                continue;
-            }
-            if conv.inputs.len() == 2 {
-                conv.inputs.push(Some(bias_id));
-            } else {
-                conv.inputs[2] = Some(bias_id);
-            }
-            conv.output = add.output;
-            conv.name = format!("FusedConvBias.{}", conv.name);
-            fused.push(conv);
-            index += 2;
-        }
-        self.nodes = fused;
-        Ok(())
-    }
-
-    #[cfg(feature = "cpu-convert")]
-    fn fold_conv_batch_normalization(&mut self) -> Result<()> {
-        let uses = value_uses(&self.nodes, self.initial_values.len());
-        let mut fused = Vec::with_capacity(self.nodes.len());
-        let mut index = 0;
-        while index < self.nodes.len() {
-            let Some(next) = self.nodes.get(index + 1) else {
-                fused.push(self.nodes[index].clone());
-                break;
-            };
-            let mut conv = self.nodes[index].clone();
-            let (batch_norm, squeeze) =
-                if matches!(next.operation, Operation::BatchNormalization { .. }) {
-                    (next, None)
-                } else if matches!(&next.operation, Operation::Squeeze { axes } if axes == &[2])
-                    && uses[conv.output] == 1
-                    && node_inputs(next).is_some_and(|inputs| inputs.first() == Some(&conv.output))
-                {
-                    let Some(batch_norm) = self.nodes.get(index + 2) else {
-                        fused.push(conv);
-                        index += 1;
-                        continue;
-                    };
-                    (batch_norm, Some(next))
-                } else {
-                    fused.push(conv);
-                    index += 1;
-                    continue;
-                };
-            let Operation::BatchNormalization { epsilon } = batch_norm.operation else {
-                fused.push(conv);
-                index += 1;
-                continue;
-            };
-            let Some(inputs) = node_inputs(batch_norm) else {
-                fused.push(conv);
-                index += 1;
-                continue;
-            };
-            let batch_norm_input = squeeze.map_or(conv.output, |squeeze| squeeze.output);
-            if !matches!(conv.operation, Operation::Conv(_))
-                || uses[conv.output] != 1
-                || squeeze.is_some_and(|squeeze| uses[squeeze.output] != 1)
-                || inputs.len() != 5
-                || inputs[0] != batch_norm_input
-            {
-                fused.push(conv);
-                index += 1;
-                continue;
-            }
-
-            let weight_id = conv
-                .inputs
-                .get(1)
-                .copied()
-                .flatten()
-                .context("Conv node has no weight input")?;
-            let weight = self.initial_values[weight_id]
-                .as_ref()
-                .context("Conv weight is not an initializer")?;
-            let output_channels = weight
-                .shape
-                .first()
-                .copied()
-                .context("Conv weight has no output-channel dimension")?;
-            let channel_size = weight
-                .len()
-                .checked_div(output_channels)
-                .context("Conv has zero output channels")?;
-            ensure!(
-                channel_size * output_channels == weight.len(),
-                "Conv weight size is not divisible by output channels"
-            );
-            let scale = initializer_f32(&self.initial_values, inputs[1], output_channels)?;
-            let offset = initializer_f32(&self.initial_values, inputs[2], output_channels)?;
-            let mean = initializer_f32(&self.initial_values, inputs[3], output_channels)?;
-            let variance = initializer_f32(&self.initial_values, inputs[4], output_channels)?;
-            let old_bias = conv
-                .inputs
-                .get(2)
-                .copied()
-                .flatten()
-                .map(|id| initializer_f32(&self.initial_values, id, output_channels))
-                .transpose()?;
-
-            let mut multipliers = Vec::with_capacity(output_channels);
-            let mut bias = Vec::with_capacity(output_channels);
-            for channel in 0..output_channels {
-                let multiplier = scale[channel] / (variance[channel] + epsilon).sqrt();
-                multipliers.push(multiplier);
-                bias.push(
-                    (old_bias.as_ref().map_or(0.0, |bias| bias[channel]) - mean[channel])
-                        .mul_add(multiplier, offset[channel]),
-                );
-            }
-            let mut weight_values = weight.as_f32()?.to_vec();
-            for (channel, values) in weight_values.chunks_mut(channel_size).enumerate() {
-                for value in values {
-                    *value *= multipliers[channel];
-                }
-            }
-            let new_weight_id = self.initial_values.len();
-            self.initial_values
-                .push(Some(Tensor::new_f32(weight.shape.clone(), weight_values)));
-            let new_bias_id = self.initial_values.len();
-            self.initial_values
-                .push(Some(Tensor::new_f32(vec![output_channels], bias)));
-            conv.inputs[1] = Some(new_weight_id);
-            if conv.inputs.len() == 2 {
-                conv.inputs.push(Some(new_bias_id));
-            } else {
-                conv.inputs[2] = Some(new_bias_id);
-            }
-            conv.name = format!("FusedConvBatchNorm.{}", conv.name);
-            if let Some(squeeze) = squeeze {
-                let mut squeeze = squeeze.clone();
-                squeeze.output = batch_norm.output;
-                fused.push(conv);
-                fused.push(squeeze);
-                index += 3;
-            } else {
-                conv.output = batch_norm.output;
-                fused.push(conv);
-                index += 2;
-            }
-        }
-        self.nodes = fused;
-        Ok(())
-    }
-
-    #[cfg(feature = "cpu-convert")]
-    fn write(&self, writer: &mut impl Write) -> Result<()> {
-        writer.write_all(MAGIC)?;
-        write_u32(writer, FORMAT_VERSION)?;
-        write_u32(writer, to_u32(self.initial_values.len(), "value count")?)?;
-        write_u32(writer, to_u32(self.input, "input id")?)?;
-        write_u32(writer, to_u32(self.output, "output id")?)?;
-        write_usize_vec(writer, &self.input_shape)?;
-
-        let initial_count = self.initial_values.iter().flatten().count();
-        write_u32(writer, to_u32(initial_count, "initializer count")?)?;
-        for (id, tensor) in self
-            .initial_values
-            .iter()
-            .enumerate()
-            .filter_map(|(id, tensor)| tensor.as_ref().map(|tensor| (id, tensor)))
-        {
-            write_u32(writer, to_u32(id, "initializer id")?)?;
-            write_usize_vec(writer, &tensor.shape)?;
-            match &tensor.data {
-                TensorData::F32(values) => {
-                    writer.write_all(&[1])?;
-                    write_u64(writer, values.len() as u64)?;
-                    for value in values.iter() {
-                        writer.write_all(&value.to_le_bytes())?;
-                    }
-                }
-                TensorData::I64(values) => {
-                    writer.write_all(&[2])?;
-                    write_u64(writer, values.len() as u64)?;
-                    for value in values.iter() {
-                        writer.write_all(&value.to_le_bytes())?;
-                    }
-                }
-            }
-        }
-
-        write_u32(writer, to_u32(self.nodes.len(), "node count")?)?;
-        for node in &self.nodes {
-            write_string(writer, &node.name)?;
-            write_u32(writer, to_u32(node.output, "node output")?)?;
-            write_u32(writer, to_u32(node.inputs.len(), "node input count")?)?;
-            for input in &node.inputs {
-                write_u32(
-                    writer,
-                    input
-                        .map(|id| to_u32(id, "node input"))
-                        .transpose()?
-                        .unwrap_or(NONE_VALUE_ID),
-                )?;
-            }
-            write_operation(writer, &node.operation)?;
-        }
-        Ok(())
-    }
-
-    fn read(reader: &mut impl Read) -> Result<Self> {
-        let mut magic = [0u8; 8];
-        reader.read_exact(&mut magic)?;
-        ensure!(&magic == MAGIC, "not a ppocr CPU model");
-        ensure!(
-            read_u32(reader)? == FORMAT_VERSION,
-            "unsupported ppocr CPU model version"
-        );
-        let value_count = read_len(reader, MAX_VALUES, "value count")?;
-        let input = read_id(reader, value_count, "input id")?;
-        let output = read_id(reader, value_count, "output id")?;
-        let input_shape = read_usize_vec(reader, MAX_RANK, "input shape")?;
-        let mut initial_values = vec![None; value_count];
-        let initializer_count = read_len(reader, value_count, "initializer count")?;
-        for _ in 0..initializer_count {
-            let id = read_id(reader, value_count, "initializer id")?;
-            ensure!(
-                initial_values[id].is_none(),
-                "duplicate initializer id {id}"
-            );
-            let shape = read_usize_vec(reader, MAX_RANK, "initializer shape")?;
-            let expected = element_count(&shape).context("initializer shape overflow")?;
-            let mut data_type = [0u8; 1];
-            reader.read_exact(&mut data_type)?;
-            let length = usize::try_from(read_u64(reader)?)?;
-            ensure!(
-                length == expected,
-                "initializer data length does not match shape"
-            );
-            let tensor = match data_type[0] {
-                1 => {
-                    let mut values = Vec::with_capacity(length);
-                    for _ in 0..length {
-                        let mut bytes = [0u8; 4];
-                        reader.read_exact(&mut bytes)?;
-                        values.push(f32::from_le_bytes(bytes));
-                    }
-                    Tensor::new_f32(shape, values)
-                }
-                2 => {
-                    let mut values = Vec::with_capacity(length);
-                    for _ in 0..length {
-                        let mut bytes = [0u8; 8];
-                        reader.read_exact(&mut bytes)?;
-                        values.push(i64::from_le_bytes(bytes));
-                    }
-                    Tensor::new_i64(shape, values)
-                }
-                value => bail!("unsupported initializer data type {value}"),
-            };
-            initial_values[id] = Some(tensor);
-        }
-        let node_count = read_len(reader, MAX_NODES, "node count")?;
-        let mut nodes = Vec::with_capacity(node_count);
-        for _ in 0..node_count {
-            let name = read_string(reader)?;
-            let node_output = read_id(reader, value_count, "node output")?;
-            let input_count = read_len(reader, 16, "node input count")?;
-            let mut inputs = Vec::with_capacity(input_count);
-            for _ in 0..input_count {
-                let id = read_u32(reader)?;
-                inputs.push(if id == NONE_VALUE_ID {
-                    None
-                } else {
-                    let id = usize::try_from(id)?;
-                    ensure!(id < value_count, "node input id is out of range");
-                    Some(id)
-                });
-            }
-            nodes.push(Node {
-                name,
-                inputs,
-                output: node_output,
-                operation: read_operation(reader)?,
-            });
-        }
-        Self {
-            input,
-            output,
-            input_shape,
-            initial_values,
-            nodes,
-            use_counts: Vec::new(),
-        }
-        .finish()
+    fn forward_gelu(&self, input: &Tensor) -> Result<Tensor> {
+        self.convolution.forward_gelu(input)
     }
 }
 
-#[cfg(feature = "cpu-convert")]
-fn value_uses(nodes: &[Node], value_count: usize) -> Vec<usize> {
-    let mut uses = vec![0usize; value_count];
-    for node in nodes {
-        for &input in node.inputs.iter().flatten() {
-            uses[input] += 1;
-        }
-    }
-    uses
-}
-
-#[cfg(feature = "cpu-convert")]
-fn initializer_f32(values: &[Option<Tensor>], id: ValueId, expected_len: usize) -> Result<&[f32]> {
-    let value = values
-        .get(id)
-        .and_then(Option::as_ref)
-        .with_context(|| format!("value {id} is not an initializer"))?
-        .as_f32()?;
+fn fold_batch_norm(
+    weight: Tensor,
+    bias: Option<Tensor>,
+    norm: VarBuilder<'_>,
+    channels: usize,
+) -> Result<(Tensor, Tensor)> {
+    let shape = weight.shape().to_vec();
     ensure!(
-        value.len() == expected_len,
-        "initializer {id} has length {}, expected {expected_len}",
-        value.len()
+        shape.first() == Some(&channels),
+        "batch-normalized convolution has invalid weight shape {shape:?}"
     );
-    Ok(value)
-}
-
-#[cfg(feature = "cpu-convert")]
-fn match_gelu(nodes: &[Node], values: &[Option<Tensor>], uses: &[usize]) -> Option<Node> {
-    let [div, erf, add, mul, scale, ..] = nodes else {
-        return None;
+    let mut weight_values = weight.into_f32()?;
+    let mut bias_values = match bias {
+        Some(bias) => bias.into_f32()?,
+        None => vec![0.0; channels],
     };
-    if !matches!(div.operation, Operation::Div)
-        || !matches!(erf.operation, Operation::Erf)
-        || !matches!(add.operation, Operation::Add)
-        || !matches!(mul.operation, Operation::Mul)
-        || !matches!(scale.operation, Operation::Mul)
-        || [div.output, erf.output, add.output, mul.output]
-            .into_iter()
-            .any(|output| uses[output] != 1)
-    {
-        return None;
-    }
-    let div_inputs = node_inputs(div)?;
-    if div_inputs.len() != 2
-        || scalar(values, div_inputs[1])
-            .is_none_or(|value| (value - std::f32::consts::SQRT_2).abs() > 1e-5)
-        || node_inputs(erf)? != [div.output]
-    {
-        return None;
-    }
-    let add_inputs = node_inputs(add)?;
-    let add_scalar = other_input(&add_inputs, erf.output)?;
-    if scalar(values, add_scalar).is_none_or(|value| (value - 1.0).abs() > 1e-6) {
-        return None;
-    }
-    if !has_inputs(mul, div_inputs[0], add.output) {
-        return None;
-    }
-    let scale_inputs = node_inputs(scale)?;
-    let scale_scalar = other_input(&scale_inputs, mul.output)?;
-    if scalar(values, scale_scalar).is_none_or(|value| (value - 0.5).abs() > 1e-6) {
-        return None;
-    }
-    Some(Node {
-        name: format!("FusedGelu.{}", div.name),
-        inputs: vec![Some(div_inputs[0])],
-        output: scale.output,
-        operation: Operation::Gelu,
-    })
-}
-
-#[cfg(feature = "cpu-convert")]
-fn match_gated_activation(nodes: &[Node], uses: &[usize]) -> Option<(Node, usize)> {
-    let [gate, mul, ..] = nodes else {
-        return None;
-    };
-    if uses[gate.output] != 1 || !matches!(mul.operation, Operation::Mul) {
-        return None;
-    }
-    let input = *node_inputs(gate)?.first()?;
-    if !has_inputs(mul, input, gate.output) {
-        return None;
-    }
-    let operation = match gate.operation {
-        Operation::Sigmoid => Operation::Silu,
-        Operation::HardSigmoid { alpha, beta }
-            if (alpha - 1.0 / 6.0).abs() < 1e-5 && (beta - 0.5).abs() < 1e-6 =>
-        {
-            Operation::HardSwish
+    let gamma = norm.get(channels, "weight")?;
+    let beta = norm.get(channels, "bias")?;
+    let mean = norm.get(channels, "running_mean")?;
+    let variance = norm.get(channels, "running_var")?;
+    let gamma = gamma.as_f32()?;
+    let beta = beta.as_f32()?;
+    let mean = mean.as_f32()?;
+    let variance = variance.as_f32()?;
+    let row = weight_values.len() / channels;
+    for channel in 0..channels {
+        let scale = gamma[channel] / (variance[channel] + 1e-5).sqrt();
+        for value in &mut weight_values[channel * row..(channel + 1) * row] {
+            *value *= scale;
         }
-        _ => return None,
-    };
-    Some((
-        Node {
-            name: format!("FusedActivation.{}", gate.name),
-            inputs: vec![Some(input)],
-            output: mul.output,
-            operation,
-        },
-        2,
+        bias_values[channel] = (bias_values[channel] - mean[channel]) * scale + beta[channel];
+    }
+    Ok((
+        Tensor::new_f32(shape, weight_values),
+        Tensor::new_f32(vec![channels], bias_values),
     ))
 }
 
-#[cfg(feature = "cpu-convert")]
-fn node_inputs(node: &Node) -> Option<Vec<ValueId>> {
-    node.inputs.iter().copied().collect()
+struct ConvBnAct {
+    conv: Conv2d,
+    activation: Activation,
 }
 
-#[cfg(feature = "cpu-convert")]
-fn has_inputs(node: &Node, left: ValueId, right: ValueId) -> bool {
-    node_inputs(node).is_some_and(|inputs| {
-        inputs.len() == 2
-            && ((inputs[0] == left && inputs[1] == right)
-                || (inputs[0] == right && inputs[1] == left))
-    })
-}
+impl ConvBnAct {
+    #[allow(clippy::too_many_arguments)]
+    fn load(
+        vb: VarBuilder<'_>,
+        in_channels: usize,
+        out_channels: usize,
+        kernel: [usize; 2],
+        stride: [usize; 2],
+        pads: [usize; 4],
+        bias: bool,
+        groups: usize,
+        norm_name: &str,
+        activation: Activation,
+    ) -> Result<Self> {
+        Ok(Self {
+            conv: Conv2d::load_bn(
+                vb,
+                in_channels,
+                out_channels,
+                kernel,
+                stride,
+                pads,
+                bias,
+                groups,
+                norm_name,
+            )?,
+            activation,
+        })
+    }
 
-#[cfg(feature = "cpu-convert")]
-fn other_input(inputs: &[ValueId], known: ValueId) -> Option<ValueId> {
-    (inputs.len() == 2).then_some(())?;
-    if inputs[0] == known {
-        Some(inputs[1])
-    } else if inputs[1] == known {
-        Some(inputs[0])
-    } else {
-        None
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        if matches!(self.activation, Activation::None) {
+            self.conv.forward(input)
+        } else {
+            self.activation.forward(self.conv.forward(input)?)
+        }
     }
 }
 
-#[cfg(feature = "cpu-convert")]
-fn scalar(values: &[Option<Tensor>], id: ValueId) -> Option<f32> {
-    let tensor = values.get(id)?.as_ref()?;
-    let values = tensor.as_f32().ok()?;
-    (values.len() == 1).then_some(values[0])
+struct SqueezeExcitation {
+    reduce: Conv2d,
+    expand: Conv2d,
 }
 
-#[cfg(feature = "cpu-convert")]
-pub fn convert_onnx(
-    input: impl AsRef<Path>,
-    output: impl AsRef<Path>,
-    input_shape: &[usize],
-) -> Result<()> {
-    use rten_onnx::onnx::ModelProto;
+impl SqueezeExcitation {
+    fn load(vb: VarBuilder<'_>, channels: usize) -> Result<Self> {
+        Ok(Self {
+            reduce: Conv2d::load(
+                vb.pp("convolutions").pp(0),
+                channels,
+                channels / 4,
+                [1, 1],
+                [1, 1],
+                [0; 4],
+                true,
+                1,
+            )?,
+            expand: Conv2d::load(
+                vb.pp("convolutions").pp(2),
+                channels / 4,
+                channels,
+                [1, 1],
+                [1, 1],
+                [0; 4],
+                true,
+                1,
+            )?,
+        })
+    }
 
-    ensure!(
-        input_shape.len() == 4,
-        "PP-OCR input shape must have rank four"
-    );
-    ensure!(
-        input_shape.iter().all(|&dimension| dimension > 0),
-        "input dimensions must be positive"
-    );
-    let input = input.as_ref();
-    let model = ModelProto::parse_file(
-        File::open(input).with_context(|| format!("open ONNX model {}", input.display()))?,
-    )
-    .with_context(|| format!("decode ONNX model {}", input.display()))?;
-    let data = compile_onnx(model, input_shape)?.optimize()?.finish()?;
-    let output = output.as_ref();
-    let file =
-        File::create(output).with_context(|| format!("create model {}", output.display()))?;
-    let mut writer = BufWriter::new(file);
-    data.write(&mut writer)?;
-    writer.flush()?;
-    Ok(())
+    fn forward(&self, input: Tensor) -> Result<Tensor> {
+        let pooled = input.global_avg_pool2d()?;
+        let reduced = self.reduce.forward(&pooled)?.into_relu()?;
+        let attention = Activation::HardSigmoid.forward(self.expand.forward(&reduced)?)?;
+        input.into_mul(&attention)
+    }
 }
 
-#[cfg(feature = "cpu-convert")]
-fn compile_onnx(model: rten_onnx::onnx::ModelProto, input_shape: &[usize]) -> Result<ModelData> {
-    use rten_onnx::onnx::DataType;
-    use std::collections::HashMap;
+enum TokenConv {
+    Direct(Conv2d),
+    ConvBn(ConvBnAct),
+}
 
-    let graph = model.graph.context("ONNX model has no graph")?;
-    ensure!(graph.output.len() == 1, "expected one ONNX graph output");
-    let mut names = HashMap::<String, ValueId>::new();
-    let mut initial_values = Vec::<Option<Tensor>>::new();
-    for initializer in graph.initializer {
-        let name = initializer
-            .name
-            .clone()
-            .context("ONNX initializer has no name")?;
-        ensure!(!names.contains_key(&name), "duplicate ONNX value {name:?}");
-        let shape = initializer
-            .dims
+impl TokenConv {
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Direct(conv) => conv.forward(input),
+            Self::ConvBn(conv) => conv.forward(input),
+        }
+    }
+}
+
+struct LcNetBlock {
+    token_conv: TokenConv,
+    squeeze_excitation: Option<SqueezeExcitation>,
+    channel_conv1: ConvBnAct,
+    channel_conv2: ConvBnAct,
+    residual: bool,
+}
+
+#[derive(Clone, Copy)]
+struct BlockSpec {
+    kernel: usize,
+    in_channels: usize,
+    out_channels: usize,
+    stride: [usize; 2],
+    use_se: bool,
+}
+
+impl LcNetBlock {
+    fn load(vb: VarBuilder<'_>, spec: BlockSpec) -> Result<Self> {
+        let residual = spec.in_channels == spec.out_channels && spec.stride == [1, 1];
+        let padding = spec.kernel / 2;
+        let token_conv = if residual {
+            TokenConv::Direct(Conv2d::load(
+                vb.pp("token_conv"),
+                spec.in_channels,
+                spec.out_channels,
+                [spec.kernel; 2],
+                spec.stride,
+                [padding, padding, padding, padding],
+                true,
+                spec.in_channels,
+            )?)
+        } else {
+            TokenConv::ConvBn(ConvBnAct::load(
+                vb.pp("token_conv"),
+                spec.in_channels,
+                spec.in_channels,
+                [spec.kernel; 2],
+                spec.stride,
+                [padding, padding, padding, padding],
+                false,
+                spec.in_channels,
+                "normalization",
+                Activation::None,
+            )?)
+        };
+        Ok(Self {
+            token_conv,
+            squeeze_excitation: spec
+                .use_se
+                .then(|| {
+                    SqueezeExcitation::load(vb.pp("token_squeeze_excitation"), spec.in_channels)
+                })
+                .transpose()?,
+            channel_conv1: ConvBnAct::load(
+                vb.pp("channel_conv1"),
+                spec.in_channels,
+                spec.in_channels * 2,
+                [1, 1],
+                [1, 1],
+                [0; 4],
+                false,
+                1,
+                "normalization",
+                Activation::None,
+            )?,
+            channel_conv2: ConvBnAct::load(
+                vb.pp("channel_conv2"),
+                spec.in_channels * 2,
+                spec.out_channels,
+                [1, 1],
+                [1, 1],
+                [0; 4],
+                false,
+                1,
+                "normalization",
+                Activation::None,
+            )?,
+            residual,
+        })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let output = self.token_conv.forward(input)?;
+        let output = match &self.squeeze_excitation {
+            Some(se) => se.forward(output)?,
+            None => output,
+        };
+        let shortcut = output;
+        let output = self.channel_conv1.conv.forward_gelu(&shortcut)?;
+        let output = self.channel_conv2.forward(&output)?;
+        if self.residual {
+            shortcut.into_add(&output)
+        } else {
+            Ok(output)
+        }
+    }
+}
+
+struct LcNetStage {
+    blocks: Vec<LcNetBlock>,
+}
+
+impl LcNetStage {
+    fn load(vb: VarBuilder<'_>, specs: &[BlockSpec]) -> Result<Self> {
+        let blocks = specs
             .iter()
-            .map(|&dimension| {
-                ensure!(
-                    dimension >= 0,
-                    "initializer {name:?} has a negative dimension"
-                );
-                usize::try_from(dimension).map_err(anyhow::Error::from)
+            .enumerate()
+            .map(|(index, spec)| LcNetBlock::load(vb.pp("blocks").pp(index), *spec))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { blocks })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.blocks
+            .iter()
+            .try_fold(input.clone(), |hidden, block| block.forward(&hidden))
+    }
+}
+
+struct LargeStem {
+    stem1: ConvBnAct,
+    stem2a: ConvBnAct,
+    stem2b: ConvBnAct,
+    stem3: ConvBnAct,
+    stem4: ConvBnAct,
+}
+
+impl LargeStem {
+    fn load(
+        vb: VarBuilder<'_>,
+        mid_channels: usize,
+        out_channels: usize,
+        activation: Activation,
+    ) -> Result<Self> {
+        let conv = |name, in_channels, out_channels, kernel, stride, pads| {
+            ConvBnAct::load(
+                vb.pp(name),
+                in_channels,
+                out_channels,
+                kernel,
+                stride,
+                pads,
+                false,
+                1,
+                "normalization",
+                activation,
+            )
+        };
+        Ok(Self {
+            stem1: conv("stem1", 3, mid_channels, [3, 3], [2, 2], [1; 4])?,
+            stem2a: conv(
+                "stem2a",
+                mid_channels,
+                mid_channels / 2,
+                [2, 2],
+                [1, 1],
+                [0, 0, 1, 1],
+            )?,
+            stem2b: conv(
+                "stem2b",
+                mid_channels / 2,
+                mid_channels,
+                [2, 2],
+                [1, 1],
+                [0, 0, 1, 1],
+            )?,
+            stem3: conv(
+                "stem3",
+                mid_channels * 2,
+                mid_channels,
+                [3, 3],
+                [2, 2],
+                [1; 4],
+            )?,
+            stem4: conv("stem4", mid_channels, out_channels, [1, 1], [1, 1], [0; 4])?,
+        })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let embedding = self.stem1.forward(input)?;
+        let branch = self.stem2a.forward(&embedding)?;
+        let branch = self.stem2b.forward(&branch)?;
+        let pooled = embedding.max_pool2d([2, 2], [1, 1], [0, 0, 1, 1], false)?;
+        let merged = Tensor::cat(&[&pooled, &branch], 1)?;
+        self.stem4.forward(&self.stem3.forward(&merged)?)
+    }
+}
+
+struct SmallStem {
+    conv1: ConvBnAct,
+    conv2: ConvBnAct,
+}
+
+impl SmallStem {
+    fn load(vb: VarBuilder<'_>, mid_channels: usize, out_channels: usize) -> Result<Self> {
+        Ok(Self {
+            conv1: ConvBnAct::load(
+                vb.pp("conv1"),
+                3,
+                mid_channels,
+                [3, 3],
+                [2, 2],
+                [1; 4],
+                false,
+                1,
+                "normalization",
+                Activation::None,
+            )?,
+            conv2: ConvBnAct::load(
+                vb.pp("conv2"),
+                mid_channels,
+                out_channels,
+                [3, 3],
+                [2, 2],
+                [1; 4],
+                false,
+                1,
+                "normalization",
+                Activation::None,
+            )?,
+        })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.conv2.forward(&self.conv1.conv.forward_gelu(input)?)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StemSpec {
+    Large {
+        mid_channels: usize,
+        out_channels: usize,
+    },
+    Small {
+        mid_channels: usize,
+        out_channels: usize,
+    },
+}
+
+enum LcNetStem {
+    Large(Box<LargeStem>),
+    Small(Box<SmallStem>),
+}
+
+impl LcNetStem {
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Large(stem) => stem.forward(input),
+            Self::Small(stem) => stem.forward(input),
+        }
+    }
+}
+
+struct LcNetBackbone {
+    stem: LcNetStem,
+    stages: Vec<LcNetStage>,
+}
+
+impl LcNetBackbone {
+    fn load(
+        vb: VarBuilder<'_>,
+        specs: &[Vec<BlockSpec>],
+        stem_spec: StemSpec,
+        activation: Activation,
+    ) -> Result<Self> {
+        let stem = match stem_spec {
+            StemSpec::Large {
+                mid_channels,
+                out_channels,
+            } => LcNetStem::Large(Box::new(LargeStem::load(
+                vb.pp("convolution"),
+                mid_channels,
+                out_channels,
+                activation,
+            )?)),
+            StemSpec::Small {
+                mid_channels,
+                out_channels,
+            } => LcNetStem::Small(Box::new(SmallStem::load(
+                vb.pp("convolution"),
+                mid_channels,
+                out_channels,
+            )?)),
+        };
+        let stages = specs
+            .iter()
+            .enumerate()
+            .map(|(index, stage)| LcNetStage::load(vb.pp("blocks").pp(index), stage))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { stem, stages })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Vec<Tensor>> {
+        let mut hidden = self.stem.forward(input)?;
+        let mut outputs = Vec::with_capacity(self.stages.len());
+        for stage in &self.stages {
+            hidden = stage.forward(&hidden)?;
+            outputs.push(hidden.clone());
+        }
+        Ok(outputs)
+    }
+}
+
+struct IntraclassBlock {
+    reduce: Conv2d,
+    vertical_long: Conv2d,
+    vertical_mid: Conv2d,
+    vertical_short: Conv2d,
+    horizontal_long: Conv2d,
+    horizontal_mid: Conv2d,
+    horizontal_short: Conv2d,
+    symmetric_long: Conv2d,
+    symmetric_mid: Conv2d,
+    symmetric_short: Conv2d,
+    final_conv: ConvBnAct,
+}
+
+impl IntraclassBlock {
+    fn load(vb: VarBuilder<'_>) -> Result<Self> {
+        let regular = |name, kernel: [usize; 2], pads| {
+            Conv2d::load(vb.pp(name), 32, 32, kernel, [1, 1], pads, true, 1)
+        };
+        Ok(Self {
+            reduce: Conv2d::load(
+                vb.pp("conv_reduce_channel"),
+                64,
+                32,
+                [1, 1],
+                [1, 1],
+                [0; 4],
+                true,
+                1,
+            )?,
+            vertical_long: regular(
+                "vertical_long_to_small_conv_longratio",
+                [7, 1],
+                [3, 0, 3, 0],
+            )?,
+            vertical_mid: regular("vertical_long_to_small_conv_midratio", [5, 1], [2, 0, 2, 0])?,
+            vertical_short: regular(
+                "vertical_long_to_small_conv_shortratio",
+                [3, 1],
+                [1, 0, 1, 0],
+            )?,
+            horizontal_long: regular(
+                "horizontal_small_to_long_conv_longratio",
+                [1, 7],
+                [0, 3, 0, 3],
+            )?,
+            horizontal_mid: regular(
+                "horizontal_small_to_long_conv_midratio",
+                [1, 5],
+                [0, 2, 0, 2],
+            )?,
+            horizontal_short: regular(
+                "horizontal_small_to_long_conv_shortratio",
+                [1, 3],
+                [0, 1, 0, 1],
+            )?,
+            symmetric_long: regular("symmetric_conv_long_longratio", [7, 7], [3; 4])?,
+            symmetric_mid: regular("symmetric_conv_long_midratio", [5, 5], [2; 4])?,
+            symmetric_short: regular("symmetric_conv_long_shortratio", [3, 3], [1; 4])?,
+            final_conv: ConvBnAct::load(
+                vb.pp("conv_final"),
+                32,
+                64,
+                [1, 1],
+                [1, 1],
+                [0; 4],
+                true,
+                1,
+                "norm",
+                Activation::Relu,
+            )?,
+        })
+    }
+
+    fn forward(&self, input: Tensor) -> Result<Tensor> {
+        let reduced = self.reduce.forward(&input)?;
+        let layer7 = self
+            .symmetric_long
+            .forward(&reduced)?
+            .into_add(&self.vertical_long.forward(&reduced)?)?
+            .into_add(&self.horizontal_long.forward(&reduced)?)?;
+        let layer5 = self
+            .symmetric_mid
+            .forward(&layer7)?
+            .into_add(&self.vertical_mid.forward(&layer7)?)?
+            .into_add(&self.horizontal_mid.forward(&layer7)?)?;
+        let layer3 = self
+            .symmetric_short
+            .forward(&layer5)?
+            .into_add(&self.vertical_short.forward(&layer5)?)?
+            .into_add(&self.horizontal_short.forward(&layer5)?)?;
+        input.into_add(&self.final_conv.forward(&layer3)?)
+    }
+}
+
+struct DetectorNeck {
+    adjust: Vec<Conv2d>,
+    project: Vec<Conv2d>,
+    pan_head: Vec<Conv2d>,
+    pan_lateral: Vec<Conv2d>,
+    intraclass: Vec<IntraclassBlock>,
+}
+
+impl DetectorNeck {
+    fn load(vb: VarBuilder<'_>) -> Result<Self> {
+        let adjust = [128, 256, 512, 896]
+            .iter()
+            .enumerate()
+            .map(|(index, channels)| {
+                Conv2d::load(
+                    vb.pp("input_channel_adjustment_convolution").pp(index),
+                    *channels,
+                    256,
+                    [1, 1],
+                    [1, 1],
+                    [0; 4],
+                    false,
+                    1,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
-        ensure!(
-            initializer.external_data.is_empty(),
-            "external ONNX weights are unsupported"
-        );
-        let expected = element_count(&shape).context("initializer shape overflow")?;
-        let tensor = if initializer.data_type == Some(DataType::FLOAT) {
-            let values = if let Some(raw) = &initializer.raw_data {
-                let raw = raw.borrow();
-                ensure!(
-                    raw.len() == expected * 4,
-                    "initializer {name:?} byte length mismatch"
-                );
-                raw.chunks_exact(4)
-                    .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
-                    .collect()
-            } else {
-                ensure!(
-                    initializer.float_data.len() == expected,
-                    "initializer {name:?} length mismatch"
-                );
-                initializer.float_data
-            };
-            Tensor::new_f32(shape, values)
-        } else if initializer.data_type == Some(DataType::INT64) {
-            let values = if let Some(raw) = &initializer.raw_data {
-                let raw = raw.borrow();
-                ensure!(
-                    raw.len() == expected * 8,
-                    "initializer {name:?} byte length mismatch"
-                );
-                raw.chunks_exact(8)
-                    .map(|bytes| i64::from_le_bytes(bytes.try_into().expect("eight-byte chunk")))
-                    .collect()
-            } else {
-                ensure!(
-                    initializer.int64_data.len() == expected,
-                    "initializer {name:?} length mismatch"
-                );
-                initializer.int64_data
-            };
-            Tensor::new_i64(shape, values)
-        } else {
-            bail!(
-                "initializer {name:?} has unsupported data type {:?}",
-                initializer.data_type
-            );
-        };
-        let id = initial_values.len();
-        names.insert(name, id);
-        initial_values.push(Some(tensor));
+        let project = (0..4)
+            .map(|index| {
+                Conv2d::load(
+                    vb.pp("input_feature_projection_convolution").pp(index),
+                    256,
+                    64,
+                    [9, 9],
+                    [1, 1],
+                    [4; 4],
+                    true,
+                    1,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let pan_head = (0..3)
+            .map(|index| {
+                Conv2d::load(
+                    vb.pp("path_aggregation_head_convolution").pp(index),
+                    64,
+                    64,
+                    [3, 3],
+                    [2, 2],
+                    [1; 4],
+                    false,
+                    1,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let pan_lateral = (0..4)
+            .map(|index| {
+                Conv2d::load(
+                    vb.pp("path_aggregation_lateral_convolution").pp(index),
+                    64,
+                    64,
+                    [9, 9],
+                    [1, 1],
+                    [4; 4],
+                    true,
+                    1,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let intraclass = (0..4)
+            .map(|index| IntraclassBlock::load(vb.pp("intraclass_blocks").pp(index)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            adjust,
+            project,
+            pan_head,
+            pan_lateral,
+            intraclass,
+        })
     }
 
-    let graph_inputs = graph
-        .input
-        .into_iter()
-        .filter_map(|input| input.name)
-        .filter(|name| !names.contains_key(name))
-        .collect::<Vec<_>>();
-    ensure!(
-        graph_inputs.len() == 1,
-        "expected one non-initializer ONNX graph input"
-    );
-    let input = initial_values.len();
-    names.insert(graph_inputs[0].clone(), input);
-    initial_values.push(None);
-
-    let mut nodes = Vec::new();
-    for (index, proto) in graph.node.into_iter().enumerate() {
-        let op_type = proto
-            .op_type
-            .as_deref()
-            .context("ONNX node has no operation type")?;
-        ensure!(
-            proto.output.len() == 1,
-            "{op_type} node must have one output"
-        );
-        if op_type == "Identity" {
-            ensure!(proto.input.len() == 1, "Identity node must have one input");
-            let input_id = *names.get(&proto.input[0]).with_context(|| {
-                format!("Identity references unknown value {:?}", proto.input[0])
-            })?;
-            names.insert(proto.output[0].clone(), input_id);
-            continue;
+    fn forward(&self, stages: &[Tensor]) -> Result<Tensor> {
+        let adjusted = self
+            .adjust
+            .iter()
+            .zip(stages)
+            .map(|(conv, feature)| conv.forward(feature))
+            .collect::<Result<Vec<_>>>()?;
+        let mut top_down = Vec::with_capacity(4);
+        for feature in adjusted.into_iter().rev() {
+            let feature = match top_down.last() {
+                Some(upper) => feature.into_add(&upsample(upper, 2)?)?,
+                None => feature,
+            };
+            top_down.push(feature);
         }
-        let inputs = proto
+        top_down.reverse();
+        let projected = self
+            .project
+            .iter()
+            .zip(&top_down)
+            .map(|(conv, feature)| conv.forward(feature))
+            .collect::<Result<Vec<_>>>()?;
+        let mut bottom_up = Vec::with_capacity(4);
+        for (index, projection) in projected.into_iter().enumerate() {
+            let feature = match bottom_up.last() {
+                Some(lower) => projection.into_add(&self.pan_head[index - 1].forward(lower)?)?,
+                None => projection,
+            };
+            bottom_up.push(feature);
+        }
+        let lateral = self
+            .pan_lateral
+            .iter()
+            .zip(&bottom_up)
+            .map(|(conv, feature)| conv.forward(feature))
+            .collect::<Result<Vec<_>>>()?;
+        let refined = self
+            .intraclass
+            .iter()
+            .zip(lateral)
+            .map(|(block, feature)| block.forward(feature))
+            .collect::<Result<Vec<_>>>()?;
+        let mut features = refined
+            .iter()
+            .zip([1, 2, 4, 8])
+            .map(|(feature, scale)| upsample(feature, scale))
+            .collect::<Result<Vec<_>>>()?;
+        features.reverse();
+        Tensor::cat(&features.iter().collect::<Vec<_>>(), 1)
+    }
+}
+
+struct VariantSqueezeExcitation {
+    reduce: Conv2d,
+    expand: Conv2d,
+}
+
+impl VariantSqueezeExcitation {
+    fn load(vb: VarBuilder<'_>, channels: usize, reduction: usize) -> Result<Self> {
+        Ok(Self {
+            reduce: Conv2d::load(
+                vb.pp("conv1"),
+                channels,
+                channels / reduction,
+                [1, 1],
+                [1, 1],
+                [0; 4],
+                true,
+                1,
+            )?,
+            expand: Conv2d::load(
+                vb.pp("conv2"),
+                channels / reduction,
+                channels,
+                [1, 1],
+                [1, 1],
+                [0; 4],
+                true,
+                1,
+            )?,
+        })
+    }
+
+    fn attention(&self, input: &Tensor) -> Result<Tensor> {
+        let pooled = input.global_avg_pool2d()?;
+        let hidden = self.reduce.forward(&pooled)?.into_relu()?;
+        Activation::HardSigmoidFive.forward(self.expand.forward(&hidden)?)
+    }
+}
+
+struct ResidualSqueezeExcitation {
+    input: Conv2d,
+    squeeze_excitation: VariantSqueezeExcitation,
+}
+
+impl ResidualSqueezeExcitation {
+    fn load(
+        vb: VarBuilder<'_>,
+        input_channels: usize,
+        output_channels: usize,
+        reduction: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            input: Conv2d::load(
+                vb.pp("in_conv"),
+                input_channels,
+                output_channels,
+                [1, 1],
+                [1, 1],
+                [0; 4],
+                false,
+                1,
+            )?,
+            squeeze_excitation: VariantSqueezeExcitation::load(
+                vb.pp("squeeze_excitation_block"),
+                output_channels,
+                reduction,
+            )?,
+        })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let hidden = self.input.forward(input)?;
+        let attention = self.squeeze_excitation.attention(&hidden)?;
+        hidden.into_residual_mul(&attention)
+    }
+}
+
+struct DepthwiseSeparableConv {
+    depthwise: Conv2d,
+    pointwise: Conv2d,
+    squeeze_excitation: VariantSqueezeExcitation,
+}
+
+impl DepthwiseSeparableConv {
+    fn load(
+        vb: VarBuilder<'_>,
+        channels: usize,
+        kernel_size: usize,
+        reduction: usize,
+    ) -> Result<Self> {
+        let padding = kernel_size / 2;
+        Ok(Self {
+            depthwise: Conv2d::load(
+                vb.pp("depthwise_convolution"),
+                channels,
+                channels,
+                [kernel_size; 2],
+                [1, 1],
+                [padding; 4],
+                true,
+                channels,
+            )?,
+            pointwise: Conv2d::load(
+                vb.pp("pointwise_convolution"),
+                channels,
+                channels / 4,
+                [1, 1],
+                [1, 1],
+                [0; 4],
+                false,
+                1,
+            )?,
+            squeeze_excitation: VariantSqueezeExcitation::load(
+                vb.pp("squeeze_excitation_module"),
+                channels / 4,
+                reduction,
+            )?,
+        })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let hidden = self.pointwise.forward(&self.depthwise.forward(input)?)?;
+        let attention = self.squeeze_excitation.attention(&hidden)?;
+        hidden.into_residual_mul(&attention)
+    }
+}
+
+struct RepLkFpn {
+    insert: Vec<ResidualSqueezeExcitation>,
+    input: Vec<DepthwiseSeparableConv>,
+}
+
+impl RepLkFpn {
+    fn load(
+        vb: VarBuilder<'_>,
+        stage_channels: [usize; 4],
+        neck_channels: usize,
+        kernel_size: usize,
+    ) -> Result<Self> {
+        let insert = stage_channels
+            .iter()
+            .enumerate()
+            .map(|(index, channels)| {
+                ResidualSqueezeExcitation::load(
+                    vb.pp("insert_conv").pp(index),
+                    *channels,
+                    neck_channels,
+                    4,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let input = (0..4)
+            .map(|index| {
+                DepthwiseSeparableConv::load(
+                    vb.pp("input_conv").pp(index),
+                    neck_channels,
+                    kernel_size,
+                    4,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { insert, input })
+    }
+
+    fn forward(&self, stages: &[Tensor]) -> Result<Tensor> {
+        let mut fused = self
+            .insert
+            .iter()
+            .zip(stages)
+            .map(|(conv, feature)| conv.forward(feature))
+            .collect::<Result<Vec<_>>>()?;
+        for index in (0..3).rev() {
+            let upper = upsample(&fused[index + 1], 2)?;
+            let current = fused.remove(index);
+            fused.insert(index, current.into_add(&upper)?);
+        }
+        let mut features = self
             .input
             .iter()
-            .map(|name| {
-                if name.is_empty() {
-                    Ok(None)
-                } else {
-                    names
-                        .get(name)
-                        .copied()
-                        .map(Some)
-                        .with_context(|| format!("{op_type} references unknown value {name:?}"))
-                }
-            })
+            .zip(&fused)
+            .map(|(conv, feature)| conv.forward(feature))
             .collect::<Result<Vec<_>>>()?;
-        let operation = operation_from_onnx(op_type, &proto.attribute)?;
-        let output = initial_values.len();
-        ensure!(
-            names.insert(proto.output[0].clone(), output).is_none(),
-            "duplicate ONNX value {:?}",
-            proto.output[0]
-        );
-        initial_values.push(None);
-        nodes.push(Node {
-            name: proto.name.unwrap_or_else(|| format!("{op_type}.{index}")),
-            inputs,
-            output,
-            operation,
-        });
+        for (feature, scale) in features.iter_mut().zip([1, 2, 4, 8]) {
+            *feature = upsample(feature, scale)?;
+        }
+        features.reverse();
+        Tensor::cat(&features.iter().collect::<Vec<_>>(), 1)
     }
-    let output_name = graph.output[0]
-        .name
-        .as_ref()
-        .context("ONNX graph output has no name")?;
-    let output = *names
-        .get(output_name)
-        .with_context(|| format!("unknown ONNX graph output {output_name:?}"))?;
-    Ok(ModelData {
-        input,
-        output,
-        input_shape: input_shape.to_vec(),
-        initial_values,
-        nodes,
-        use_counts: Vec::new(),
-    })
 }
 
-#[cfg(feature = "cpu-convert")]
-fn operation_from_onnx(
-    op_type: &str,
-    attributes: &[rten_onnx::onnx::AttributeProto],
-) -> Result<Operation> {
-    let operation = match op_type {
-        "Add" => Operation::Add,
-        "AveragePool" => Operation::AveragePool(pool_options(attributes)?),
-        "BatchNormalization" => Operation::BatchNormalization {
-            epsilon: attribute_float(attributes, "epsilon").unwrap_or(1e-5),
-        },
-        "Concat" => Operation::Concat {
-            axis: attribute_int(attributes, "axis").context("Concat has no axis")?,
-        },
-        "Conv" => Operation::Conv(conv_options(attributes)?),
-        "ConvTranspose" => Operation::ConvTranspose(conv_options(attributes)?),
-        "Div" => Operation::Div,
-        "Erf" => Operation::Erf,
-        "GlobalAveragePool" => Operation::GlobalAveragePool,
-        "HardSigmoid" => Operation::HardSigmoid {
-            alpha: attribute_float(attributes, "alpha").unwrap_or(0.2),
-            beta: attribute_float(attributes, "beta").unwrap_or(0.5),
-        },
-        "MatMul" => Operation::MatMul,
-        "MaxPool" => Operation::MaxPool(pool_options(attributes)?),
-        "Mul" => Operation::Mul,
-        "Pow" => Operation::Pow,
-        "ReduceMean" => Operation::ReduceMean {
-            axes: attribute_ints(attributes, "axes")
-                .context("ReduceMean has no axes")?
-                .to_vec(),
-            keep_dims: attribute_int(attributes, "keepdims").unwrap_or(1) != 0,
-        },
-        "Relu" => Operation::Relu,
-        "Reshape" => Operation::Reshape,
-        "Resize" => {
-            ensure!(
-                attribute_string(attributes, "mode").unwrap_or("nearest") == "nearest",
-                "only nearest Resize is supported"
-            );
-            ensure!(
-                attribute_string(attributes, "coordinate_transformation_mode")
-                    .unwrap_or("half_pixel")
-                    == "asymmetric",
-                "only asymmetric Resize is supported"
-            );
-            Operation::Resize
-        }
-        "Shape" => Operation::Shape,
-        "Sigmoid" => Operation::Sigmoid,
-        "Slice" => Operation::Slice,
-        "Softmax" => Operation::Softmax {
-            axis: attribute_int(attributes, "axis").unwrap_or(-1),
-        },
-        "Sqrt" => Operation::Sqrt,
-        "Squeeze" => Operation::Squeeze {
-            axes: attribute_ints(attributes, "axes").unwrap_or(&[]).to_vec(),
-        },
-        "Sub" => Operation::Sub,
-        "Transpose" => Operation::Transpose {
-            permutation: attribute_ints(attributes, "perm")
-                .context("Transpose has no permutation")?
-                .iter()
-                .map(|&value| usize::try_from(value).map_err(anyhow::Error::from))
-                .collect::<Result<Vec<_>>>()?,
-        },
-        "Unsqueeze" => Operation::Unsqueeze {
-            axes: attribute_ints(attributes, "axes").unwrap_or(&[]).to_vec(),
-        },
-        other => bail!("unsupported ONNX operation {other}"),
+fn upsample(input: &Tensor, scale: usize) -> Result<Tensor> {
+    if scale == 1 {
+        return Ok(input.clone());
+    }
+    let (_, _, height, width) = input.dims4()?;
+    input.resize_nearest2d([height * scale, width * scale])
+}
+
+struct TransposeConvBnRelu {
+    convolution: BackendConvTranspose2d,
+}
+
+impl TransposeConvBnRelu {
+    fn load(vb: VarBuilder<'_>, in_channels: usize, out_channels: usize) -> Result<Self> {
+        let conv = vb.pp("convolution");
+        let weight = conv.get([in_channels, out_channels, 2, 2], "weight")?;
+        let bias = Some(conv.get(out_channels, "bias")?);
+        let (weight, bias) =
+            fold_transpose_batch_norm(weight, bias, vb.pp("norm"), in_channels, out_channels)?;
+        Ok(Self {
+            convolution: BackendConvTranspose2d::new(weight, Some(bias), [2, 2], [0; 4], 1)?,
+        })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.convolution.forward(input)?.into_relu()
+    }
+}
+
+fn fold_transpose_batch_norm(
+    weight: Tensor,
+    bias: Option<Tensor>,
+    norm: VarBuilder<'_>,
+    in_channels: usize,
+    out_channels: usize,
+) -> Result<(Tensor, Tensor)> {
+    let shape = weight.shape().to_vec();
+    let mut weight_values = weight.into_f32()?;
+    let mut bias_values = match bias {
+        Some(bias) => bias.into_f32()?,
+        None => vec![0.0; out_channels],
     };
-    Ok(operation)
-}
-
-#[cfg(feature = "cpu-convert")]
-fn conv_options(attributes: &[rten_onnx::onnx::AttributeProto]) -> Result<ConvOptions> {
-    let strides = pair(
-        attribute_ints(attributes, "strides").unwrap_or(&[1, 1]),
-        "strides",
-    )?;
-    let kernel = pair(
-        attribute_ints(attributes, "kernel_shape").context("Conv has no kernel shape")?,
-        "kernel shape",
-    )?;
-    let pads = padding(attributes, kernel, strides)?;
-    ensure!(
-        attribute_ints(attributes, "dilations").unwrap_or(&[1, 1]) == [1, 1],
-        "dilated Conv is unsupported"
-    );
-    Ok(ConvOptions {
-        strides,
-        pads,
-        groups: usize::try_from(attribute_int(attributes, "group").unwrap_or(1))?,
-        packed_pointwise: false,
-    })
-}
-
-#[cfg(feature = "cpu-convert")]
-fn pool_options(attributes: &[rten_onnx::onnx::AttributeProto]) -> Result<PoolOptions> {
-    let kernel = pair(
-        attribute_ints(attributes, "kernel_shape").context("pool has no kernel shape")?,
-        "kernel shape",
-    )?;
-    let strides = pair(
-        attribute_ints(attributes, "strides").unwrap_or(&[1, 1]),
-        "strides",
-    )?;
-    Ok(PoolOptions {
-        kernel,
-        strides,
-        pads: padding(attributes, kernel, strides)?,
-        ceil_mode: attribute_int(attributes, "ceil_mode").unwrap_or(0) != 0,
-        count_include_pad: attribute_int(attributes, "count_include_pad").unwrap_or(0) != 0,
-    })
-}
-
-#[cfg(feature = "cpu-convert")]
-fn padding(
-    attributes: &[rten_onnx::onnx::AttributeProto],
-    kernel: [usize; 2],
-    strides: [usize; 2],
-) -> Result<[usize; 4]> {
-    if let Some(pads) = attribute_ints(attributes, "pads") {
-        ensure!(pads.len() == 4, "padding must contain four values");
-        return pads
-            .iter()
-            .map(|&value| usize::try_from(value).map_err(anyhow::Error::from))
-            .collect::<Result<Vec<_>>>()?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("padding must contain four values"));
-    }
-    match attribute_string(attributes, "auto_pad").unwrap_or("NOTSET") {
-        "NOTSET" | "VALID" => Ok([0; 4]),
-        "SAME_UPPER" => {
-            ensure!(
-                strides == [1, 1],
-                "SAME_UPPER with non-unit stride is unsupported"
-            );
-            Ok([0, 0, kernel[0] - 1, kernel[1] - 1])
-        }
-        value => bail!("unsupported automatic padding mode {value:?}"),
-    }
-}
-
-#[cfg(feature = "cpu-convert")]
-fn pair(values: &[i64], name: &str) -> Result<[usize; 2]> {
-    ensure!(values.len() == 2, "{name} must contain two values");
-    Ok([usize::try_from(values[0])?, usize::try_from(values[1])?])
-}
-
-#[cfg(feature = "cpu-convert")]
-fn attribute<'a>(
-    attributes: &'a [rten_onnx::onnx::AttributeProto],
-    name: &str,
-) -> Option<&'a rten_onnx::onnx::AttributeProto> {
-    attributes
-        .iter()
-        .find(|attribute| attribute.name.as_deref() == Some(name))
-}
-
-#[cfg(feature = "cpu-convert")]
-fn attribute_int(attributes: &[rten_onnx::onnx::AttributeProto], name: &str) -> Option<i64> {
-    attribute(attributes, name).and_then(|attribute| attribute.i)
-}
-
-#[cfg(feature = "cpu-convert")]
-fn attribute_float(attributes: &[rten_onnx::onnx::AttributeProto], name: &str) -> Option<f32> {
-    attribute(attributes, name).and_then(|attribute| attribute.f)
-}
-
-#[cfg(feature = "cpu-convert")]
-fn attribute_ints<'a>(
-    attributes: &'a [rten_onnx::onnx::AttributeProto],
-    name: &str,
-) -> Option<&'a [i64]> {
-    attribute(attributes, name).map(|attribute| attribute.ints.as_slice())
-}
-
-#[cfg(feature = "cpu-convert")]
-fn attribute_string<'a>(
-    attributes: &'a [rten_onnx::onnx::AttributeProto],
-    name: &str,
-) -> Option<&'a str> {
-    attribute(attributes, name).and_then(|attribute| attribute.s.as_deref())
-}
-
-#[cfg(feature = "cpu-convert")]
-fn write_operation(writer: &mut impl Write, operation: &Operation) -> Result<()> {
-    let tag = match operation {
-        Operation::Add => 0,
-        Operation::AveragePool(_) => 1,
-        Operation::BatchNormalization { .. } => 2,
-        Operation::Concat { .. } => 3,
-        Operation::Conv(_) => 4,
-        Operation::ConvTranspose(_) => 5,
-        Operation::Div => 6,
-        Operation::Erf => 7,
-        Operation::GlobalAveragePool => 8,
-        Operation::HardSigmoid { .. } => 9,
-        Operation::MatMul => 10,
-        Operation::MaxPool(_) => 11,
-        Operation::Mul => 12,
-        Operation::Pow => 13,
-        Operation::ReduceMean { .. } => 14,
-        Operation::Relu => 15,
-        Operation::Reshape => 16,
-        Operation::Resize => 17,
-        Operation::Shape => 18,
-        Operation::Sigmoid => 19,
-        Operation::Slice => 20,
-        Operation::Softmax { .. } => 21,
-        Operation::Sqrt => 22,
-        Operation::Squeeze { .. } => 23,
-        Operation::Sub => 24,
-        Operation::Transpose { .. } => 25,
-        Operation::Unsqueeze { .. } => 26,
-        Operation::Gelu => 27,
-        Operation::HardSwish => 28,
-        Operation::Silu => 29,
-        Operation::ConvGelu(_) => 30,
-        Operation::BiasSoftmax { .. } => 31,
-        Operation::MatMulBiasSoftmax { .. } => 32,
-    };
-    writer.write_all(&[tag])?;
-    match operation {
-        Operation::AveragePool(options) | Operation::MaxPool(options) => {
-            write_pool(writer, options)?
-        }
-        Operation::BatchNormalization { epsilon } => writer.write_all(&epsilon.to_le_bytes())?,
-        Operation::BiasSoftmax { axis }
-        | Operation::Concat { axis }
-        | Operation::MatMulBiasSoftmax { axis }
-        | Operation::Softmax { axis } => writer.write_all(&axis.to_le_bytes())?,
-        Operation::Conv(options)
-        | Operation::ConvGelu(options)
-        | Operation::ConvTranspose(options) => write_conv(writer, options)?,
-        Operation::HardSigmoid { alpha, beta } => {
-            writer.write_all(&alpha.to_le_bytes())?;
-            writer.write_all(&beta.to_le_bytes())?;
-        }
-        Operation::ReduceMean { axes, keep_dims } => {
-            write_i64_vec(writer, axes)?;
-            writer.write_all(&[u8::from(*keep_dims)])?;
-        }
-        Operation::Squeeze { axes } | Operation::Unsqueeze { axes } => write_i64_vec(writer, axes)?,
-        Operation::Transpose { permutation } => write_usize_vec(writer, permutation)?,
-        _ => {}
-    }
-    Ok(())
-}
-
-fn read_operation(reader: &mut impl Read) -> Result<Operation> {
-    let mut tag = [0u8; 1];
-    reader.read_exact(&mut tag)?;
-    Ok(match tag[0] {
-        0 => Operation::Add,
-        1 => Operation::AveragePool(read_pool(reader)?),
-        2 => Operation::BatchNormalization {
-            epsilon: read_f32(reader)?,
-        },
-        3 => Operation::Concat {
-            axis: read_i64(reader)?,
-        },
-        4 => Operation::Conv(read_conv(reader)?),
-        5 => Operation::ConvTranspose(read_conv(reader)?),
-        6 => Operation::Div,
-        7 => Operation::Erf,
-        8 => Operation::GlobalAveragePool,
-        9 => Operation::HardSigmoid {
-            alpha: read_f32(reader)?,
-            beta: read_f32(reader)?,
-        },
-        10 => Operation::MatMul,
-        11 => Operation::MaxPool(read_pool(reader)?),
-        12 => Operation::Mul,
-        13 => Operation::Pow,
-        14 => {
-            let axes = read_i64_vec(reader, MAX_RANK, "reduction axes")?;
-            let mut keep_dims = [0u8; 1];
-            reader.read_exact(&mut keep_dims)?;
-            ensure!(keep_dims[0] <= 1, "invalid keep-dimensions flag");
-            Operation::ReduceMean {
-                axes,
-                keep_dims: keep_dims[0] != 0,
+    let gamma = norm.get(out_channels, "weight")?;
+    let beta = norm.get(out_channels, "bias")?;
+    let mean = norm.get(out_channels, "running_mean")?;
+    let variance = norm.get(out_channels, "running_var")?;
+    let gamma = gamma.as_f32()?;
+    let beta = beta.as_f32()?;
+    let mean = mean.as_f32()?;
+    let variance = variance.as_f32()?;
+    let kernel = weight_values.len() / (in_channels * out_channels);
+    for out_channel in 0..out_channels {
+        let scale = gamma[out_channel] / (variance[out_channel] + 1e-5).sqrt();
+        for in_channel in 0..in_channels {
+            let start = (in_channel * out_channels + out_channel) * kernel;
+            for value in &mut weight_values[start..start + kernel] {
+                *value *= scale;
             }
         }
-        15 => Operation::Relu,
-        16 => Operation::Reshape,
-        17 => Operation::Resize,
-        18 => Operation::Shape,
-        19 => Operation::Sigmoid,
-        20 => Operation::Slice,
-        21 => Operation::Softmax {
-            axis: read_i64(reader)?,
-        },
-        22 => Operation::Sqrt,
-        23 => Operation::Squeeze {
-            axes: read_i64_vec(reader, MAX_RANK, "squeeze axes")?,
-        },
-        24 => Operation::Sub,
-        25 => Operation::Transpose {
-            permutation: read_usize_vec(reader, MAX_RANK, "transpose permutation")?,
-        },
-        26 => Operation::Unsqueeze {
-            axes: read_i64_vec(reader, MAX_RANK, "unsqueeze axes")?,
-        },
-        27 => Operation::Gelu,
-        28 => Operation::HardSwish,
-        29 => Operation::Silu,
-        30 => Operation::ConvGelu(read_conv(reader)?),
-        31 => Operation::BiasSoftmax {
-            axis: read_i64(reader)?,
-        },
-        32 => Operation::MatMulBiasSoftmax {
-            axis: read_i64(reader)?,
-        },
-        value => bail!("unknown operation tag {value}"),
-    })
+        bias_values[out_channel] =
+            (bias_values[out_channel] - mean[out_channel]) * scale + beta[out_channel];
+    }
+    Ok((
+        Tensor::new_f32(shape, weight_values),
+        Tensor::new_f32(vec![out_channels], bias_values),
+    ))
 }
 
-#[cfg(feature = "cpu-convert")]
-fn write_conv(writer: &mut impl Write, options: &ConvOptions) -> Result<()> {
-    write_usize_vec(writer, &options.strides)?;
-    write_usize_vec(writer, &options.pads)?;
-    write_u32(writer, to_u32(options.groups, "group count")?)
+struct DetectorHead {
+    down: ConvBnAct,
+    up: TransposeConvBnRelu,
+    final_conv: BackendConvTranspose2d,
 }
 
-fn read_conv(reader: &mut impl Read) -> Result<ConvOptions> {
-    Ok(ConvOptions {
-        strides: read_usize_vec(reader, 2, "convolution strides")?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("convolution must have two strides"))?,
-        pads: read_usize_vec(reader, 4, "convolution padding")?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("convolution must have four padding values"))?,
-        groups: usize::try_from(read_u32(reader)?)?,
-        packed_pointwise: false,
-    })
+impl DetectorHead {
+    fn load(vb: VarBuilder<'_>, input_channels: usize) -> Result<Self> {
+        let hidden_channels = input_channels / 4;
+        let down = ConvBnAct::load(
+            vb.pp("conv_down"),
+            input_channels,
+            hidden_channels,
+            [3, 3],
+            [1, 1],
+            [1; 4],
+            false,
+            1,
+            "norm",
+            Activation::Relu,
+        )?;
+        let up = TransposeConvBnRelu::load(vb.pp("conv_up"), hidden_channels, hidden_channels)?;
+        let final_vb = vb.pp("conv_final");
+        let final_conv = BackendConvTranspose2d::new(
+            final_vb.get([hidden_channels, 1, 2, 2], "weight")?,
+            Some(final_vb.get(1, "bias")?),
+            [2, 2],
+            [0; 4],
+            1,
+        )?;
+        Ok(Self {
+            down,
+            up,
+            final_conv,
+        })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.final_conv
+            .forward(&self.up.forward(&self.down.forward(input)?)?)?
+            .into_sigmoid()
+    }
 }
 
-#[cfg(feature = "cpu-convert")]
-fn write_pool(writer: &mut impl Write, options: &PoolOptions) -> Result<()> {
-    write_usize_vec(writer, &options.kernel)?;
-    write_usize_vec(writer, &options.strides)?;
-    write_usize_vec(writer, &options.pads)?;
-    writer.write_all(&[
-        u8::from(options.ceil_mode),
-        u8::from(options.count_include_pad),
-    ])?;
-    Ok(())
+enum DetectorNeckKind {
+    Medium(DetectorNeck),
+    RepLkFpn(RepLkFpn),
 }
 
-fn read_pool(reader: &mut impl Read) -> Result<PoolOptions> {
-    let kernel = read_usize_vec(reader, 2, "pool kernel")?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("pool must have a two-dimensional kernel"))?;
-    let strides = read_usize_vec(reader, 2, "pool strides")?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("pool must have two strides"))?;
-    let pads = read_usize_vec(reader, 4, "pool padding")?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("pool must have four padding values"))?;
-    let mut flags = [0u8; 2];
-    reader.read_exact(&mut flags)?;
-    ensure!(flags.iter().all(|&flag| flag <= 1), "invalid pool flags");
-    Ok(PoolOptions {
-        kernel,
-        strides,
-        pads,
-        ceil_mode: flags[0] != 0,
-        count_include_pad: flags[1] != 0,
-    })
+impl DetectorNeckKind {
+    fn forward(&self, stages: &[Tensor]) -> Result<Tensor> {
+        match self {
+            Self::Medium(neck) => neck.forward(stages),
+            Self::RepLkFpn(neck) => neck.forward(stages),
+        }
+    }
 }
 
-#[cfg(feature = "cpu-convert")]
-fn write_usize_vec(writer: &mut impl Write, values: &[usize]) -> Result<()> {
-    write_u32(writer, to_u32(values.len(), "vector length")?)?;
-    for &value in values {
-        write_u64(writer, value as u64)?;
+pub struct Detector {
+    backbone: LcNetBackbone,
+    neck: DetectorNeckKind,
+    head: DetectorHead,
+    pool: ThreadPool,
+}
+
+impl Detector {
+    pub fn load(path: impl AsRef<Path>, size: ModelSize, options: CpuOptions) -> Result<Self> {
+        let pool = thread_pool(options)?;
+        let weights = Weights::load(path)?;
+        let vb = weights.builder();
+        let encoder = vb.pp("model").pp("backbone").pp("encoder");
+        let (backbone, neck, head) = match size {
+            ModelSize::Medium => (
+                LcNetBackbone::load(
+                    encoder,
+                    &detector_stages_for_channels([128, 256, 512, 896]),
+                    StemSpec::Large {
+                        mid_channels: 64,
+                        out_channels: 128,
+                    },
+                    Activation::Relu,
+                )?,
+                DetectorNeckKind::Medium(DetectorNeck::load(vb.pp("model").pp("neck"))?),
+                DetectorHead::load(vb.pp("head"), 256)?,
+            ),
+            ModelSize::Small => (
+                LcNetBackbone::load(
+                    encoder,
+                    &detector_stages_for_channels([48, 96, 192, 384]),
+                    StemSpec::Large {
+                        mid_channels: 24,
+                        out_channels: 48,
+                    },
+                    Activation::Relu,
+                )?,
+                DetectorNeckKind::RepLkFpn(RepLkFpn::load(
+                    vb.pp("model").pp("neck"),
+                    [48, 96, 192, 384],
+                    96,
+                    7,
+                )?),
+                DetectorHead::load(vb.pp("head"), 96)?,
+            ),
+            ModelSize::Tiny => (
+                LcNetBackbone::load(
+                    encoder,
+                    &detector_stages_for_channels([32, 48, 64, 160]),
+                    StemSpec::Large {
+                        mid_channels: 16,
+                        out_channels: 32,
+                    },
+                    Activation::Relu,
+                )?,
+                DetectorNeckKind::RepLkFpn(RepLkFpn::load(
+                    vb.pp("model").pp("neck"),
+                    [32, 48, 64, 160],
+                    64,
+                    5,
+                )?),
+                DetectorHead::load(vb.pp("head"), 64)?,
+            ),
+        };
+        Ok(Self {
+            backbone,
+            neck,
+            head,
+            pool,
+        })
+    }
+
+    pub fn run(&self, input: Tensor) -> Result<Tensor> {
+        validate_input(&input, true)?;
+        self.pool.install(|| self.forward(&input))
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let features = self.backbone.forward(input)?;
+        self.head.forward(&self.neck.forward(&features)?)
+    }
+}
+
+fn validate_input(input: &Tensor, detector: bool) -> Result<()> {
+    input.as_f32()?;
+    let (batch, channels, height, width) = input.dims4()?;
+    ensure!(batch > 0, "input batch must not be empty");
+    ensure!(channels == 3, "input must have three NCHW channels");
+    ensure!(
+        height > 0 && width > 0,
+        "input spatial dimensions must be positive"
+    );
+    if detector {
+        ensure!(
+            height % 32 == 0 && width % 32 == 0,
+            "detector input height and width must be multiples of 32"
+        );
+    } else {
+        ensure!(height == 48, "recognizer input height must be 48");
+        ensure!(width >= 5, "recognizer input width must be at least 5");
     }
     Ok(())
 }
 
-#[cfg(feature = "cpu-convert")]
-fn write_i64_vec(writer: &mut impl Write, values: &[i64]) -> Result<()> {
-    write_u32(writer, to_u32(values.len(), "vector length")?)?;
-    for &value in values {
-        writer.write_all(&value.to_le_bytes())?;
+fn detector_stages_for_channels(channels: [usize; 4]) -> Vec<Vec<BlockSpec>> {
+    let [stage1, stage2, stage3, stage4] = channels;
+    vec![
+        vec![
+            rec_block(stage1, stage1, [1, 1], true),
+            rec_block(stage1, stage1, [1, 1], false),
+        ],
+        vec![
+            rec_block(stage1, stage2, [2, 2], false),
+            rec_block(stage2, stage2, [1, 1], true),
+            rec_block(stage2, stage2, [1, 1], false),
+        ],
+        vec![
+            rec_block(stage2, stage3, [2, 2], false),
+            rec_block(stage3, stage3, [1, 1], true),
+            rec_block(stage3, stage3, [1, 1], false),
+            rec_block(stage3, stage3, [1, 1], true),
+            rec_block(stage3, stage3, [1, 1], false),
+        ],
+        vec![
+            rec_block(stage3, stage4, [2, 2], false),
+            rec_block(stage4, stage4, [1, 1], true),
+            rec_block(stage4, stage4, [1, 1], false),
+        ],
+    ]
+}
+
+fn load_linear(vb: VarBuilder<'_>, input: usize, output: usize) -> Result<Linear> {
+    Linear::new(
+        vb.get([output, input], "weight")?,
+        Some(vb.get(output, "bias")?),
+    )
+}
+
+fn load_layer_norm(vb: VarBuilder<'_>, features: usize) -> Result<LayerNorm> {
+    LayerNorm::new(vb.get(features, "weight")?, vb.get(features, "bias")?, 1e-6)
+}
+
+struct RecAttention {
+    qkv: Linear,
+    projection: Linear,
+    hidden_size: usize,
+    num_heads: usize,
+}
+
+impl RecAttention {
+    fn load(vb: VarBuilder<'_>, hidden_size: usize, num_heads: usize) -> Result<Self> {
+        Ok(Self {
+            qkv: load_linear(vb.pp("qkv"), hidden_size, hidden_size * 3)?,
+            projection: load_linear(vb.pp("projection"), hidden_size, hidden_size)?,
+            hidden_size,
+            num_heads,
+        })
     }
-    Ok(())
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let (batch, sequence, _) = input.dims3()?;
+        let head_dim = self.hidden_size / self.num_heads;
+        let qkv = self
+            .qkv
+            .forward(input)?
+            .reshape([batch, sequence, 3, self.num_heads, head_dim])?
+            .permute([2, 0, 3, 1, 4])?;
+        let parts = qkv.chunk(3, 0)?;
+        let query = parts[0].squeeze(0)?;
+        let key = parts[1].squeeze(0)?;
+        let value = parts[2].squeeze(0)?;
+        let weights = query
+            .matmul(&key.transpose(2, 3)?)?
+            .into_affine((head_dim as f32).powf(-0.5), 0.0)?
+            .into_softmax(-1)?;
+        let output = weights.matmul(&value)?.transpose(1, 2)?.reshape([
+            batch,
+            sequence,
+            self.hidden_size,
+        ])?;
+        self.projection.forward(&output)
+    }
 }
 
-fn read_usize_vec(reader: &mut impl Read, maximum: usize, name: &str) -> Result<Vec<usize>> {
-    let length = read_len(reader, maximum, name)?;
-    (0..length)
-        .map(|_| Ok(usize::try_from(read_u64(reader)?)?))
-        .collect()
+struct RecMlp {
+    fc1: Linear,
+    fc2: Linear,
 }
 
-fn read_i64_vec(reader: &mut impl Read, maximum: usize, name: &str) -> Result<Vec<i64>> {
-    let length = read_len(reader, maximum, name)?;
-    (0..length).map(|_| read_i64(reader)).collect()
+impl RecMlp {
+    fn load(vb: VarBuilder<'_>, hidden_size: usize, mlp_size: usize) -> Result<Self> {
+        Ok(Self {
+            fc1: load_linear(vb.pp("fc1"), hidden_size, mlp_size)?,
+            fc2: load_linear(vb.pp("fc2"), mlp_size, hidden_size)?,
+        })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.fc2.forward(&self.fc1.forward(input)?.into_silu()?)
+    }
 }
 
-#[cfg(feature = "cpu-convert")]
-fn write_string(writer: &mut impl Write, value: &str) -> Result<()> {
-    write_u32(writer, to_u32(value.len(), "string length")?)?;
-    writer.write_all(value.as_bytes())?;
-    Ok(())
+struct RecBlock {
+    layer_norm1: LayerNorm,
+    attention: RecAttention,
+    layer_norm2: LayerNorm,
+    mlp: RecMlp,
 }
 
-fn read_string(reader: &mut impl Read) -> Result<String> {
-    let length = read_len(reader, 64 * 1024, "string length")?;
-    let mut bytes = vec![0; length];
-    reader.read_exact(&mut bytes)?;
-    String::from_utf8(bytes).context("model contains invalid UTF-8")
+impl RecBlock {
+    fn load(
+        vb: VarBuilder<'_>,
+        hidden_size: usize,
+        num_heads: usize,
+        mlp_size: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            layer_norm1: load_layer_norm(vb.pp("layer_norm1"), hidden_size)?,
+            attention: RecAttention::load(vb.pp("self_attn"), hidden_size, num_heads)?,
+            layer_norm2: load_layer_norm(vb.pp("layer_norm2"), hidden_size)?,
+            mlp: RecMlp::load(vb.pp("mlp"), hidden_size, mlp_size)?,
+        })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let output = input.add(&self.attention.forward(&self.layer_norm1.forward(input)?)?)?;
+        let residual = self.mlp.forward(&self.layer_norm2.forward(&output)?)?;
+        output.into_add(&residual)
+    }
 }
 
-#[cfg(feature = "cpu-convert")]
-fn write_u32(writer: &mut impl Write, value: u32) -> Result<()> {
-    writer.write_all(&value.to_le_bytes())?;
-    Ok(())
+struct RecEncoder {
+    skip: ConvBnAct,
+    reduce: ConvBnAct,
+    local: ConvBnAct,
+    blocks: Vec<RecBlock>,
+    norm: LayerNorm,
 }
 
-#[cfg(feature = "cpu-convert")]
-fn write_u64(writer: &mut impl Write, value: u64) -> Result<()> {
-    writer.write_all(&value.to_le_bytes())?;
-    Ok(())
+impl RecEncoder {
+    fn load(
+        vb: VarBuilder<'_>,
+        input_channels: usize,
+        hidden_size: usize,
+        num_heads: usize,
+        mlp_size: usize,
+        depth: usize,
+    ) -> Result<Self> {
+        let load_conv = |index, in_channels, out_channels, kernel: [usize; 2], groups| {
+            let padding = [kernel[0] / 2, kernel[1] / 2];
+            ConvBnAct::load(
+                vb.pp("conv_block").pp(index),
+                in_channels,
+                out_channels,
+                kernel,
+                [1, 1],
+                [padding[0], padding[1], padding[0], padding[1]],
+                false,
+                groups,
+                "normalization",
+                Activation::Silu,
+            )
+        };
+        Ok(Self {
+            skip: load_conv(0, input_channels, hidden_size, [1, 1], 1)?,
+            reduce: load_conv(1, input_channels, hidden_size, [1, 1], 1)?,
+            local: load_conv(2, hidden_size, hidden_size, [1, 7], hidden_size)?,
+            blocks: (0..depth)
+                .map(|index| {
+                    RecBlock::load(
+                        vb.pp("svtr_block").pp(index),
+                        hidden_size,
+                        num_heads,
+                        mlp_size,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?,
+            norm: load_layer_norm(vb.pp("norm"), hidden_size)?,
+        })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let residual = self.skip.forward(input)?;
+        let hidden = self.reduce.forward(input)?;
+        let local = self.local.forward(&hidden)?;
+        let hidden = hidden.into_add(&local)?;
+        let (batch, channels, height, width) = hidden.dims4()?;
+        let mut hidden = hidden.flatten(2, 3)?.transpose(1, 2)?;
+        for block in &self.blocks {
+            hidden = block.forward(&hidden)?;
+        }
+        let hidden = self
+            .norm
+            .forward(&hidden)?
+            .reshape([batch, height, width, channels])?
+            .permute([0, 3, 1, 2])?
+            .into_add(&residual)?;
+        hidden.squeeze(2)?.transpose(1, 2)
+    }
 }
 
-fn read_u32(reader: &mut impl Read) -> Result<u32> {
-    let mut bytes = [0; 4];
-    reader.read_exact(&mut bytes)?;
-    Ok(u32::from_le_bytes(bytes))
+struct LightSvtrRecognizerHead {
+    encoder: RecEncoder,
+    classifier: Linear,
 }
 
-fn read_u64(reader: &mut impl Read) -> Result<u64> {
-    let mut bytes = [0; 8];
-    reader.read_exact(&mut bytes)?;
-    Ok(u64::from_le_bytes(bytes))
+impl LightSvtrRecognizerHead {
+    fn load(
+        vb: VarBuilder<'_>,
+        input_channels: usize,
+        hidden_size: usize,
+        mlp_size: usize,
+        classes: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            encoder: RecEncoder::load(
+                vb.pp("encoder"),
+                input_channels,
+                hidden_size,
+                8,
+                mlp_size,
+                2,
+            )?,
+            classifier: load_linear(vb.pp("head"), hidden_size, classes)?,
+        })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.classifier
+            .forward_softmax(&self.encoder.forward(input)?)
+    }
 }
 
-fn read_i64(reader: &mut impl Read) -> Result<i64> {
-    let mut bytes = [0; 8];
-    reader.read_exact(&mut bytes)?;
-    Ok(i64::from_le_bytes(bytes))
+struct Conv1dBn {
+    convolution: BackendConv2d,
 }
 
-fn read_f32(reader: &mut impl Read) -> Result<f32> {
-    let mut bytes = [0; 4];
-    reader.read_exact(&mut bytes)?;
-    Ok(f32::from_le_bytes(bytes))
+impl Conv1dBn {
+    fn load(
+        conv: VarBuilder<'_>,
+        norm: VarBuilder<'_>,
+        input_channels: usize,
+        output_channels: usize,
+        kernel_size: usize,
+        groups: usize,
+    ) -> Result<Self> {
+        let weight = conv.get(
+            [output_channels, input_channels / groups, kernel_size],
+            "weight",
+        )?;
+        let (weight, bias) = fold_batch_norm(weight, None, norm, output_channels)?;
+        let weight = weight.reshape([output_channels, input_channels / groups, 1, kernel_size])?;
+        let padding = kernel_size / 2;
+        Ok(Self {
+            convolution: BackendConv2d::new(
+                weight,
+                Some(bias),
+                [1, 1],
+                [0, padding, 0, padding],
+                groups,
+            )?,
+        })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.convolution.forward(input)
+    }
 }
 
-fn read_len(reader: &mut impl Read, maximum: usize, name: &str) -> Result<usize> {
-    let value = usize::try_from(read_u32(reader)?)?;
-    ensure!(value <= maximum, "{name} {value} exceeds limit {maximum}");
-    Ok(value)
+struct TinyRecognizerHead {
+    conv1: Conv1dBn,
+    conv2: Conv1dBn,
+    fc1: Linear,
+    fc2: Linear,
 }
 
-fn read_id(reader: &mut impl Read, value_count: usize, name: &str) -> Result<usize> {
-    let id = usize::try_from(read_u32(reader)?)?;
-    ensure!(id < value_count, "{name} {id} is out of range");
-    Ok(id)
+impl TinyRecognizerHead {
+    fn load(vb: VarBuilder<'_>) -> Result<Self> {
+        Ok(Self {
+            conv1: Conv1dBn::load(vb.pp("conv1"), vb.pp("norm1"), 160, 160, 5, 160)?,
+            conv2: Conv1dBn::load(vb.pp("conv2"), vb.pp("norm2"), 160, 160, 1, 1)?,
+            fc1: load_linear(vb.pp("fc1"), 160, 80)?,
+            fc2: load_linear(vb.pp("fc2"), 80, 6_906)?,
+        })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let hidden = self.conv1.forward(input)?.into_hard_swish()?;
+        let hidden = self.conv2.forward(&hidden)?.into_hard_swish()?;
+        let hidden = hidden.squeeze(2)?.transpose(1, 2)?;
+        self.fc2.forward_softmax(&self.fc1.forward(&hidden)?)
+    }
 }
 
-#[cfg(feature = "cpu-convert")]
-fn to_u32(value: usize, name: &str) -> Result<u32> {
-    u32::try_from(value).with_context(|| format!("{name} does not fit u32"))
+enum RecognizerHeadKind {
+    LightSvtr(LightSvtrRecognizerHead),
+    Tiny(TinyRecognizerHead),
+}
+
+impl RecognizerHeadKind {
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::LightSvtr(head) => head.forward(input),
+            Self::Tiny(head) => head.forward(input),
+        }
+    }
+}
+
+pub struct Recognizer {
+    backbone: LcNetBackbone,
+    head: RecognizerHeadKind,
+    pool: ThreadPool,
+}
+
+impl Recognizer {
+    pub fn load(path: impl AsRef<Path>, size: ModelSize, options: CpuOptions) -> Result<Self> {
+        let pool = thread_pool(options)?;
+        let weights = Weights::load(path)?;
+        let vb = weights.builder();
+        let encoder = vb.pp("model").pp("backbone").pp("encoder");
+        let (backbone, head) = match size {
+            ModelSize::Medium => (
+                LcNetBackbone::load(
+                    encoder,
+                    &recognizer_stages(),
+                    StemSpec::Large {
+                        mid_channels: 64,
+                        out_channels: 128,
+                    },
+                    Activation::Relu,
+                )?,
+                RecognizerHeadKind::LightSvtr(LightSvtrRecognizerHead::load(
+                    vb.pp("head"),
+                    768,
+                    192,
+                    768,
+                    18_710,
+                )?),
+            ),
+            ModelSize::Small => (
+                LcNetBackbone::load(
+                    encoder,
+                    &small_recognizer_stages(),
+                    StemSpec::Large {
+                        mid_channels: 48,
+                        out_channels: 96,
+                    },
+                    Activation::Relu,
+                )?,
+                RecognizerHeadKind::LightSvtr(LightSvtrRecognizerHead::load(
+                    vb.pp("head"),
+                    384,
+                    120,
+                    240,
+                    18_710,
+                )?),
+            ),
+            ModelSize::Tiny => (
+                LcNetBackbone::load(
+                    encoder,
+                    &tiny_recognizer_stages(),
+                    StemSpec::Small {
+                        mid_channels: 24,
+                        out_channels: 48,
+                    },
+                    Activation::Relu,
+                )?,
+                RecognizerHeadKind::Tiny(TinyRecognizerHead::load(vb.pp("head"))?),
+            ),
+        };
+        Ok(Self {
+            backbone,
+            head,
+            pool,
+        })
+    }
+
+    pub fn run(&self, input: Tensor) -> Result<Tensor> {
+        validate_input(&input, false)?;
+        self.pool.install(|| self.forward(&input))
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let features = self.backbone.forward(input)?;
+        let feature = features.last().expect("recognizer backbone has stages");
+        let pooled = feature.avg_pool2d([3, 2], [3, 2], [0; 4], false, false)?;
+        self.head.forward(&pooled)
+    }
+}
+
+fn rec_block(
+    in_channels: usize,
+    out_channels: usize,
+    stride: [usize; 2],
+    use_se: bool,
+) -> BlockSpec {
+    BlockSpec {
+        kernel: 3,
+        in_channels,
+        out_channels,
+        stride,
+        use_se,
+    }
+}
+
+fn recognizer_stages() -> Vec<Vec<BlockSpec>> {
+    vec![
+        vec![rec_block(128, 128, [1, 1], true)],
+        vec![
+            rec_block(128, 256, [1, 1], false),
+            rec_block(256, 256, [1, 1], false),
+            rec_block(256, 256, [1, 1], true),
+        ],
+        vec![
+            rec_block(256, 512, [2, 1], false),
+            rec_block(512, 512, [1, 1], true),
+            rec_block(512, 512, [1, 1], false),
+            rec_block(512, 512, [1, 1], true),
+            rec_block(512, 512, [1, 1], false),
+            rec_block(512, 512, [1, 1], true),
+            rec_block(512, 512, [1, 1], false),
+        ],
+        vec![
+            rec_block(512, 768, [2, 1], false),
+            rec_block(768, 768, [1, 1], true),
+            rec_block(768, 768, [1, 1], false),
+        ],
+    ]
+}
+
+fn small_recognizer_stages() -> Vec<Vec<BlockSpec>> {
+    vec![
+        vec![rec_block(96, 96, [1, 1], true)],
+        vec![
+            rec_block(96, 96, [1, 1], false),
+            rec_block(96, 96, [1, 1], false),
+        ],
+        vec![
+            rec_block(96, 192, [2, 1], false),
+            rec_block(192, 192, [1, 1], true),
+            rec_block(192, 192, [1, 1], false),
+            rec_block(192, 192, [1, 1], true),
+            rec_block(192, 192, [1, 1], false),
+            rec_block(192, 192, [1, 1], true),
+            rec_block(192, 192, [1, 1], false),
+        ],
+        vec![
+            rec_block(192, 384, [2, 1], false),
+            rec_block(384, 384, [1, 1], true),
+            rec_block(384, 384, [1, 1], false),
+        ],
+    ]
+}
+
+fn tiny_recognizer_stages() -> Vec<Vec<BlockSpec>> {
+    vec![
+        vec![rec_block(48, 48, [1, 1], true)],
+        vec![rec_block(48, 48, [1, 1], false)],
+        vec![
+            rec_block(48, 96, [2, 1], false),
+            rec_block(96, 96, [1, 1], true),
+            rec_block(96, 96, [1, 1], false),
+        ],
+        vec![
+            rec_block(96, 160, [2, 1], false),
+            rec_block(160, 160, [1, 1], true),
+            rec_block(160, 160, [1, 1], false),
+            rec_block(160, 160, [1, 1], false),
+        ],
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(height: usize, width: usize) -> Tensor {
+        Tensor::new_f32(vec![1, 3, height, width], vec![0.0; 3 * height * width])
+    }
+
+    #[test]
+    fn validates_model_input_boundaries() {
+        assert!(validate_input(&input(32, 32), true).is_ok());
+        assert!(validate_input(&input(32, 31), true).is_err());
+        assert!(validate_input(&input(48, 5), false).is_ok());
+        assert!(validate_input(&input(48, 4), false).is_err());
+    }
 }

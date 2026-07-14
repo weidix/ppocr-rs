@@ -1,17 +1,7 @@
-//! Architecture-specific CPU kernels.
-
 use rayon::prelude::*;
 
 #[cfg(target_arch = "aarch64")]
 mod neon;
-#[cfg(target_arch = "x86_64")]
-mod x86;
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn has_avx2_fma() -> bool {
-    std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
-}
 
 #[inline]
 pub(crate) fn fill(values: &mut [f32], value: f32) {
@@ -20,19 +10,12 @@ pub(crate) fn fill(values: &mut [f32], value: f32) {
 
 #[inline]
 pub(crate) fn axpy(output: &mut [f32], input: &[f32], scale: f32) {
-    assert_eq!(output.len(), input.len());
+    debug_assert_eq!(output.len(), input.len());
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: The implementation only performs unaligned loads/stores within
         // the bounds of equally sized slices. NEON is mandatory on AArch64.
         unsafe { neon::axpy(output, input, scale) };
-    }
-    #[cfg(target_arch = "x86_64")]
-    if has_avx2_fma() {
-        // SAFETY: AVX2 and FMA were detected at runtime, and equal-length
-        // slices bound every unaligned vector load and store.
-        unsafe { x86::axpy(output, input, scale) };
-        return;
     }
     #[cfg(not(target_arch = "aarch64"))]
     for (output, input) in output.iter_mut().zip(input) {
@@ -46,18 +29,11 @@ pub(crate) fn add_in_place(output: &mut [f32], input: &[f32]) {
 }
 
 pub(crate) fn mul_in_place(output: &mut [f32], input: &[f32]) {
-    assert_eq!(output.len(), input.len());
+    debug_assert_eq!(output.len(), input.len());
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: Equal-length slices bound every vector load and store.
         unsafe { neon::mul_in_place(output, input) };
-    }
-    #[cfg(target_arch = "x86_64")]
-    if has_avx2_fma() {
-        // SAFETY: AVX2 and FMA were detected at runtime, and both slices have
-        // the same length.
-        unsafe { x86::mul_in_place(output, input) };
-        return;
     }
     #[cfg(not(target_arch = "aarch64"))]
     for (output, input) in output.iter_mut().zip(input) {
@@ -71,37 +47,9 @@ pub(crate) fn affine_in_place(values: &mut [f32], scale: f32, bias: f32) {
         // SAFETY: The in-place kernel only accesses the supplied slice.
         unsafe { neon::affine(values, scale, bias) };
     }
-    #[cfg(target_arch = "x86_64")]
-    if has_avx2_fma() {
-        // SAFETY: AVX2 and FMA were detected at runtime; the kernel stays
-        // within the supplied slice.
-        unsafe { x86::affine(values, scale, bias) };
-        return;
-    }
     #[cfg(not(target_arch = "aarch64"))]
     for value in values {
         *value = value.mul_add(scale, bias);
-    }
-}
-
-pub(crate) fn residual_mul_in_place(values: &mut [f32], gate: f32) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: The in-place kernel only accesses the supplied slice.
-        unsafe { neon::residual_mul(values, gate) };
-    }
-    #[cfg(target_arch = "x86_64")]
-    if has_avx2_fma() {
-        // SAFETY: AVX2 and FMA were detected at runtime; the kernel stays
-        // within the supplied slice.
-        unsafe { x86::residual_mul(values, gate) };
-        return;
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    for value in values {
-        let original = *value;
-        let scaled = original.mul_add(gate, 0.0);
-        *value = scaled.mul_add(1.0, original);
     }
 }
 
@@ -110,13 +58,6 @@ pub(crate) fn square_in_place(values: &mut [f32]) {
     {
         // SAFETY: The in-place kernel only accesses the supplied slice.
         unsafe { neon::square(values) };
-    }
-    #[cfg(target_arch = "x86_64")]
-    if has_avx2_fma() {
-        // SAFETY: AVX2 and FMA were detected at runtime; the kernel stays
-        // within the supplied slice.
-        unsafe { x86::square(values) };
-        return;
     }
     #[cfg(not(target_arch = "aarch64"))]
     for value in values {
@@ -238,14 +179,12 @@ fn gemm_impl(
     activation: Option<UnaryOperation>,
     row_softmax: bool,
 ) {
-    assert!(rows > 0 && inner > 0 && columns > 0);
-    assert_eq!(rows.checked_mul(columns), Some(output.len()));
-    assert_eq!(rows.checked_mul(inner), Some(left.len()));
-    assert_eq!(inner.checked_mul(columns), Some(right.len()));
-    assert!(bias.is_none_or(|bias| bias.len() == rows));
-    assert!(column_bias.is_none_or(|bias| bias.len() == columns));
-    assert!(bias.is_none() || column_bias.is_none());
-    assert!(!packed_left || column_bias.is_none());
+    debug_assert_eq!(output.len(), rows * columns);
+    debug_assert_eq!(left.len(), rows * inner);
+    debug_assert_eq!(right.len(), inner * columns);
+    debug_assert!(bias.is_none_or(|bias| bias.len() == rows));
+    debug_assert!(column_bias.is_none_or(|bias| bias.len() == columns));
+    debug_assert!(bias.is_none() || column_bias.is_none());
     let micro_rows = if packed_left { 12 } else { 8 };
     let row_blocks = rows.div_ceil(micro_rows);
     let blocks_per_task = row_blocks.div_ceil(rayon::current_num_threads()).max(1);
@@ -298,89 +237,6 @@ fn gemm_rows(
     column_bias: Option<&[f32]>,
     packed_left: bool,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    if has_avx2_fma() {
-        if rows == 12 && packed_left {
-            debug_assert!(column_bias.is_none());
-            // SAFETY: AVX2 and FMA were detected at runtime. The caller
-            // supplies twelve packed left rows and complete output rows.
-            unsafe {
-                x86::gemm_rows_8::<12, true>(
-                    output,
-                    left,
-                    right,
-                    inner,
-                    columns,
-                    right_stride,
-                    bias,
-                    None,
-                )
-            };
-            return;
-        }
-        if rows == 8 {
-            // SAFETY: AVX2 and FMA were detected at runtime. Slice dimensions
-            // describe eight complete rows in the selected left layout.
-            unsafe {
-                if packed_left {
-                    debug_assert!(column_bias.is_none());
-                    x86::gemm_rows_8::<8, true>(
-                        output,
-                        left,
-                        right,
-                        inner,
-                        columns,
-                        right_stride,
-                        bias,
-                        None,
-                    )
-                } else {
-                    x86::gemm_rows_8::<8, false>(
-                        output,
-                        left,
-                        right,
-                        inner,
-                        columns,
-                        right_stride,
-                        bias,
-                        column_bias,
-                    )
-                }
-            };
-            return;
-        }
-        if rows == 4 {
-            // SAFETY: Same runtime feature and matrix-bounds argument as the
-            // eight-row kernel above.
-            unsafe {
-                if packed_left {
-                    debug_assert!(column_bias.is_none());
-                    x86::gemm_rows_8::<4, true>(
-                        output,
-                        left,
-                        right,
-                        inner,
-                        columns,
-                        right_stride,
-                        bias,
-                        None,
-                    )
-                } else {
-                    x86::gemm_rows_8::<4, false>(
-                        output,
-                        left,
-                        right,
-                        inner,
-                        columns,
-                        right_stride,
-                        bias,
-                        column_bias,
-                    )
-                }
-            };
-            return;
-        }
-    }
     #[cfg(target_arch = "aarch64")]
     if rows == 12 && packed_left {
         // SAFETY: The caller supplies exactly twelve complete output rows and
@@ -449,8 +305,8 @@ fn gemm_rows(
 }
 
 pub(crate) fn max_pool_2x2_same_upper(output: &mut [f32], input: &[f32], width: usize) {
-    assert_eq!(output.len(), input.len());
-    assert!(width > 0 && input.len().is_multiple_of(width));
+    debug_assert_eq!(output.len(), input.len());
+    debug_assert!(width > 0 && input.len().is_multiple_of(width));
     let height = input.len() / width;
     for y in 0..height {
         let current = &input[y * width..(y + 1) * width];
@@ -531,13 +387,6 @@ pub(crate) fn softmax_in_place(values: &mut [f32]) {
         // supplied slice and handles the remaining values with safe indexing.
         unsafe { neon::softmax(values) };
     }
-    #[cfg(target_arch = "x86_64")]
-    if has_avx2_fma() {
-        // SAFETY: AVX2 and FMA were detected at runtime; the kernel only
-        // accesses full vectors and a scalar tail inside the slice.
-        unsafe { x86::softmax(values) };
-        return;
-    }
     #[cfg(not(target_arch = "aarch64"))]
     {
         let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -560,15 +409,7 @@ pub(crate) fn mean(values: &[f32]) -> f32 {
         // handles its tail through safe indexing.
         unsafe { neon::sum(values) }
     };
-    #[cfg(target_arch = "x86_64")]
-    let sum = if has_avx2_fma() {
-        // SAFETY: AVX2 and FMA were detected at runtime; the reduction only
-        // reads full vectors and a scalar tail inside the slice.
-        unsafe { x86::sum(values) }
-    } else {
-        values.iter().copied().sum::<f32>()
-    };
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(not(target_arch = "aarch64"))]
     let sum = values.iter().copied().sum::<f32>();
     sum / values.len() as f32
 }
@@ -585,23 +426,6 @@ fn unary_chunk(values: &mut [f32], operation: UnaryOperation) {
             UnaryOperation::Gelu => {
                 // SAFETY: The operation is in-place and stays in slice bounds.
                 unsafe { neon::gelu(values) };
-                return;
-            }
-            _ => {}
-        }
-    }
-    #[cfg(target_arch = "x86_64")]
-    if has_avx2_fma() {
-        match operation {
-            UnaryOperation::Relu => {
-                // SAFETY: AVX2 and FMA were detected at runtime, and the
-                // operation stays within the supplied slice.
-                unsafe { x86::relu(values) };
-                return;
-            }
-            UnaryOperation::Gelu => {
-                // SAFETY: Same feature and slice-bounds argument as ReLU.
-                unsafe { x86::gelu(values) };
                 return;
             }
             _ => {}
@@ -728,35 +552,5 @@ mod tests {
                 .map(|(index, _)| index),
             Some(2)
         );
-    }
-
-    #[test]
-    fn fused_residual_mul_preserves_two_step_rounding() {
-        let mut values = (0..37)
-            .map(|index| (index as f32 - 19.0) / 7.0)
-            .collect::<Vec<_>>();
-        let mut expected = values.clone();
-        for value in &mut expected {
-            let original = *value;
-            let scaled = original.mul_add(0.375, 0.0);
-            *value = scaled.mul_add(1.0, original);
-        }
-        residual_mul_in_place(&mut values, 0.375);
-        assert_eq!(values, expected);
-    }
-
-    #[test]
-    fn relu_and_max_pool_ignore_a_single_nan() {
-        let mut values = vec![-1.0; 17];
-        values[0] = f32::NAN;
-        unary_in_place(&mut values, UnaryOperation::Relu);
-        assert_eq!(values[0], 0.0);
-
-        let mut input = vec![1.0; 17];
-        input[0] = f32::NAN;
-        input[1] = 2.0;
-        let mut output = vec![0.0; input.len()];
-        max_pool_2x2_same_upper(&mut output, &input, 17);
-        assert_eq!(output[0], 2.0);
     }
 }

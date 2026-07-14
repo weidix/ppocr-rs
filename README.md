@@ -7,36 +7,65 @@ Candle CRNN trainer. Runtime dependencies are selected explicitly through Cargo 
 | --- | --- | --- |
 | `candle-metal` | PP-OCRv6 Safetensors inference on Metal | Yes |
 | `candle` | PP-OCRv6 Safetensors inference on CPU | No |
-| `cpu` | Self-contained SIMD CPU inference for converted models | No |
-| `cpu-convert` | Offline ONNX to `.ppocr-cpu` conversion | No |
+| `cpu` | Direct Safetensors inference with native CPU kernels | No |
+| `gpu` | Direct Safetensors inference through WGPU (Metal/Vulkan) | No |
+| `cpu_onnx` | Self-contained SIMD CPU inference for converted ONNX models | No |
+| `cpu_onnx-convert` | Offline ONNX to `.ppocr-cpu` conversion | No |
 | `burn-infer` | Fixed-shape ONNX Burn Metal end-to-end OCR | No |
 | `burn-bench` | Fixed-shape ONNX Burn Metal benchmark | No |
 | `onnx-tools` | Rust ONNX fixed-shape utility | No |
 | `training` | Candle CRNN trainer | No |
 
-## Self-Contained CPU Backend
+## Safetensors GPU Backend
 
-The `cpu` runtime implements the PP-OCRv6 operators locally and does not invoke ONNX Runtime,
+The `gpu` feature runs the official medium, small, and tiny detector and recognizer models directly
+from F32 Safetensors. It selects Metal on macOS and Vulkan on other platforms.
+
+```sh
+cargo run --release --no-default-features --features gpu --bin ppocr-gpu-bench -- \
+  --model det --size tiny --weights /path/to/model.safetensors \
+  --height 416 --width 736 --warmup 5 --runs 30
+```
+
+The Rust API is available under `ppocr_rs::gpu`.
+
+## Safetensors CPU Backend
+
+The `cpu` feature provides direct PP-OCRv6 Safetensors CPU inference for the medium, small, and tiny
+detector and recognizer models from the PaddlePaddle PP-OCRv6 collection.
+
+```sh
+cargo run --release --no-default-features --features cpu --bin ppocr-cpu-bench -- \
+  --model /path/to/model.safetensors --kind det --size tiny \
+  --height 416 --width 736 --threads 4 --warmup 5 --runs 30
+```
+
+The Rust API is available under `ppocr_rs::cpu`.
+
+## Converted ONNX CPU Backend
+
+The `cpu_onnx` runtime implements the PP-OCRv6 operators locally and does not invoke ONNX Runtime,
 Burn, Candle, RTen, BLAS, or another inference library. Its only compute dependency is Rayon for
-the fixed worker pool. `rten-onnx` is enabled only by `cpu-convert` to decode ONNX offline and is
-not linked into deployed `cpu` builds.
+the fixed worker pool. `rten-onnx` is enabled only by `cpu_onnx-convert` to decode ONNX offline and
+is not linked into deployed `cpu_onnx` builds. Direct Safetensors inference uses the `cpu` feature
+above.
 
 Convert a model at its deployed fixed shape, then benchmark the packed model:
 
 ```sh
-cargo run --release --no-default-features --features cpu-convert \
-  --bin ppocr-cpu-convert -- \
+cargo run --release --no-default-features --features cpu_onnx-convert \
+  --bin ppocr-cpu-onnx-convert -- \
   inference.onnx model.ppocr-cpu --shape 1 3 48 320
 
-cargo run --release --no-default-features --features cpu \
-  --bin ppocr-cpu-bench -- \
+cargo run --release --no-default-features --features cpu_onnx \
+  --bin ppocr-cpu-onnx-bench -- \
   model.ppocr-cpu --threads 4 --warmup 5 --runs 30
 ```
 
 The runtime API accepts a contiguous NCHW F32 tensor:
 
 ```rust
-use ppocr_rs::cpu::{CpuModel, CpuOptions, Tensor};
+use ppocr_rs::cpu_onnx::{CpuModel, CpuOptions, Tensor};
 
 let model = CpuModel::load("model.ppocr-cpu", CpuOptions { threads: 4 })?;
 let input = Tensor::from_f32(model.input_shape().to_vec(), input_values)?;

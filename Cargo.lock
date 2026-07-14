@@ -4472,8 +4472,10 @@ dependencies = [
  "rand 0.8.7",
  "rayon",
  "rten-onnx",
+ "safetensors 0.7.0",
  "serde",
  "serde_json",
+ "wgpu",
 ]
 
 [[package]]

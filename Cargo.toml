@@ -9,10 +9,14 @@ default-run = "ppocr-rs"
 [features]
 default = ["candle-metal"]
 
+# Direct PP-OCRv6 Safetensors inference through native CPU kernels or WGPU.
+cpu = ["dep:rayon", "dep:safetensors"]
+gpu = ["dep:safetensors", "dep:wgpu"]
+
 # Self-contained CPU inference. ONNX decoding is isolated to the offline
 # converter; deployed inference only needs the packed model and CPU kernels.
-cpu = ["dep:rayon"]
-cpu-convert = ["cpu", "dep:rten-onnx"]
+cpu_onnx = ["dep:rayon"]
+cpu_onnx-convert = ["cpu_onnx", "dep:rten-onnx"]
 
 # Direct PP-OCRv6 Safetensors inference.
 candle = ["dep:candle-core", "dep:candle-nn"]
@@ -54,8 +58,15 @@ protobuf = { version = "=3.7.2", optional = true }
 rand = { version = "0.8", optional = true }
 rayon = { version = "1.11", optional = true }
 rten-onnx = { version = "=0.24.0", optional = true }
+safetensors = { version = "=0.7.0", optional = true, default-features = false, features = ["std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "=29.0.4", optional = true, default-features = false, features = ["std", "wgsl", "metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+wgpu = { version = "=29.0.4", optional = true, default-features = false, features = ["std", "wgsl", "vulkan"] }
 
 [build-dependencies]
 burn-onnx = { version = "=0.21.0", optional = true }
@@ -90,19 +101,29 @@ path = "src/bin/ppocr-onnx-staticize.rs"
 required-features = ["onnx-tools"]
 
 [[bin]]
-name = "ppocr-cpu-inspect"
-path = "src/bin/ppocr-cpu-inspect.rs"
-required-features = ["cpu-convert"]
+name = "ppocr-cpu-onnx-inspect"
+path = "src/bin/ppocr-cpu-onnx-inspect.rs"
+required-features = ["cpu_onnx-convert"]
 
 [[bin]]
-name = "ppocr-cpu-convert"
-path = "src/bin/ppocr-cpu-convert.rs"
-required-features = ["cpu-convert"]
+name = "ppocr-cpu-onnx-convert"
+path = "src/bin/ppocr-cpu-onnx-convert.rs"
+required-features = ["cpu_onnx-convert"]
+
+[[bin]]
+name = "ppocr-cpu-onnx-bench"
+path = "src/bin/ppocr-cpu-onnx-bench.rs"
+required-features = ["cpu_onnx"]
 
 [[bin]]
 name = "ppocr-cpu-bench"
 path = "src/bin/ppocr-cpu-bench.rs"
 required-features = ["cpu"]
+
+[[bin]]
+name = "ppocr-gpu-bench"
+path = "src/bin/ppocr-gpu-bench.rs"
+required-features = ["gpu"]
 
 [[bin]]
 name = "ppocr-candle-train"
