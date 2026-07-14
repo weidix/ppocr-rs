@@ -1,7 +1,5 @@
 //! AArch64 NEON kernels.
-
 use core::arch::aarch64::*;
-
 #[target_feature(enable = "neon")]
 pub(super) unsafe fn axpy(output: &mut [f32], input: &[f32], scale: f32) {
     let vector_len = output.len() / 16 * 16;
@@ -37,7 +35,6 @@ pub(super) unsafe fn axpy(output: &mut [f32], input: &[f32], scale: f32) {
         output[index] = input[index].mul_add(scale, output[index]);
     }
 }
-
 #[target_feature(enable = "neon")]
 pub(super) unsafe fn relu(values: &mut [f32]) {
     let zero = vdupq_n_f32(0.0);
@@ -60,7 +57,6 @@ pub(super) unsafe fn relu(values: &mut [f32]) {
         *value = value.max(0.0);
     }
 }
-
 #[target_feature(enable = "neon")]
 pub(super) unsafe fn mul_in_place(output: &mut [f32], input: &[f32]) {
     let vector_len = output.len() / 16 * 16;
@@ -288,6 +284,7 @@ pub(super) unsafe fn gemm_8x12(
 }
 
 #[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn gemm_4x16_packed(
     output: &mut [f32],
     left: &[f32],
@@ -296,6 +293,7 @@ pub(super) unsafe fn gemm_4x16_packed(
     columns: usize,
     right_stride: usize,
     bias: Option<&[f32]>,
+    accumulate: bool,
 ) {
     debug_assert_eq!(output.len(), 4 * columns);
     debug_assert_eq!(left.len(), 4 * inner);
@@ -305,19 +303,120 @@ pub(super) unsafe fn gemm_4x16_packed(
     for column in (0..vector_columns).step_by(16) {
         let mut accumulators = [vdupq_n_f32(0.0); 16];
         for row in 0..4 {
+            if accumulate {
+                let output_base = unsafe { output.as_ptr().add(row * columns + column) };
+                for vector in 0..4 {
+                    accumulators[row * 4 + vector] =
+                        unsafe { vld1q_f32(output_base.add(vector * 4)) };
+                }
+            } else {
+                let initial = vdupq_n_f32(bias.map_or(0.0, |bias| bias[row]));
+                for vector in 0..4 {
+                    accumulators[row * 4 + vector] = initial;
+                }
+            }
+        }
+        macro_rules! k_step {
+            ($index:expr) => {{
+                let index = $index;
+                let right_base = unsafe { right.as_ptr().add(index * right_stride + column) };
+                let right0 = unsafe { vld1q_f32(right_base) };
+                let right1 = unsafe { vld1q_f32(right_base.add(4)) };
+                let right2 = unsafe { vld1q_f32(right_base.add(8)) };
+                let right3 = unsafe { vld1q_f32(right_base.add(12)) };
+                // SAFETY: `left` contains `inner` complete groups of four packed rows.
+                let weights = unsafe { vld1q_f32(left.as_ptr().add(index * 4)) };
+                accumulators[0] = vfmaq_laneq_f32::<0>(accumulators[0], right0, weights);
+                accumulators[1] = vfmaq_laneq_f32::<0>(accumulators[1], right1, weights);
+                accumulators[2] = vfmaq_laneq_f32::<0>(accumulators[2], right2, weights);
+                accumulators[3] = vfmaq_laneq_f32::<0>(accumulators[3], right3, weights);
+                accumulators[4] = vfmaq_laneq_f32::<1>(accumulators[4], right0, weights);
+                accumulators[5] = vfmaq_laneq_f32::<1>(accumulators[5], right1, weights);
+                accumulators[6] = vfmaq_laneq_f32::<1>(accumulators[6], right2, weights);
+                accumulators[7] = vfmaq_laneq_f32::<1>(accumulators[7], right3, weights);
+                accumulators[8] = vfmaq_laneq_f32::<2>(accumulators[8], right0, weights);
+                accumulators[9] = vfmaq_laneq_f32::<2>(accumulators[9], right1, weights);
+                accumulators[10] = vfmaq_laneq_f32::<2>(accumulators[10], right2, weights);
+                accumulators[11] = vfmaq_laneq_f32::<2>(accumulators[11], right3, weights);
+                accumulators[12] = vfmaq_laneq_f32::<3>(accumulators[12], right0, weights);
+                accumulators[13] = vfmaq_laneq_f32::<3>(accumulators[13], right1, weights);
+                accumulators[14] = vfmaq_laneq_f32::<3>(accumulators[14], right2, weights);
+                accumulators[15] = vfmaq_laneq_f32::<3>(accumulators[15], right3, weights);
+            }};
+        }
+        let mut index = 0;
+        while index + 4 <= inner {
+            k_step!(index);
+            k_step!(index + 1);
+            k_step!(index + 2);
+            k_step!(index + 3);
+            index += 4;
+        }
+        while index < inner {
+            k_step!(index);
+            index += 1;
+        }
+        for row in 0..4 {
+            let output_base = unsafe { output.as_mut_ptr().add(row * columns + column) };
+            let offset = row * 4;
+            unsafe {
+                vst1q_f32(output_base, accumulators[offset]);
+                vst1q_f32(output_base.add(4), accumulators[offset + 1]);
+                vst1q_f32(output_base.add(8), accumulators[offset + 2]);
+                vst1q_f32(output_base.add(12), accumulators[offset + 3]);
+            }
+        }
+    }
+    for row in 0..4 {
+        for column in vector_columns..columns {
+            let mut sum = if accumulate {
+                output[row * columns + column]
+            } else {
+                bias.map_or(0.0, |bias| bias[row])
+            };
+            for index in 0..inner {
+                // SAFETY: Matrix dimensions were validated at entry.
+                sum = unsafe { *left.get_unchecked(index * 4 + row) }.mul_add(
+                    unsafe { *right.get_unchecked(index * right_stride + column) },
+                    sum,
+                );
+            }
+            output[row * columns + column] = sum;
+        }
+    }
+}
+
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn gemm_4x16_sparse(
+    output: &mut [f32],
+    right: &[f32],
+    indices: &[u32],
+    weights: &[f32],
+    columns: usize,
+    right_stride: usize,
+    bias: Option<&[f32]>,
+) {
+    const ROWS: usize = 4;
+
+    debug_assert_eq!(output.len(), ROWS * columns);
+    debug_assert!(columns.is_multiple_of(16));
+    debug_assert_eq!(weights.len(), indices.len() * ROWS);
+    debug_assert!(bias.is_none_or(|bias| bias.len() == ROWS));
+    for column in (0..columns).step_by(16) {
+        let mut accumulators = [vdupq_n_f32(0.0); 16];
+        for row in 0..ROWS {
             let initial = vdupq_n_f32(bias.map_or(0.0, |bias| bias[row]));
             for vector in 0..4 {
                 accumulators[row * 4 + vector] = initial;
             }
         }
-        for index in 0..inner {
-            let right_base = unsafe { right.as_ptr().add(index * right_stride + column) };
+        for (entry, &index) in indices.iter().enumerate() {
+            let right_base = unsafe { right.as_ptr().add(index as usize * right_stride + column) };
             let right0 = unsafe { vld1q_f32(right_base) };
             let right1 = unsafe { vld1q_f32(right_base.add(4)) };
             let right2 = unsafe { vld1q_f32(right_base.add(8)) };
             let right3 = unsafe { vld1q_f32(right_base.add(12)) };
-            // SAFETY: `left` contains `inner` complete groups of four packed rows.
-            let weights = unsafe { vld1q_f32(left.as_ptr().add(index * 4)) };
+            let weights = unsafe { vld1q_f32(weights.as_ptr().add(entry * ROWS)) };
             accumulators[0] = vfmaq_laneq_f32::<0>(accumulators[0], right0, weights);
             accumulators[1] = vfmaq_laneq_f32::<0>(accumulators[1], right1, weights);
             accumulators[2] = vfmaq_laneq_f32::<0>(accumulators[2], right2, weights);
@@ -335,7 +434,7 @@ pub(super) unsafe fn gemm_4x16_packed(
             accumulators[14] = vfmaq_laneq_f32::<3>(accumulators[14], right2, weights);
             accumulators[15] = vfmaq_laneq_f32::<3>(accumulators[15], right3, weights);
         }
-        for row in 0..4 {
+        for row in 0..ROWS {
             let output_base = unsafe { output.as_mut_ptr().add(row * columns + column) };
             let offset = row * 4;
             unsafe {
@@ -344,19 +443,6 @@ pub(super) unsafe fn gemm_4x16_packed(
                 vst1q_f32(output_base.add(8), accumulators[offset + 2]);
                 vst1q_f32(output_base.add(12), accumulators[offset + 3]);
             }
-        }
-    }
-    for row in 0..4 {
-        for column in vector_columns..columns {
-            let mut sum = bias.map_or(0.0, |bias| bias[row]);
-            for index in 0..inner {
-                // SAFETY: Matrix dimensions were validated at entry.
-                sum = unsafe { *left.get_unchecked(index * 4 + row) }.mul_add(
-                    unsafe { *right.get_unchecked(index * right_stride + column) },
-                    sum,
-                );
-            }
-            output[row * columns + column] = sum;
         }
     }
 }
@@ -441,8 +527,8 @@ pub(super) unsafe fn gemm_8x12_packed(
         }
     }
 }
-
 #[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn gemm_12x8_packed(
     output: &mut [f32],
     left: &[f32],
@@ -451,6 +537,7 @@ pub(super) unsafe fn gemm_12x8_packed(
     columns: usize,
     right_stride: usize,
     bias: Option<&[f32]>,
+    accumulate: bool,
 ) {
     debug_assert_eq!(output.len(), 12 * columns);
     debug_assert_eq!(left.len(), 12 * inner);
@@ -460,9 +547,15 @@ pub(super) unsafe fn gemm_12x8_packed(
     for column in (0..vector_columns).step_by(8) {
         let mut accumulators = [vdupq_n_f32(0.0); 24];
         for row in 0..12 {
-            let initial = vdupq_n_f32(bias.map_or(0.0, |bias| bias[row]));
-            accumulators[row * 2] = initial;
-            accumulators[row * 2 + 1] = initial;
+            if accumulate {
+                let output_base = unsafe { output.as_ptr().add(row * columns + column) };
+                accumulators[row * 2] = unsafe { vld1q_f32(output_base) };
+                accumulators[row * 2 + 1] = unsafe { vld1q_f32(output_base.add(4)) };
+            } else {
+                let initial = vdupq_n_f32(bias.map_or(0.0, |bias| bias[row]));
+                accumulators[row * 2] = initial;
+                accumulators[row * 2 + 1] = initial;
+            }
         }
         for index in 0..inner {
             let right_base = unsafe { right.as_ptr().add(index * right_stride + column) };
@@ -508,7 +601,11 @@ pub(super) unsafe fn gemm_12x8_packed(
     }
     for row in 0..12 {
         for column in vector_columns..columns {
-            let mut sum = bias.map_or(0.0, |bias| bias[row]);
+            let mut sum = if accumulate {
+                output[row * columns + column]
+            } else {
+                bias.map_or(0.0, |bias| bias[row])
+            };
             for index in 0..inner {
                 // SAFETY: Matrix dimensions were validated at entry.
                 sum = unsafe { *left.get_unchecked(index * 12 + row) }.mul_add(

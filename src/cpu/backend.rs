@@ -1,6 +1,6 @@
 use super::{
     kernels,
-    ops::{ConvOptions, Node, Operation, PoolOptions},
+    ops::{ConvOptions, Node, Operation, PoolOptions, SparseConvWeights},
     tensor::{IntoShape, Tensor, element_count},
 };
 use anyhow::{Context, Result, ensure};
@@ -295,7 +295,12 @@ impl Conv2d {
         pads: [usize; 4],
         groups: usize,
     ) -> Result<Self> {
-        let [output_channels, _, kernel_height, kernel_width]: [usize; 4] =
+        let [
+            output_channels,
+            channels_per_group,
+            kernel_height,
+            kernel_width,
+        ]: [usize; 4] =
             weight.shape.as_slice().try_into().with_context(|| {
                 format!("expected rank-four Conv weight, found {:?}", weight.shape)
             })?;
@@ -312,11 +317,41 @@ impl Conv2d {
             );
         }
 
+        let inner = channels_per_group * kernel_height * kernel_width;
+        let tiled_spatial = groups == 1
+            && (kernel_height != 1 || kernel_width != 1)
+            && inner >= 128
+            && output_channels >= 32;
+        let sparse_pointwise = groups == 1
+            && kernel_height == 1
+            && kernel_width == 1
+            && inner >= 512
+            && output_channels >= 512;
+        // Projection weights are strongly block-pruned. The tighter spatial
+        // threshold preserves detector scores; large pointwise layers use the
+        // OCR decision-preserving threshold measured by the CPU benchmark.
+        let prune_threshold = if tiled_spatial { 2.0e-6 } else { 4.0e-2 };
+        let sparse_weights = ((tiled_spatial || sparse_pointwise)
+            && output_channels.is_multiple_of(4))
+        .then(|| {
+            SparseConvWeights::from_dense(
+                weight.as_f32().expect("Conv weight was validated as F32"),
+                output_channels,
+                inner,
+                prune_threshold,
+            )
+        })
+        .flatten();
         let packed_pointwise = groups == 1
             && ((kernel_height == 1 && kernel_width == 1)
-                || (strides != [1, 1] && output_channels >= 48));
+                || (strides != [1, 1] && output_channels >= 48)
+                || tiled_spatial);
         let weight = if packed_pointwise {
-            pack_conv_rows(weight, output_channels)?
+            if tiled_spatial || sparse_weights.is_some() {
+                pack_conv_rows(weight, output_channels, 4)?
+            } else {
+                pack_conv_rows(weight, output_channels, 12)?
+            }
         } else {
             weight
         };
@@ -328,6 +363,7 @@ impl Conv2d {
                 pads,
                 groups,
                 packed_pointwise,
+                sparse_weights,
             },
         })
     }
@@ -356,8 +392,9 @@ impl Conv2d {
     }
 }
 
-fn pack_conv_rows(weight: Tensor, rows: usize) -> Result<Tensor> {
+fn pack_conv_rows(weight: Tensor, rows: usize, block_rows: usize) -> Result<Tensor> {
     ensure!(rows > 0, "Conv weight has zero output channels");
+    ensure!(block_rows > 0, "Conv weight block has zero rows");
     let shape = weight.shape.clone();
     let source = weight.into_f32()?;
     ensure!(
@@ -366,8 +403,8 @@ fn pack_conv_rows(weight: Tensor, rows: usize) -> Result<Tensor> {
     );
     let inner = source.len() / rows;
     let mut packed = Vec::with_capacity(source.len());
-    for row_start in (0..rows).step_by(12) {
-        let block_rows = (rows - row_start).min(12);
+    for row_start in (0..rows).step_by(block_rows) {
+        let block_rows = (rows - row_start).min(block_rows);
         for index in 0..inner {
             for row in 0..block_rows {
                 packed.push(source[(row_start + row) * inner + index]);
@@ -423,6 +460,7 @@ impl ConvTranspose2d {
                 pads,
                 groups,
                 packed_pointwise: false,
+                sparse_weights: None,
             },
         })
     }

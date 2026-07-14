@@ -286,6 +286,235 @@ fn gemm_impl(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_packed_panels(
+    output: &mut [f32],
+    left: &[f32],
+    right: &[f32],
+    rows: usize,
+    inner: usize,
+    panels: usize,
+    bias: Option<&[f32]>,
+    gelu: bool,
+) {
+    const PANEL_COLUMNS: usize = 16;
+
+    assert_eq!(output.len(), panels * rows * PANEL_COLUMNS);
+    assert_eq!(left.len(), rows * inner);
+    assert_eq!(right.len(), panels * inner * PANEL_COLUMNS);
+    #[cfg(target_arch = "aarch64")]
+    if rows.is_multiple_of(4) {
+        gemm_packed_panels_blocked(output, left, right, rows, inner, panels, bias, gelu);
+        return;
+    }
+    output
+        .par_chunks_mut(rows * PANEL_COLUMNS)
+        .zip(right.par_chunks(inner * PANEL_COLUMNS))
+        .for_each(|(output, right)| {
+            for row_start in (0..rows).step_by(4) {
+                let block_rows = (rows - row_start).min(4);
+                let output = &mut output
+                    [row_start * PANEL_COLUMNS..(row_start + block_rows) * PANEL_COLUMNS];
+                let left = &left[row_start * inner..(row_start + block_rows) * inner];
+                let bias = bias.map(|bias| &bias[row_start..row_start + block_rows]);
+                gemm_rows(
+                    output,
+                    left,
+                    right,
+                    block_rows,
+                    inner,
+                    PANEL_COLUMNS,
+                    PANEL_COLUMNS,
+                    bias,
+                    None,
+                    true,
+                );
+            }
+            if gelu {
+                unary_chunk(output, UnaryOperation::Gelu);
+            }
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_sparse_packed_panels(
+    output: &mut [f32],
+    right: &[f32],
+    rows: usize,
+    inner: usize,
+    panels: usize,
+    bias: Option<&[f32]>,
+    gelu: bool,
+    row_offsets: &[usize],
+    indices: &[u32],
+    values: &[f32],
+) {
+    const PANEL_COLUMNS: usize = 16;
+    const BLOCK_ROWS: usize = 4;
+
+    assert_eq!(output.len(), panels * rows * PANEL_COLUMNS);
+    assert_eq!(right.len(), panels * inner * PANEL_COLUMNS);
+    assert!(rows.is_multiple_of(BLOCK_ROWS));
+    assert_eq!(row_offsets.len(), rows / BLOCK_ROWS + 1);
+    assert_eq!(values.len(), indices.len() * BLOCK_ROWS);
+    output
+        .par_chunks_mut(rows * PANEL_COLUMNS)
+        .zip(right.par_chunks(inner * PANEL_COLUMNS))
+        .for_each(|(output, right)| {
+            for block in 0..rows / BLOCK_ROWS {
+                let row_start = block * BLOCK_ROWS;
+                let entry_start = row_offsets[block];
+                let entry_end = row_offsets[block + 1];
+                let output = &mut output
+                    [row_start * PANEL_COLUMNS..(row_start + BLOCK_ROWS) * PANEL_COLUMNS];
+                let bias = bias.map(|bias| &bias[row_start..row_start + BLOCK_ROWS]);
+                #[cfg(target_arch = "aarch64")]
+                // SAFETY: Indices reference complete 16-column rows in the
+                // packed RHS, and weights contain four values per entry.
+                unsafe {
+                    neon::gemm_4x16_sparse(
+                        output,
+                        right,
+                        &indices[entry_start..entry_end],
+                        &values[entry_start * BLOCK_ROWS..entry_end * BLOCK_ROWS],
+                        PANEL_COLUMNS,
+                        PANEL_COLUMNS,
+                        bias,
+                    );
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                for row in 0..BLOCK_ROWS {
+                    for column in 0..PANEL_COLUMNS {
+                        let mut sum = bias.map_or(0.0, |bias| bias[row]);
+                        for entry in entry_start..entry_end {
+                            let index = indices[entry] as usize;
+                            sum = values[entry * BLOCK_ROWS + row]
+                                .mul_add(right[index * PANEL_COLUMNS + column], sum);
+                        }
+                        output[row * PANEL_COLUMNS + column] = sum;
+                    }
+                }
+            }
+            if gelu {
+                unary_chunk(output, UnaryOperation::Gelu);
+            }
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_sparse_packed_left(
+    output: &mut [f32],
+    right: &[f32],
+    rows: usize,
+    inner: usize,
+    columns: usize,
+    bias: Option<&[f32]>,
+    gelu: bool,
+    row_offsets: &[usize],
+    indices: &[u32],
+    values: &[f32],
+) {
+    const BLOCK_ROWS: usize = 4;
+
+    assert_eq!(output.len(), rows * columns);
+    assert_eq!(right.len(), inner * columns);
+    assert!(rows.is_multiple_of(BLOCK_ROWS));
+    assert!(columns.is_multiple_of(16));
+    assert_eq!(row_offsets.len(), rows / BLOCK_ROWS + 1);
+    assert_eq!(values.len(), indices.len() * BLOCK_ROWS);
+    output
+        .par_chunks_mut(BLOCK_ROWS * columns)
+        .enumerate()
+        .for_each(|(block, output)| {
+            let entry_start = row_offsets[block];
+            let entry_end = row_offsets[block + 1];
+            let row_start = block * BLOCK_ROWS;
+            let bias = bias.map(|bias| &bias[row_start..row_start + BLOCK_ROWS]);
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: Every sparse index identifies a complete RHS row and
+            // weights contain four values per entry.
+            unsafe {
+                neon::gemm_4x16_sparse(
+                    output,
+                    right,
+                    &indices[entry_start..entry_end],
+                    &values[entry_start * BLOCK_ROWS..entry_end * BLOCK_ROWS],
+                    columns,
+                    columns,
+                    bias,
+                );
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            for row in 0..BLOCK_ROWS {
+                for column in 0..columns {
+                    let mut sum = bias.map_or(0.0, |bias| bias[row]);
+                    for entry in entry_start..entry_end {
+                        let index = indices[entry] as usize;
+                        sum = values[entry * BLOCK_ROWS + row]
+                            .mul_add(right[index * columns + column], sum);
+                    }
+                    output[row * columns + column] = sum;
+                }
+            }
+            if gelu {
+                unary_chunk(output, UnaryOperation::Gelu);
+            }
+        });
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+fn gemm_packed_panels_blocked(
+    output: &mut [f32],
+    left: &[f32],
+    right: &[f32],
+    rows: usize,
+    inner: usize,
+    _panels: usize,
+    bias: Option<&[f32]>,
+    gelu: bool,
+) {
+    const PANEL_COLUMNS: usize = 16;
+    const DEPTH_BLOCK: usize = 1024;
+
+    for depth_start in (0..inner).step_by(DEPTH_BLOCK) {
+        let depth = (inner - depth_start).min(DEPTH_BLOCK);
+        output
+            .par_chunks_mut(rows * PANEL_COLUMNS)
+            .zip(right.par_chunks(inner * PANEL_COLUMNS))
+            .for_each(|(output, right)| {
+                let right_start = depth_start * PANEL_COLUMNS;
+                let right = &right[right_start..right_start + depth * PANEL_COLUMNS];
+                for row_start in (0..rows).step_by(4) {
+                    let output =
+                        &mut output[row_start * PANEL_COLUMNS..(row_start + 4) * PANEL_COLUMNS];
+                    let left_start = row_start * inner + depth_start * 4;
+                    let left = &left[left_start..left_start + depth * 4];
+                    let bias = bias.map(|bias| &bias[row_start..row_start + 4]);
+                    // SAFETY: The slices describe a complete 4x16 tile and
+                    // NEON is mandatory on AArch64.
+                    unsafe {
+                        neon::gemm_4x16_packed(
+                            output,
+                            left,
+                            right,
+                            depth,
+                            PANEL_COLUMNS,
+                            PANEL_COLUMNS,
+                            bias,
+                            depth_start != 0,
+                        )
+                    };
+                }
+            });
+    }
+    if gelu {
+        output
+            .par_chunks_mut(rows * PANEL_COLUMNS)
+            .for_each(|output| unary_chunk(output, UnaryOperation::Gelu));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn gemm_rows(
     output: &mut [f32],
     left: &[f32],
@@ -386,7 +615,24 @@ fn gemm_rows(
         // SAFETY: The caller supplies exactly twelve complete output rows and
         // twelve interleaved weights for every inner-dimension position.
         debug_assert!(column_bias.is_none());
-        unsafe { neon::gemm_12x8_packed(output, left, right, inner, columns, right_stride, bias) };
+        const DEPTH_BLOCK: usize = 256;
+        for depth_start in (0..inner).step_by(DEPTH_BLOCK) {
+            let depth = (inner - depth_start).min(DEPTH_BLOCK);
+            let packed_left = &left[depth_start * 12..(depth_start + depth) * 12];
+            let right = &right[depth_start * right_stride..];
+            unsafe {
+                neon::gemm_12x8_packed(
+                    output,
+                    packed_left,
+                    right,
+                    depth,
+                    columns,
+                    right_stride,
+                    bias,
+                    depth_start != 0,
+                )
+            };
+        }
         return;
     }
     #[cfg(target_arch = "aarch64")]
@@ -418,7 +664,16 @@ fn gemm_rows(
         unsafe {
             if packed_left {
                 debug_assert!(column_bias.is_none());
-                neon::gemm_4x16_packed(output, left, right, inner, columns, right_stride, bias)
+                neon::gemm_4x16_packed(
+                    output,
+                    left,
+                    right,
+                    inner,
+                    columns,
+                    right_stride,
+                    bias,
+                    false,
+                )
             } else {
                 neon::gemm_4x16(
                     output,

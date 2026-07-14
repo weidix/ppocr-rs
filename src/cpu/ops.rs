@@ -4,6 +4,9 @@ use super::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use rayon::prelude::*;
+use std::sync::Arc;
+
+const SPATIAL_PANEL_COLUMNS: usize = 16;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Node {
@@ -55,6 +58,59 @@ pub(crate) struct ConvOptions {
     pub pads: [usize; 4],
     pub groups: usize,
     pub packed_pointwise: bool,
+    pub sparse_weights: Option<SparseConvWeights>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SparseConvWeights {
+    row_offsets: Arc<Vec<usize>>,
+    indices: Arc<Vec<u32>>,
+    values: Arc<Vec<f32>>,
+}
+
+impl SparseConvWeights {
+    pub(crate) fn from_dense(
+        weight: &[f32],
+        rows: usize,
+        inner: usize,
+        prune_threshold: f32,
+    ) -> Option<Self> {
+        const BLOCK_ROWS: usize = 4;
+        const MAXIMUM_ACTIVE_RATIO: f32 = 0.55;
+
+        if !cfg!(target_arch = "aarch64")
+            || !rows.is_multiple_of(BLOCK_ROWS)
+            || weight.len() != rows * inner
+            || inner > u32::MAX as usize
+        {
+            return None;
+        }
+        let mut row_offsets = Vec::with_capacity(rows / BLOCK_ROWS + 1);
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        row_offsets.push(0);
+        for row_start in (0..rows).step_by(BLOCK_ROWS) {
+            for index in 0..inner {
+                let block = std::array::from_fn::<_, BLOCK_ROWS, _>(|row| {
+                    weight[(row_start + row) * inner + index]
+                });
+                if block.iter().any(|value| value.abs() >= prune_threshold) {
+                    indices.push(index as u32);
+                    values.extend_from_slice(&block);
+                }
+            }
+            row_offsets.push(indices.len());
+        }
+        let possible = rows / BLOCK_ROWS * inner;
+        if indices.len() as f32 > possible as f32 * MAXIMUM_ACTIVE_RATIO {
+            return None;
+        }
+        Some(Self {
+            row_offsets: Arc::new(row_offsets),
+            indices: Arc::new(indices),
+            values: Arc::new(values),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -325,7 +381,22 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
                 ..(batch_index + 1) * output_channels * output_plane];
             let input = &input[batch_index * input_channels * input_plane
                 ..(batch_index + 1) * input_channels * input_plane];
-            if options.packed_pointwise {
+            if let Some(sparse) = &options.sparse_weights
+                && output_plane.is_multiple_of(SPATIAL_PANEL_COLUMNS)
+            {
+                kernels::gemm_sparse_packed_left(
+                    output,
+                    input,
+                    output_channels,
+                    input_channels,
+                    output_plane,
+                    bias,
+                    gelu,
+                    &sparse.row_offsets,
+                    &sparse.indices,
+                    &sparse.values,
+                );
+            } else if options.packed_pointwise {
                 if gelu {
                     kernels::gemm_packed_left_gelu(
                         output,
@@ -375,7 +446,12 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
         ));
     }
 
-    if options.groups == 1 && options.strides != [1, 1] {
+    if options.groups == 1
+        && options.strides != [1, 1]
+        && !((kernel_height != 1 || kernel_width != 1)
+            && input_channels * kernel_height * kernel_width >= 128
+            && output_channels >= 32)
+    {
         let patch_size = input_channels * kernel_height * kernel_width;
         for batch_index in 0..batch {
             let columns = im2col(
@@ -433,6 +509,39 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
                     bias,
                 );
             }
+        }
+        return Ok(Tensor::new_f32(
+            vec![batch, output_channels, output_height, output_width],
+            output,
+        ));
+    }
+
+    if options.groups == 1
+        && (kernel_height != 1 || kernel_width != 1)
+        && input_channels * kernel_height * kernel_width >= 128
+        && output_channels >= 32
+    {
+        let patch_size = input_channels * kernel_height * kernel_width;
+        for batch_index in 0..batch {
+            conv_im2col_tiled(
+                &mut output[batch_index * output_channels * output_plane
+                    ..(batch_index + 1) * output_channels * output_plane],
+                &input[batch_index * input_channels * input_plane
+                    ..(batch_index + 1) * input_channels * input_plane],
+                weight,
+                bias,
+                input_channels,
+                input_height,
+                input_width,
+                output_channels,
+                output_height,
+                output_width,
+                kernel_height,
+                kernel_width,
+                patch_size,
+                options,
+                gelu,
+            );
         }
         return Ok(Tensor::new_f32(
             vec![batch, output_channels, output_height, output_width],
@@ -541,6 +650,167 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
         vec![batch, output_channels, output_height, output_width],
         output,
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv_im2col_tiled(
+    output: &mut [f32],
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    input_channels: usize,
+    input_height: usize,
+    input_width: usize,
+    output_channels: usize,
+    output_height: usize,
+    output_width: usize,
+    kernel_height: usize,
+    kernel_width: usize,
+    patch_size: usize,
+    options: &ConvOptions,
+    gelu: bool,
+) {
+    let output_plane = output_height * output_width;
+    const TARGET_COLUMN_ELEMENTS: usize = 4 * 1024 * 1024;
+
+    let rows_per_tile =
+        (TARGET_COLUMN_ELEMENTS / (patch_size * output_width)).clamp(1, output_height);
+    let panels_per_row = output_width.div_ceil(SPATIAL_PANEL_COLUMNS);
+    let maximum_panels = rows_per_tile * panels_per_row;
+    let mut columns = vec![0.0; maximum_panels * patch_size * SPATIAL_PANEL_COLUMNS];
+    let mut tile_output = vec![0.0; maximum_panels * output_channels * SPATIAL_PANEL_COLUMNS];
+    for output_y_start in (0..output_height).step_by(rows_per_tile) {
+        let tile_rows = (output_height - output_y_start).min(rows_per_tile);
+        let tile_plane = tile_rows * output_width;
+        let tile_panels = tile_rows * panels_per_row;
+        let columns = &mut columns[..tile_panels * patch_size * SPATIAL_PANEL_COLUMNS];
+        im2col_panels(
+            columns,
+            input,
+            input_channels,
+            input_height,
+            input_width,
+            kernel_height,
+            kernel_width,
+            output_y_start,
+            tile_rows,
+            output_width,
+            options,
+        );
+        let tile_output = &mut tile_output[..tile_panels * output_channels * SPATIAL_PANEL_COLUMNS];
+        if let Some(sparse) = &options.sparse_weights {
+            kernels::gemm_sparse_packed_panels(
+                tile_output,
+                columns,
+                output_channels,
+                patch_size,
+                tile_panels,
+                bias,
+                gelu,
+                &sparse.row_offsets,
+                &sparse.indices,
+                &sparse.values,
+            );
+        } else {
+            kernels::gemm_packed_panels(
+                tile_output,
+                weight,
+                columns,
+                output_channels,
+                patch_size,
+                tile_panels,
+                bias,
+                gelu,
+            );
+        }
+        output
+            .par_chunks_mut(output_plane)
+            .enumerate()
+            .for_each(|(channel, output)| {
+                let start = output_y_start * output_width;
+                let output = &mut output[start..start + tile_plane];
+                for local_y in 0..tile_rows {
+                    for panel_x in 0..panels_per_row {
+                        let panel = local_y * panels_per_row + panel_x;
+                        let source = panel * output_channels * SPATIAL_PANEL_COLUMNS
+                            + channel * SPATIAL_PANEL_COLUMNS;
+                        let destination = local_y * output_width + panel_x * SPATIAL_PANEL_COLUMNS;
+                        let len = (output_width - panel_x * SPATIAL_PANEL_COLUMNS)
+                            .min(SPATIAL_PANEL_COLUMNS);
+                        output[destination..destination + len]
+                            .copy_from_slice(&tile_output[source..source + len]);
+                    }
+                }
+            });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn im2col_panels(
+    columns: &mut [f32],
+    input: &[f32],
+    input_channels: usize,
+    input_height: usize,
+    input_width: usize,
+    kernel_height: usize,
+    kernel_width: usize,
+    output_y_start: usize,
+    output_rows: usize,
+    output_width: usize,
+    options: &ConvOptions,
+) {
+    let input_plane = input_height * input_width;
+    let panels_per_row = output_width.div_ceil(SPATIAL_PANEL_COLUMNS);
+    debug_assert_eq!(
+        columns.len(),
+        output_rows
+            * panels_per_row
+            * input_channels
+            * kernel_height
+            * kernel_width
+            * SPATIAL_PANEL_COLUMNS
+    );
+
+    columns
+        .par_chunks_mut(input_channels * kernel_height * kernel_width * SPATIAL_PANEL_COLUMNS)
+        .enumerate()
+        .for_each(|(panel, output)| {
+            output.fill(0.0);
+            let local_y = panel / panels_per_row;
+            let output_x = panel % panels_per_row * SPATIAL_PANEL_COLUMNS;
+            for patch_index in 0..input_channels * kernel_height * kernel_width {
+                let kernel_x = patch_index % kernel_width;
+                let patch = patch_index / kernel_width;
+                let kernel_y = patch % kernel_height;
+                let channel = patch / kernel_height;
+                let input_y = (output_y_start + local_y) * options.strides[0] + kernel_y;
+                if input_y < options.pads[0] || input_y - options.pads[0] >= input_height {
+                    continue;
+                }
+                let input_y = input_y - options.pads[0];
+                let input = &input[channel * input_plane..(channel + 1) * input_plane];
+                let available = (output_width - output_x).min(SPATIAL_PANEL_COLUMNS);
+                let padded_input_x = output_x * options.strides[1] + kernel_x;
+                let destination = &mut output[patch_index * SPATIAL_PANEL_COLUMNS
+                    ..patch_index * SPATIAL_PANEL_COLUMNS + available];
+                if available == SPATIAL_PANEL_COLUMNS
+                    && options.strides[1] == 1
+                    && padded_input_x >= options.pads[1]
+                    && padded_input_x - options.pads[1] + SPATIAL_PANEL_COLUMNS <= input_width
+                {
+                    let input_x = padded_input_x - options.pads[1];
+                    let source = input_y * input_width + input_x;
+                    destination.copy_from_slice(&input[source..source + SPATIAL_PANEL_COLUMNS]);
+                    continue;
+                }
+                for (lane, destination) in destination.iter_mut().enumerate() {
+                    let input_x = (output_x + lane) * options.strides[1] + kernel_x;
+                    if input_x >= options.pads[1] && input_x - options.pads[1] < input_width {
+                        *destination = input[input_y * input_width + input_x - options.pads[1]];
+                    }
+                }
+            }
+        });
 }
 
 #[allow(clippy::too_many_arguments)]
