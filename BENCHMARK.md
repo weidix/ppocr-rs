@@ -170,12 +170,12 @@ F32 inputs as the ORT probe, with five warmups and 30 timed runs.
 
 | Model | WGPU p50 | p90 | Throughput | Burn p50 | WGPU vs Burn | ORT CPU / GPU / ANE p50 | WGPU vs ORT GPU |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| medium detector | 173.197 ms | 174.520 ms | 5.77 frames/s | 166.927 ms | 3.8% slower | 303.26 / 184.75 / 180.73 ms | 6.3% faster |
-| medium recognizer | 19.050 ms | 20.177 ms | 52.49 lines/s | 17.634 ms | 8.0% slower | 22.68 / 34.35 / 31.87 ms | 44.5% faster |
-| small detector | 36.589 ms | 36.778 ms | 27.33 frames/s | 47.855 ms | 23.5% faster | 56.13 / 55.58 / 52.87 ms | 34.2% faster |
-| small recognizer | 8.843 ms | 8.945 ms | 113.08 lines/s | 10.278 ms | 14.0% faster | 8.54 / 13.35 / 11.91 ms | 33.8% faster |
-| tiny detector | 20.337 ms | 21.575 ms | 49.17 frames/s | 28.606 ms | 28.9% faster | 27.84 / 29.65 / 27.40 ms | 31.4% faster |
-| tiny recognizer | 3.837 ms | 3.870 ms | 260.61 lines/s | 3.918 ms | 2.1% faster | 1.81 / 4.34 / 4.52 ms | 11.6% faster |
+| medium detector | 173.197 ms | 174.520 ms | 5.77 frames/s | 166.927 ms | 3.8% slower | 286.663 / 184.75 / 180.73 ms | 6.3% faster |
+| medium recognizer | 19.050 ms | 20.177 ms | 52.49 lines/s | 17.634 ms | 8.0% slower | 21.208 / 34.35 / 31.87 ms | 44.5% faster |
+| small detector | 36.589 ms | 36.778 ms | 27.33 frames/s | 47.855 ms | 23.5% faster | 52.489 / 55.58 / 52.87 ms | 34.2% faster |
+| small recognizer | 8.843 ms | 8.945 ms | 113.08 lines/s | 10.278 ms | 14.0% faster | 8.184 / 13.35 / 11.91 ms | 33.8% faster |
+| tiny detector | 20.337 ms | 21.575 ms | 49.17 frames/s | 28.606 ms | 28.9% faster | 26.704 / 29.65 / 27.40 ms | 31.4% faster |
+| tiny recognizer | 3.837 ms | 3.870 ms | 260.61 lines/s | 3.918 ms | 2.1% faster | 1.941 / 4.34 / 4.52 ms | 11.6% faster |
 
 WGPU beats Burn for both small and tiny models. Medium is within 3.8% for detection and 8.0% for
 recognition, so the current implementation does not claim a clean Burn win at that size. All six
@@ -192,32 +192,32 @@ against the strict Safetensors reference, GPU maximum absolute error is about `4
 ## Converted ONNX CPU Probe
 
 The self-contained `cpu_onnx` runtime was measured using converted fixed-shape ONNX models on the
-same M4 host. Each model uses four worker threads, five warmups, and 30 timed runs; model loading,
+same M4 host. Each model uses one worker thread, five warmups, and 30 timed runs; model loading,
 input generation, and output validation are outside the timed interval.
 
 | Model | Input | cpu_onnx p50 | p90 | Throughput at p50 |
 | --- | --- | ---: | ---: | ---: |
-| medium detector | `[1,3,416,736]` | 342.201 ms | 347.293 ms | 2.92 frames/s |
-| medium recognizer | `[1,3,48,320]` | 38.137 ms | 38.689 ms | 26.22 lines/s |
-| small detector | `[1,3,416,736]` | 47.542 ms | 49.026 ms | 21.03 frames/s |
-| small recognizer | `[1,3,48,320]` | 9.983 ms | 10.764 ms | 100.17 lines/s |
-| tiny detector | `[1,3,416,736]` | 21.603 ms | 22.386 ms | 46.29 frames/s |
-| tiny recognizer | `[1,3,48,320]` | 2.149 ms | 2.501 ms | 465.33 lines/s |
+| medium detector | `[1,3,416,736]` | 972.947 ms | 977.228 ms | 1.03 frames/s |
+| medium recognizer | `[1,3,48,320]` | 107.621 ms | 107.805 ms | 9.29 lines/s |
+| small detector | `[1,3,416,736]` | 126.527 ms | 127.257 ms | 7.90 frames/s |
+| small recognizer | `[1,3,48,320]` | 25.390 ms | 25.624 ms | 39.39 lines/s |
+| tiny detector | `[1,3,416,736]` | 52.462 ms | 53.110 ms | 19.06 frames/s |
+| tiny recognizer | `[1,3,48,320]` | 4.858 ms | 5.149 ms | 205.85 lines/s |
 
 ## Direct Safetensors CPU Probe
 
 The direct `cpu` runtime was measured from the official Safetensors weights on the same M4 host.
-Each model uses four worker threads, ten warmups, and 50 timed runs; model loading, input
+Each model uses one worker thread, five warmups, and 30 timed runs; model loading, input
 generation, and output validation are outside the timed interval.
 
 | Model | Input | cpu p50 | p90 | Throughput at p50 |
 | --- | --- | ---: | ---: | ---: |
-| medium detector | `[1,3,416,736]` | 158.895 ms | 161.388 ms | 6.29 frames/s |
-| medium recognizer | `[1,3,48,320]` | 16.566 ms | 16.822 ms | 60.36 lines/s |
-| small detector | `[1,3,416,736]` | 35.294 ms | 35.669 ms | 28.33 frames/s |
-| small recognizer | `[1,3,48,320]` | 8.044 ms | 8.220 ms | 124.32 lines/s |
-| tiny detector | `[1,3,416,736]` | 17.455 ms | 17.675 ms | 57.29 frames/s |
-| tiny recognizer | `[1,3,48,320]` | 1.741 ms | 1.934 ms | 574.38 lines/s |
+| medium detector | `[1,3,416,736]` | 470.572 ms | 503.702 ms | 2.13 frames/s |
+| medium recognizer | `[1,3,48,320]` | 35.363 ms | 36.416 ms | 28.28 lines/s |
+| small detector | `[1,3,416,736]` | 104.689 ms | 106.151 ms | 9.55 frames/s |
+| small recognizer | `[1,3,48,320]` | 24.030 ms | 24.217 ms | 41.61 lines/s |
+| tiny detector | `[1,3,416,736]` | 45.341 ms | 51.886 ms | 22.06 frames/s |
+| tiny recognizer | `[1,3,48,320]` | 4.771 ms | 5.035 ms | 209.60 lines/s |
 
 The CPU runtime evaluates every nonzero convolution weight. Its sparse representation skips only
 blocks that are exactly zero; large macOS pointwise convolutions use Accelerate SGEMM instead of
@@ -234,7 +234,7 @@ text exactly; steady-state p50 latency was `79.626 ms` and `101.398 ms`, respect
 
 RTen 0.24 is a separate pure-Rust CPU control using the official matching ONNX repositories, not a
 conversion performed in this assessment and not a replacement for direct Safetensors loading. Each
-model was measured with four worker threads, five warmups, and 30 timed runs. RTen receives one
+model was measured with one worker thread, five warmups, and 30 timed runs. RTen receives one
 fixed randomly generated F32 input per model, reused for all runs.
 
 Install `rten-cli` 0.24, then run the following commands for each medium, small, and tiny official
@@ -245,51 +245,52 @@ and OCR postprocessing are outside the measurement.
 ```sh
 RTEN=/path/to/rten
 
-# Detector: fixed [1,3,416,736] random F32 input, four worker threads.
+# Detector: fixed [1,3,416,736] random F32 input, one worker thread.
 $RTEN /path/to/PP-OCRv6_tiny_det_onnx/inference.onnx \
-  -t 4 -n 35 \
+  -t 1 -n 35 \
   -s '"DynamicDimension.1"=416' \
   -s '"DynamicDimension.2"=736'
 
-# Recognizer: fixed [1,3,48,320] random F32 input, four worker threads.
+# Recognizer: fixed [1,3,48,320] random F32 input, one worker thread.
 $RTEN /path/to/PP-OCRv6_tiny_rec_onnx/inference.onnx \
-  -t 4 -n 35 \
+  -t 1 -n 35 \
   -s '"DynamicDimension.1"=320'
 ```
 
 | Model | Input | RTen p50 | p90 | Throughput at p50 |
 | --- | --- | ---: | ---: | ---: |
-| medium detector | `[1,3,416,736]` | 222.560 ms | 223.530 ms | 4.49 frames/s |
-| medium recognizer | `[1,3,48,320]` | 36.250 ms | 37.790 ms | 27.59 lines/s |
-| small detector | `[1,3,416,736]` | 39.890 ms | 40.410 ms | 25.07 frames/s |
-| small recognizer | `[1,3,48,320]` | 9.290 ms | 10.830 ms | 107.64 lines/s |
-| tiny detector | `[1,3,416,736]` | 18.130 ms | 19.490 ms | 55.16 frames/s |
-| tiny recognizer | `[1,3,48,320]` | 2.100 ms | 2.290 ms | 476.19 lines/s |
+| medium detector | `[1,3,416,736]` | 650.640 ms | 651.560 ms | 1.54 frames/s |
+| medium recognizer | `[1,3,48,320]` | 110.970 ms | 111.530 ms | 9.01 lines/s |
+| small detector | `[1,3,416,736]` | 107.970 ms | 108.350 ms | 9.26 frames/s |
+| small recognizer | `[1,3,48,320]` | 24.570 ms | 24.700 ms | 40.70 lines/s |
+| tiny detector | `[1,3,416,736]` | 45.460 ms | 46.970 ms | 22.00 frames/s |
+| tiny recognizer | `[1,3,48,320]` | 4.630 ms | 4.910 ms | 215.98 lines/s |
 
 ## ONNX Runtime Fixed-Shape Probe
 
-ONNX Runtime (ORT) was measured with fixed F32 inputs: detector `[1,3,416,736]` and recognizer
-`[1,3,48,320]`. Each backend uses five warmups and 30 timed runs. Values are milliseconds per
-item. Throughput is calculated as `1000 / p50_ms`.
+ONNX Runtime (ORT) CPU was measured with fixed F32 inputs: detector `[1,3,416,736]` and recognizer
+`[1,3,48,320]`, one intra-op and one inter-op thread, five warmups, and 30 timed runs. GPU and ANE
+rows retain their existing measurements. Values are milliseconds per item. Throughput is calculated
+as `1000 / p50_ms`.
 
 | Model | Input | Backend | ORT p50 | p90 | Throughput at p50 |
 | --- | --- | --- | ---: | ---: | ---: |
-| medium detector | `[1,3,416,736]` | CPU | 303.26 ms | 307.81 ms | 3.30 frames/s |
+| medium detector | `[1,3,416,736]` | CPU | 286.663 ms | 289.826 ms | 3.49 frames/s |
 | medium detector | `[1,3,416,736]` | GPU | 184.75 ms | 211.84 ms | 5.41 frames/s |
 | medium detector | `[1,3,416,736]` | ANE | 180.73 ms | 194.42 ms | 5.53 frames/s |
-| medium recognizer | `[1,3,48,320]` | CPU | 22.68 ms | 23.19 ms | 44.1 lines/s |
+| medium recognizer | `[1,3,48,320]` | CPU | 21.208 ms | 21.505 ms | 47.15 lines/s |
 | medium recognizer | `[1,3,48,320]` | GPU | 34.35 ms | 37.56 ms | 29.1 lines/s |
 | medium recognizer | `[1,3,48,320]` | ANE | 31.87 ms | 32.73 ms | 31.4 lines/s |
-| small detector | `[1,3,416,736]` | CPU | 56.13 ms | 57.49 ms | 17.8 frames/s |
+| small detector | `[1,3,416,736]` | CPU | 52.489 ms | 53.190 ms | 19.05 frames/s |
 | small detector | `[1,3,416,736]` | GPU | 55.58 ms | 56.15 ms | 18.0 frames/s |
 | small detector | `[1,3,416,736]` | ANE | 52.87 ms | 54.39 ms | 18.9 frames/s |
-| small recognizer | `[1,3,48,320]` | CPU | 8.54 ms | 8.72 ms | 117.0 lines/s |
+| small recognizer | `[1,3,48,320]` | CPU | 8.184 ms | 8.415 ms | 122.19 lines/s |
 | small recognizer | `[1,3,48,320]` | GPU | 13.35 ms | 13.73 ms | 74.9 lines/s |
 | small recognizer | `[1,3,48,320]` | ANE | 11.91 ms | 12.15 ms | 84.0 lines/s |
-| tiny detector | `[1,3,416,736]` | CPU | 27.84 ms | 28.33 ms | 35.9 frames/s |
+| tiny detector | `[1,3,416,736]` | CPU | 26.704 ms | 27.389 ms | 37.45 frames/s |
 | tiny detector | `[1,3,416,736]` | GPU | 29.65 ms | 30.29 ms | 33.7 frames/s |
 | tiny detector | `[1,3,416,736]` | ANE | 27.40 ms | 28.19 ms | 36.5 frames/s |
-| tiny recognizer | `[1,3,48,320]` | CPU | 1.81 ms | 2.08 ms | 553.4 lines/s |
+| tiny recognizer | `[1,3,48,320]` | CPU | 1.941 ms | 2.418 ms | 515.20 lines/s |
 | tiny recognizer | `[1,3,48,320]` | GPU | 4.34 ms | 4.58 ms | 230.5 lines/s |
 | tiny recognizer | `[1,3,48,320]` | ANE | 4.52 ms | 5.21 ms | 221.2 lines/s |
 
@@ -305,11 +306,11 @@ The medium detector is roughly 451 GMAC at the validation-frame input size. Cand
 | --- | --- | --- | --- | --- |
 | Direct WGPU | Requested Safetensors | No | Metal/Vulkan | Fixed-shape medium/small/tiny detector and recognizer graphs. WGPU beats the ORT GPU baseline for all six; small/tiny beat Burn, while medium is within 8%. |
 | Candle 0.10.2 | Requested Safetensors | Yes | Metal/CUDA | End-to-end OCR is implemented for medium/small/tiny. Tiny is usable for reduced-resolution local inference; medium needs custom fused/grouped convolution kernels for a materially higher ceiling. |
-| cpu_onnx | Converted fixed-shape ONNX | Yes | No | Four-worker-thread p50 detector/recognizer latency (ms): medium 342.201/38.137, small 47.542/9.983, tiny 21.603/2.149. |
-| cpu | Requested Safetensors | Yes | No | Exact-weight four-worker-thread p50 detector/recognizer latency (ms): medium 158.895/16.566, small 35.294/8.044, tiny 17.455/1.741. |
+| cpu_onnx | Converted fixed-shape ONNX | Yes | No | Single-thread p50 detector/recognizer latency (ms): medium 972.947/107.621, small 126.527/25.390, tiny 52.462/4.858. |
+| cpu | Requested Safetensors | Yes | No | Exact-weight single-thread p50 detector/recognizer latency (ms): medium 470.572/35.363, small 104.689/24.030, tiny 45.341/4.771. |
 | Burn 0.21 with WGPU/CubeCL | Official ONNX imported at build time | Yes | Metal/WGPU/CUDA backends | Fresh guarded-path p50 detector/recognizer latency (ms): medium 166.927/17.634, small 47.855/10.278, tiny 28.606/3.918. |
-| RTen 0.24 | Official matching ONNX | Yes | No | Four-worker-thread p50 detector/recognizer latency (ms): medium 222.560/36.250, small 39.890/9.290, tiny 18.130/2.100. It does not read the supplied Safetensors directly. |
-| ONNX Runtime (ORT) | ONNX | Yes | GPU/ANE | Fixed-shape p50 detector/recognizer latency (ms): CPU medium 303.26/22.68, small 56.13/8.54, tiny 27.84/1.81; GPU medium 184.75/34.35, small 55.58/13.35, tiny 29.65/4.34; ANE medium 180.73/31.87, small 52.87/11.91, tiny 27.40/4.52. |
+| RTen 0.24 | Official matching ONNX | Yes | No | Single-thread p50 detector/recognizer latency (ms): medium 650.640/110.970, small 107.970/24.570, tiny 45.460/4.630. It does not read the supplied Safetensors directly. |
+| ONNX Runtime (ORT) | ONNX | Yes | GPU/ANE | Fixed-shape p50 detector/recognizer latency (ms): single-thread CPU medium 286.663/21.208, small 52.489/8.184, tiny 26.704/1.941; GPU medium 184.75/34.35, small 55.58/13.35, tiny 29.65/4.34; ANE medium 180.73/31.87, small 52.87/11.91, tiny 27.40/4.52. |
 | Wonnx 0.5 | Official ONNX | No practical result | WGPU/Metal | Current model preparation fails on unsupported HardSigmoid; detector also needs ConvTranspose support. |
 | Tract 0.23 | Official ONNX | Yes | No | Current dynamic PP-OCRv6 ONNX optimization fails at the first convolution. |
 
