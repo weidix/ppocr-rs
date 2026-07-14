@@ -1,6 +1,6 @@
 use super::{
     kernels,
-    ops::{ConvOptions, Node, Operation, PoolOptions, SparseConvWeights},
+    ops::{ConvOptions, ExactSparseConvWeights, Node, Operation, PoolOptions},
     tensor::{IntoShape, Tensor, element_count},
 };
 use anyhow::{Context, Result, ensure};
@@ -295,17 +295,6 @@ impl Conv2d {
         pads: [usize; 4],
         groups: usize,
     ) -> Result<Self> {
-        Self::new_with_pointwise_prune_threshold(weight, bias, strides, pads, groups, 4.0e-2)
-    }
-
-    pub(crate) fn new_with_pointwise_prune_threshold(
-        weight: Tensor,
-        bias: Option<Tensor>,
-        strides: [usize; 2],
-        pads: [usize; 4],
-        groups: usize,
-        pointwise_prune_threshold: f32,
-    ) -> Result<Self> {
         let [
             output_channels,
             channels_per_group,
@@ -317,10 +306,6 @@ impl Conv2d {
             })?;
         weight.as_f32()?;
         ensure!(groups > 0, "Conv group count must be positive");
-        ensure!(
-            pointwise_prune_threshold.is_finite() && pointwise_prune_threshold >= 0.0,
-            "pointwise prune threshold must be finite and non-negative"
-        );
         ensure!(
             strides.into_iter().all(|stride| stride > 0),
             "Conv strides must be positive"
@@ -342,31 +327,26 @@ impl Conv2d {
             && kernel_width == 1
             && inner >= 512
             && output_channels >= 512;
-        // Projection weights are strongly block-pruned. The tighter spatial
-        // threshold preserves detector scores; large pointwise layers use the
-        // OCR decision-preserving threshold measured by the CPU benchmark.
-        let prune_threshold = if tiled_spatial {
-            2.0e-6
-        } else {
-            pointwise_prune_threshold
-        };
-        let sparse_weights = ((tiled_spatial || sparse_pointwise)
+        // Sparse storage is lossless: only complete blocks of exact zeros are omitted.
+        let exact_sparse_weights = ((tiled_spatial || sparse_pointwise)
             && output_channels.is_multiple_of(4))
         .then(|| {
-            SparseConvWeights::from_dense(
+            ExactSparseConvWeights::from_dense(
                 weight.as_f32().expect("Conv weight was validated as F32"),
                 output_channels,
                 inner,
-                prune_threshold,
             )
         })
         .flatten();
+        let system_dense_pointwise =
+            cfg!(target_os = "macos") && sparse_pointwise && strides == [1, 1] && pads == [0; 4];
         let packed_pointwise = groups == 1
             && ((kernel_height == 1 && kernel_width == 1)
                 || (strides != [1, 1] && output_channels >= 48)
-                || tiled_spatial);
+                || tiled_spatial)
+            && !system_dense_pointwise;
         let weight = if packed_pointwise {
-            if tiled_spatial || sparse_weights.is_some() {
+            if tiled_spatial || exact_sparse_weights.is_some() {
                 pack_conv_rows(weight, output_channels, 4)?
             } else {
                 pack_conv_rows(weight, output_channels, 12)?
@@ -382,7 +362,8 @@ impl Conv2d {
                 pads,
                 groups,
                 packed_pointwise,
-                sparse_weights,
+                system_dense_pointwise,
+                exact_sparse_weights,
             },
         })
     }
@@ -479,7 +460,8 @@ impl ConvTranspose2d {
                 pads,
                 groups,
                 packed_pointwise: false,
-                sparse_weights: None,
+                system_dense_pointwise: false,
+                exact_sparse_weights: None,
             },
         })
     }
@@ -759,6 +741,47 @@ mod tests {
             .unwrap();
         assert_eq!(output.shape(), [1, 2, 1, 2]);
         assert_eq!(output.as_f32().unwrap(), &[21.5, 42.5, 42.5, 85.5]);
+    }
+
+    #[test]
+    fn exact_sparse_pointwise_preserves_dynamic_width_tail() {
+        let channels = 512;
+        let width = 17;
+        let mut weights = vec![0.0; channels * channels];
+        let mut scales = vec![0.0; channels];
+        for row in 0..channels {
+            let scale = (row % 13 + 1) as f32 / 17.0;
+            weights[row * channels + row] = scale;
+            scales[row] = scale;
+        }
+        let bias = (0..channels)
+            .map(|row| (row % 7) as f32 / 19.0)
+            .collect::<Vec<_>>();
+        let convolution = Conv2d::new(
+            Tensor::new_f32(vec![channels, channels, 1, 1], weights),
+            Some(Tensor::new_f32(vec![channels], bias.clone())),
+            [1, 1],
+            [0; 4],
+            1,
+        )
+        .unwrap();
+        let input_values = (0..channels * width)
+            .map(|index| ((index * 11 % 31) as f32 - 15.0) / 23.0)
+            .collect::<Vec<_>>();
+        let output = convolution
+            .forward(&Tensor::new_f32(
+                vec![1, channels, 1, width],
+                input_values.clone(),
+            ))
+            .unwrap();
+
+        for row in 0..channels {
+            for column in 0..width {
+                let expected = input_values[row * width + column].mul_add(scales[row], bias[row]);
+                let actual = output.as_f32().unwrap()[row * width + column];
+                assert_eq!(actual, expected, "row {row}, column {column}");
+            }
+        }
     }
 
     #[test]

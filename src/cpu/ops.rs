@@ -58,23 +58,19 @@ pub(crate) struct ConvOptions {
     pub pads: [usize; 4],
     pub groups: usize,
     pub packed_pointwise: bool,
-    pub sparse_weights: Option<SparseConvWeights>,
+    pub system_dense_pointwise: bool,
+    pub exact_sparse_weights: Option<ExactSparseConvWeights>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SparseConvWeights {
+pub(crate) struct ExactSparseConvWeights {
     row_offsets: Arc<Vec<usize>>,
     indices: Arc<Vec<u32>>,
     values: Arc<Vec<f32>>,
 }
 
-impl SparseConvWeights {
-    pub(crate) fn from_dense(
-        weight: &[f32],
-        rows: usize,
-        inner: usize,
-        prune_threshold: f32,
-    ) -> Option<Self> {
+impl ExactSparseConvWeights {
+    pub(crate) fn from_dense(weight: &[f32], rows: usize, inner: usize) -> Option<Self> {
         const BLOCK_ROWS: usize = 4;
         const MAXIMUM_ACTIVE_RATIO: f32 = 0.55;
 
@@ -94,7 +90,7 @@ impl SparseConvWeights {
                 let block = std::array::from_fn::<_, BLOCK_ROWS, _>(|row| {
                     weight[(row_start + row) * inner + index]
                 });
-                if block.iter().any(|value| value.abs() >= prune_threshold) {
+                if block.iter().any(|value| *value != 0.0) {
                     indices.push(index as u32);
                     values.extend_from_slice(&block);
                 }
@@ -381,9 +377,7 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
                 ..(batch_index + 1) * output_channels * output_plane];
             let input = &input[batch_index * input_channels * input_plane
                 ..(batch_index + 1) * input_channels * input_plane];
-            if let Some(sparse) = &options.sparse_weights
-                && output_plane.is_multiple_of(SPATIAL_PANEL_COLUMNS)
-            {
+            if let Some(sparse) = &options.exact_sparse_weights {
                 kernels::gemm_sparse_packed_left(
                     output,
                     input,
@@ -395,6 +389,17 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
                     &sparse.row_offsets,
                     &sparse.indices,
                     &sparse.values,
+                );
+            } else if options.system_dense_pointwise {
+                kernels::gemm_system_dense(
+                    output,
+                    weight,
+                    input,
+                    output_channels,
+                    input_channels,
+                    output_plane,
+                    bias,
+                    gelu,
                 );
             } else if options.packed_pointwise {
                 if gelu {
@@ -733,7 +738,7 @@ fn conv_im2col_tiled(
             options,
         );
         let tile_output = &mut tile_output[..tile_panels * output_channels * SPATIAL_PANEL_COLUMNS];
-        if let Some(sparse) = &options.sparse_weights {
+        if let Some(sparse) = &options.exact_sparse_weights {
             kernels::gemm_sparse_packed_panels(
                 tile_output,
                 columns,
@@ -1935,4 +1940,21 @@ fn ensure_input_count(inputs: &[Tensor], expected: usize) -> Result<()> {
         inputs.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn exact_sparse_weights_retain_every_nonzero_value() {
+        let smallest = f32::from_bits(1);
+        let weights = [smallest, 0.0, -smallest, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let sparse = ExactSparseConvWeights::from_dense(&weights, 4, 2)
+            .expect("one of two exact blocks is active");
+        assert_eq!(sparse.row_offsets.as_slice(), [0, 1]);
+        assert_eq!(sparse.indices.as_slice(), [0]);
+        assert_eq!(sparse.values.as_slice(), [smallest, -smallest, 0.0, 0.0]);
+    }
 }

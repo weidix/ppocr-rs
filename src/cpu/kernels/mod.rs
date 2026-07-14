@@ -2,6 +2,8 @@
 
 use rayon::prelude::*;
 
+#[cfg(target_os = "macos")]
+mod accelerate;
 #[cfg(target_arch = "aarch64")]
 mod neon;
 #[cfg(target_arch = "x86_64")]
@@ -271,6 +273,42 @@ pub(crate) fn gemm_packed_left_gelu(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_system_dense(
+    output: &mut [f32],
+    left: &[f32],
+    right: &[f32],
+    rows: usize,
+    inner: usize,
+    columns: usize,
+    bias: Option<&[f32]>,
+    gelu: bool,
+) {
+    assert!(rows > 0 && inner > 0 && columns > 0);
+    assert!(bias.is_none_or(|bias| bias.len() == rows));
+    #[cfg(target_os = "macos")]
+    {
+        accelerate::sgemm(output, left, right, rows, inner, columns);
+        output
+            .par_chunks_mut(columns)
+            .enumerate()
+            .for_each(|(row, output)| {
+                if let Some(bias) = bias {
+                    affine_in_place(output, 1.0, bias[row]);
+                }
+                if gelu {
+                    unary_chunk(output, UnaryOperation::Gelu);
+                }
+            });
+    }
+    #[cfg(not(target_os = "macos"))]
+    if gelu {
+        gemm_gelu(output, left, right, rows, inner, columns, bias);
+    } else {
+        gemm(output, left, right, rows, inner, columns, bias);
+    }
+}
+
 pub(crate) fn gemm_column_bias_softmax(
     output: &mut [f32],
     left: &[f32],
@@ -489,7 +527,6 @@ pub(crate) fn gemm_sparse_packed_left(
     assert_eq!(output.len(), rows * columns);
     assert_eq!(right.len(), inner * columns);
     assert!(rows.is_multiple_of(BLOCK_ROWS));
-    assert!(columns.is_multiple_of(16));
     assert_eq!(row_offsets.len(), rows / BLOCK_ROWS + 1);
     assert_eq!(values.len(), indices.len() * BLOCK_ROWS);
     output
@@ -1039,6 +1076,54 @@ mod tests {
             .map(|(expected, actual)| (expected - actual).abs())
             .fold(0.0f32, f32::max);
         assert!(maximum_error < 2e-6, "maximum error: {maximum_error}");
+    }
+
+    #[test]
+    fn exact_sparse_gemm_handles_dynamic_column_tails() {
+        let rows = 8;
+        let inner = 7;
+        let row_offsets = [0, 3, 5];
+        let indices = [0, 2, 6, 1, 5];
+        let weights = [
+            1.0, -0.5, 0.25, 2.0, 0.75, 1.5, -1.0, 0.5, -2.0, 0.125, 0.375, 1.25, 0.5, -0.75, 2.0,
+            1.0, -1.5, 0.25, 0.625, -0.125,
+        ];
+        let bias = [0.5, -0.25, 1.0, -1.0, 0.75, 0.0, -0.5, 0.25];
+
+        for columns in [1, 15, 16, 17, 31, 32, 33] {
+            let right = (0..inner * columns)
+                .map(|index| ((index * 13 % 37) as f32 - 18.0) / 11.0)
+                .collect::<Vec<_>>();
+            let mut actual = vec![0.0; rows * columns];
+            gemm_sparse_packed_left(
+                &mut actual,
+                &right,
+                rows,
+                inner,
+                columns,
+                Some(&bias),
+                false,
+                &row_offsets,
+                &indices,
+                &weights,
+            );
+
+            let mut expected = vec![0.0; rows * columns];
+            for block in 0..2 {
+                for row in 0..4 {
+                    for column in 0..columns {
+                        let output_row = block * 4 + row;
+                        let mut sum = bias[output_row];
+                        for entry in row_offsets[block]..row_offsets[block + 1] {
+                            sum = weights[entry * 4 + row]
+                                .mul_add(right[indices[entry] as usize * columns + column], sum);
+                        }
+                        expected[output_row * columns + column] = sum;
+                    }
+                }
+            }
+            assert_eq!(actual, expected, "column count {columns}");
+        }
     }
 
     #[test]

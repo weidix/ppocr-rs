@@ -109,21 +109,13 @@ impl Conv2d {
         bias: bool,
         groups: usize,
     ) -> Result<Self> {
-        let pointwise_prune_threshold = vb.pointwise_prune_threshold();
         let weight = vb.get(
             [out_channels, in_channels / groups, kernel[0], kernel[1]],
             "weight",
         )?;
         let bias = bias.then(|| vb.get(out_channels, "bias")).transpose()?;
         Ok(Self {
-            convolution: BackendConv2d::new_with_pointwise_prune_threshold(
-                weight,
-                bias,
-                stride,
-                pads,
-                groups,
-                pointwise_prune_threshold,
-            )?,
+            convolution: BackendConv2d::new(weight, bias, stride, pads, groups)?,
         })
     }
 
@@ -139,7 +131,6 @@ impl Conv2d {
         groups: usize,
         norm_name: &str,
     ) -> Result<Self> {
-        let pointwise_prune_threshold = vb.pointwise_prune_threshold();
         let conv = vb.pp("convolution");
         let weight = conv.get(
             [out_channels, in_channels / groups, kernel[0], kernel[1]],
@@ -148,14 +139,7 @@ impl Conv2d {
         let bias = bias.then(|| conv.get(out_channels, "bias")).transpose()?;
         let (weight, bias) = fold_batch_norm(weight, bias, vb.pp(norm_name), out_channels)?;
         Ok(Self {
-            convolution: BackendConv2d::new_with_pointwise_prune_threshold(
-                weight,
-                Some(bias),
-                stride,
-                pads,
-                groups,
-                pointwise_prune_threshold,
-            )?,
+            convolution: BackendConv2d::new(weight, Some(bias), stride, pads, groups)?,
         })
     }
 
@@ -1809,10 +1793,7 @@ impl Recognizer {
     pub fn load(path: impl AsRef<Path>, size: ModelSize, options: CpuOptions) -> Result<Self> {
         let pool = thread_pool(options)?;
         let weights = Weights::load(path)?;
-        let vb = weights.builder_with_pointwise_prune_threshold(match size {
-            ModelSize::Medium => 7.5e-2,
-            ModelSize::Small | ModelSize::Tiny => 4.0e-2,
-        });
+        let vb = weights.builder();
         let encoder = vb.pp("model").pp("backbone").pp("encoder");
         let (backbone, head) = match size {
             ModelSize::Medium => (

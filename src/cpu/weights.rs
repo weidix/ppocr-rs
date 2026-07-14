@@ -47,17 +47,9 @@ impl Weights {
     }
 
     pub(crate) fn builder(&self) -> VarBuilder<'_> {
-        self.builder_with_pointwise_prune_threshold(4.0e-2)
-    }
-
-    pub(crate) fn builder_with_pointwise_prune_threshold(
-        &self,
-        pointwise_prune_threshold: f32,
-    ) -> VarBuilder<'_> {
         VarBuilder {
             weights: self,
             prefix: String::new(),
-            pointwise_prune_threshold,
         }
     }
 }
@@ -66,7 +58,6 @@ impl Weights {
 pub(crate) struct VarBuilder<'a> {
     weights: &'a Weights,
     prefix: String,
-    pointwise_prune_threshold: f32,
 }
 
 impl<'a> VarBuilder<'a> {
@@ -80,12 +71,7 @@ impl<'a> VarBuilder<'a> {
         Self {
             weights: self.weights,
             prefix,
-            pointwise_prune_threshold: self.pointwise_prune_threshold,
         }
-    }
-
-    pub(crate) fn pointwise_prune_threshold(&self) -> f32 {
-        self.pointwise_prune_threshold
     }
 
     pub(crate) fn get(&self, shape: impl IntoShape, name: &str) -> Result<Tensor> {

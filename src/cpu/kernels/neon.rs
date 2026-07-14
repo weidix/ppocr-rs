@@ -487,10 +487,10 @@ pub(super) unsafe fn gemm_4x16_sparse(
     const ROWS: usize = 4;
 
     debug_assert_eq!(output.len(), ROWS * columns);
-    debug_assert!(columns.is_multiple_of(16));
     debug_assert_eq!(weights.len(), indices.len() * ROWS);
     debug_assert!(bias.is_none_or(|bias| bias.len() == ROWS));
-    for column in (0..columns).step_by(16) {
+    let vector_columns = columns / 16 * 16;
+    for column in (0..vector_columns).step_by(16) {
         let mut accumulators = [vdupq_n_f32(0.0); 16];
         for row in 0..ROWS {
             let initial = vdupq_n_f32(bias.map_or(0.0, |bias| bias[row]));
@@ -531,6 +531,18 @@ pub(super) unsafe fn gemm_4x16_sparse(
                 vst1q_f32(output_base.add(8), accumulators[offset + 2]);
                 vst1q_f32(output_base.add(12), accumulators[offset + 3]);
             }
+        }
+    }
+    for row in 0..ROWS {
+        for column in vector_columns..columns {
+            let mut sum = bias.map_or(0.0, |bias| bias[row]);
+            for (entry, &index) in indices.iter().enumerate() {
+                sum = unsafe { *weights.get_unchecked(entry * ROWS + row) }.mul_add(
+                    unsafe { *right.get_unchecked(index as usize * right_stride + column) },
+                    sum,
+                );
+            }
+            output[row * columns + column] = sum;
         }
     }
 }

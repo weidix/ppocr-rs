@@ -48,6 +48,10 @@ recorded in `models.json`; pass `--model` only to override the local model expli
 
 The Rust API is available under `ppocr_rs::cpu`.
 
+The native CPU path evaluates every nonzero model weight. On macOS, large pointwise convolutions
+use Accelerate SGEMM; the custom sparse kernels skip only exact-zero blocks and support arbitrary
+recognizer widths without a packed-layout fallback.
+
 ## Converted ONNX CPU Backend
 
 The `cpu_onnx` runtime implements the PP-OCRv6 operators locally and does not invoke ONNX Runtime,
