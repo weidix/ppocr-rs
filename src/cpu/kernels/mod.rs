@@ -16,6 +16,118 @@ fn has_avx2_fma() -> bool {
 }
 
 #[inline]
+pub(crate) fn supports_exact_sparse_gemm() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        true
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        has_avx2_fma()
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+#[inline]
+pub(crate) fn supports_stride2_simd_copy() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        has_avx2_fma()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[inline]
+pub(crate) fn supports_direct_spatial_conv() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        has_avx2_fma()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[inline(always)]
+pub(crate) unsafe fn copy_stride2_16(output: *mut f32, input: *const f32) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        x86::copy_stride2_16(output, input);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    for lane in 0..16 {
+        unsafe { *output.add(lane) = *input.add(lane * 2) };
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spatial_conv2d_direct(
+    output: &mut [f32],
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    input_channels: usize,
+    input_height: usize,
+    input_width: usize,
+    output_channels: usize,
+    output_height: usize,
+    output_width: usize,
+    kernel_height: usize,
+    kernel_width: usize,
+    strides: [usize; 2],
+    pads: [usize; 4],
+    activation: Option<UnaryOperation>,
+) {
+    const BLOCK_ROWS: usize = 4;
+    assert!(supports_direct_spatial_conv());
+    assert!(output_channels.is_multiple_of(BLOCK_ROWS));
+    assert_eq!(input.len(), input_channels * input_height * input_width);
+    assert_eq!(output.len(), output_channels * output_height * output_width);
+    let patch_size = input_channels * kernel_height * kernel_width;
+    assert_eq!(weight.len(), output_channels * patch_size);
+    assert!(bias.is_none_or(|bias| bias.len() == output_channels));
+    let output_plane = output_height * output_width;
+
+    output
+        .par_chunks_mut(BLOCK_ROWS * output_plane)
+        .enumerate()
+        .for_each(|(block, output)| {
+            let row_start = block * BLOCK_ROWS;
+            let weight_start = block * BLOCK_ROWS * patch_size;
+            let weight = &weight[weight_start..weight_start + BLOCK_ROWS * patch_size];
+            let bias = bias.map(|bias| &bias[row_start..row_start + BLOCK_ROWS]);
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: Runtime AVX2/FMA support and all matrix/image dimensions
+            // are validated above. The kernel handles borders without OOB loads.
+            unsafe {
+                x86::spatial_conv2d_packed_4(
+                    output,
+                    input,
+                    weight,
+                    input_channels,
+                    input_height,
+                    input_width,
+                    output_height,
+                    output_width,
+                    kernel_height,
+                    kernel_width,
+                    strides,
+                    pads,
+                    bias,
+                    activation,
+                )
+            };
+        });
+}
+
+#[inline]
 pub(crate) fn fill(values: &mut [f32], value: f32) {
     values.fill(value);
 }
@@ -74,6 +186,18 @@ pub(crate) fn depthwise_conv2d_same(
                     )
                 };
             }
+            #[cfg(target_arch = "x86_64")]
+            if has_avx2_fma() {
+                // SAFETY: AVX2 and FMA were detected at runtime. Slice dimensions
+                // are checked above, and the kernel vectorizes only complete
+                // interior windows.
+                unsafe {
+                    x86::depthwise_conv2d_same::<$kernel>(
+                        output, input, weights, height, width, bias,
+                    )
+                };
+                return;
+            }
             #[cfg(not(target_arch = "aarch64"))]
             depthwise_conv2d_same_scalar::<$kernel>(output, input, weights, height, width, bias);
         }};
@@ -106,6 +230,15 @@ pub(crate) fn depthwise_conv2d_same_3x3_stride2(
     unsafe {
         neon::depthwise_conv2d_same_3x3_stride2(output, input, weights, height, width, bias)
     };
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2_fma() {
+        // SAFETY: AVX2 and FMA were detected at runtime. Slice dimensions are
+        // checked above, and complete interior vectors are bounded by the input.
+        unsafe {
+            x86::depthwise_conv2d_same_3x3_stride2(output, input, weights, height, width, bias)
+        };
+        return;
+    }
     #[cfg(not(target_arch = "aarch64"))]
     {
         let output_width = width.div_ceil(2);
@@ -250,12 +383,11 @@ pub(crate) fn gemm(
     columns: usize,
     bias: Option<&[f32]>,
 ) {
-    gemm_impl(
-        output, left, right, rows, inner, columns, bias, None, false, None, false,
-    );
+    gemm_with_activation(output, left, right, rows, inner, columns, bias, None);
 }
 
-pub(crate) fn gemm_gelu(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_with_activation(
     output: &mut [f32],
     left: &[f32],
     right: &[f32],
@@ -263,22 +395,14 @@ pub(crate) fn gemm_gelu(
     inner: usize,
     columns: usize,
     bias: Option<&[f32]>,
+    activation: Option<UnaryOperation>,
 ) {
     gemm_impl(
-        output,
-        left,
-        right,
-        rows,
-        inner,
-        columns,
-        bias,
-        None,
-        false,
-        Some(UnaryOperation::Gelu),
-        false,
+        output, left, right, rows, inner, columns, bias, None, false, activation, false,
     );
 }
 
+#[cfg(test)]
 pub(crate) fn gemm_packed_left(
     output: &mut [f32],
     left: &[f32],
@@ -288,12 +412,11 @@ pub(crate) fn gemm_packed_left(
     columns: usize,
     bias: Option<&[f32]>,
 ) {
-    gemm_impl(
-        output, left, right, rows, inner, columns, bias, None, true, None, false,
-    );
+    gemm_packed_left_with_activation(output, left, right, rows, inner, columns, bias, None);
 }
 
-pub(crate) fn gemm_packed_left_gelu(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_packed_left_with_activation(
     output: &mut [f32],
     left: &[f32],
     right: &[f32],
@@ -301,19 +424,10 @@ pub(crate) fn gemm_packed_left_gelu(
     inner: usize,
     columns: usize,
     bias: Option<&[f32]>,
+    activation: Option<UnaryOperation>,
 ) {
     gemm_impl(
-        output,
-        left,
-        right,
-        rows,
-        inner,
-        columns,
-        bias,
-        None,
-        true,
-        Some(UnaryOperation::Gelu),
-        false,
+        output, left, right, rows, inner, columns, bias, None, true, activation, false,
     );
 }
 
@@ -326,7 +440,7 @@ pub(crate) fn gemm_system_dense(
     inner: usize,
     columns: usize,
     bias: Option<&[f32]>,
-    gelu: bool,
+    activation: Option<UnaryOperation>,
 ) {
     assert!(rows > 0 && inner > 0 && columns > 0);
     assert!(bias.is_none_or(|bias| bias.len() == rows));
@@ -340,17 +454,13 @@ pub(crate) fn gemm_system_dense(
                 if let Some(bias) = bias {
                     affine_in_place(output, 1.0, bias[row]);
                 }
-                if gelu {
-                    unary_chunk(output, UnaryOperation::Gelu);
+                if let Some(activation) = activation {
+                    unary_chunk(output, activation);
                 }
             });
     }
     #[cfg(not(target_os = "macos"))]
-    if gelu {
-        gemm_gelu(output, left, right, rows, inner, columns, bias);
-    } else {
-        gemm(output, left, right, rows, inner, columns, bias);
-    }
+    gemm_with_activation(output, left, right, rows, inner, columns, bias, activation);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -379,6 +489,126 @@ pub(crate) fn linear_system_dense(
             add_in_place(row, bias);
         }
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn linear_right_transposed(
+    output: &mut [f32],
+    input: &[f32],
+    weight: &[f32],
+    rows: usize,
+    inner: usize,
+    columns: usize,
+    bias: Option<&[f32]>,
+    activation: Option<UnaryOperation>,
+    softmax: bool,
+) {
+    assert!(rows > 0 && inner > 0 && columns > 0);
+    assert_eq!(output.len(), rows * columns);
+    assert_eq!(input.len(), rows * inner);
+    assert_eq!(weight.len(), columns * inner);
+    assert!(bias.is_none_or(|bias| bias.len() == columns));
+    assert!(!softmax || activation.is_none());
+
+    const MICRO_ROWS: usize = 8;
+    let row_blocks = rows.div_ceil(MICRO_ROWS);
+    let blocks_per_task = row_blocks.div_ceil(rayon::current_num_threads()).max(1);
+    let task_rows = blocks_per_task * MICRO_ROWS;
+    output
+        .par_chunks_mut(task_rows * columns)
+        .enumerate()
+        .for_each(|(task, output)| {
+            let row_start = task * task_rows;
+            let task_row_count = (rows - row_start).min(task_rows);
+            for local_row in (0..task_row_count).step_by(MICRO_ROWS) {
+                let block_rows = (task_row_count - local_row).min(MICRO_ROWS);
+                let input_start = (row_start + local_row) * inner;
+                let input = &input[input_start..input_start + block_rows * inner];
+                let output = &mut output[local_row * columns..(local_row + block_rows) * columns];
+
+                #[cfg(target_arch = "x86_64")]
+                if has_avx2_fma() {
+                    macro_rules! dispatch_rows {
+                        ($rows:literal) => {
+                            // SAFETY: AVX2/FMA were checked above. All slices
+                            // contain the complete row block described here.
+                            unsafe {
+                                x86::linear_rows_8::<$rows>(
+                                    output, input, weight, inner, columns, bias, activation,
+                                )
+                            }
+                        };
+                    }
+                    match block_rows {
+                        1 => dispatch_rows!(1),
+                        2 => dispatch_rows!(2),
+                        3 => dispatch_rows!(3),
+                        4 => dispatch_rows!(4),
+                        5 => dispatch_rows!(5),
+                        6 => dispatch_rows!(6),
+                        7 => dispatch_rows!(7),
+                        8 => dispatch_rows!(8),
+                        _ => unreachable!(),
+                    }
+                } else {
+                    linear_rows_scalar(
+                        output, input, weight, block_rows, inner, columns, bias, activation,
+                    );
+                }
+
+                #[cfg(not(target_arch = "x86_64"))]
+                linear_rows_scalar(
+                    output, input, weight, block_rows, inner, columns, bias, activation,
+                );
+
+                if softmax {
+                    output.chunks_mut(columns).for_each(softmax_in_place);
+                }
+            }
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(target_os = "macos"))]
+fn linear_rows_scalar(
+    output: &mut [f32],
+    input: &[f32],
+    weight: &[f32],
+    rows: usize,
+    inner: usize,
+    columns: usize,
+    bias: Option<&[f32]>,
+    activation: Option<UnaryOperation>,
+) {
+    #[cfg(target_arch = "x86_64")]
+    for column_start in (0..columns).step_by(8) {
+        let block_columns = (columns - column_start).min(8);
+        let weight = &weight[column_start * inner..(column_start + block_columns) * inner];
+        for row in 0..rows {
+            for column in 0..block_columns {
+                let mut sum = bias.map_or(0.0, |bias| bias[column_start + column]);
+                for index in 0..inner {
+                    sum = input[row * inner + index]
+                        .mul_add(weight[index * block_columns + column], sum);
+                }
+                output[row * columns + column_start + column] =
+                    activation.map_or(sum, |activation| activation.apply(sum));
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    for row in 0..rows {
+        for column in 0..columns {
+            let mut sum = bias.map_or(0.0, |bias| bias[column]);
+            for index in 0..inner {
+                sum = input[row * inner + index].mul_add(weight[column * inner + index], sum);
+            }
+            output[row * columns + column] =
+                activation.map_or(sum, |activation| activation.apply(sum));
+        }
+    }
 }
 
 pub(crate) fn gemm_column_bias_softmax(
@@ -454,13 +684,12 @@ fn gemm_impl(
                     bias,
                     column_bias,
                     packed_left,
+                    activation,
                 );
                 if row_softmax {
                     for row in output.chunks_mut(columns) {
                         softmax_in_place(row);
                     }
-                } else if let Some(activation) = activation {
-                    unary_chunk(output, activation);
                 }
             }
         });
@@ -475,7 +704,7 @@ pub(crate) fn gemm_packed_panels(
     inner: usize,
     panels: usize,
     bias: Option<&[f32]>,
-    gelu: bool,
+    activation: Option<UnaryOperation>,
 ) {
     const PANEL_COLUMNS: usize = 16;
 
@@ -484,7 +713,12 @@ pub(crate) fn gemm_packed_panels(
     assert_eq!(right.len(), panels * inner * PANEL_COLUMNS);
     #[cfg(target_arch = "aarch64")]
     if rows.is_multiple_of(4) {
-        gemm_packed_panels_blocked(output, left, right, rows, inner, panels, bias, gelu);
+        gemm_packed_panels_blocked(output, left, right, rows, inner, panels, bias, activation);
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if rows.is_multiple_of(4) && has_avx2_fma() {
+        gemm_packed_panels_blocked(output, left, right, rows, inner, panels, bias, activation);
         return;
     }
     output
@@ -508,10 +742,8 @@ pub(crate) fn gemm_packed_panels(
                     bias,
                     None,
                     true,
+                    activation,
                 );
-            }
-            if gelu {
-                unary_chunk(output, UnaryOperation::Gelu);
             }
         });
 }
@@ -524,10 +756,10 @@ pub(crate) fn gemm_sparse_packed_panels(
     inner: usize,
     panels: usize,
     bias: Option<&[f32]>,
-    gelu: bool,
     row_offsets: &[usize],
     indices: &[u32],
     values: &[f32],
+    activation: Option<UnaryOperation>,
 ) {
     const PANEL_COLUMNS: usize = 16;
     const BLOCK_ROWS: usize = 4;
@@ -548,6 +780,24 @@ pub(crate) fn gemm_sparse_packed_panels(
                 let output = &mut output
                     [row_start * PANEL_COLUMNS..(row_start + BLOCK_ROWS) * PANEL_COLUMNS];
                 let bias = bias.map(|bias| &bias[row_start..row_start + BLOCK_ROWS]);
+                #[cfg(target_arch = "x86_64")]
+                if has_avx2_fma() {
+                    // SAFETY: AVX2/FMA were checked above. Every sparse index
+                    // selects a complete packed RHS row.
+                    unsafe {
+                        x86::gemm_4x16_sparse(
+                            output,
+                            right,
+                            &indices[entry_start..entry_end],
+                            &values[entry_start * BLOCK_ROWS..entry_end * BLOCK_ROWS],
+                            PANEL_COLUMNS,
+                            PANEL_COLUMNS,
+                            bias,
+                            activation,
+                        )
+                    };
+                    continue;
+                }
                 #[cfg(target_arch = "aarch64")]
                 // SAFETY: Indices reference complete 16-column rows in the
                 // packed RHS, and weights contain four values per entry.
@@ -561,22 +811,21 @@ pub(crate) fn gemm_sparse_packed_panels(
                         PANEL_COLUMNS,
                         bias,
                     );
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                for row in 0..BLOCK_ROWS {
-                    for column in 0..PANEL_COLUMNS {
-                        let mut sum = bias.map_or(0.0, |bias| bias[row]);
-                        for entry in entry_start..entry_end {
-                            let index = indices[entry] as usize;
-                            sum = values[entry * BLOCK_ROWS + row]
-                                .mul_add(right[index * PANEL_COLUMNS + column], sum);
-                        }
-                        output[row * PANEL_COLUMNS + column] = sum;
+                    if let Some(activation) = activation {
+                        unary_chunk(output, activation);
                     }
                 }
-            }
-            if gelu {
-                unary_chunk(output, UnaryOperation::Gelu);
+                #[cfg(not(target_arch = "aarch64"))]
+                gemm_4_sparse_scalar(
+                    output,
+                    right,
+                    &indices[entry_start..entry_end],
+                    &values[entry_start * BLOCK_ROWS..entry_end * BLOCK_ROWS],
+                    PANEL_COLUMNS,
+                    PANEL_COLUMNS,
+                    bias,
+                    activation,
+                );
             }
         });
 }
@@ -589,10 +838,10 @@ pub(crate) fn gemm_sparse_packed_left(
     inner: usize,
     columns: usize,
     bias: Option<&[f32]>,
-    gelu: bool,
     row_offsets: &[usize],
     indices: &[u32],
     values: &[f32],
+    activation: Option<UnaryOperation>,
 ) {
     const BLOCK_ROWS: usize = 4;
 
@@ -609,6 +858,24 @@ pub(crate) fn gemm_sparse_packed_left(
             let entry_end = row_offsets[block + 1];
             let row_start = block * BLOCK_ROWS;
             let bias = bias.map(|bias| &bias[row_start..row_start + BLOCK_ROWS]);
+            #[cfg(target_arch = "x86_64")]
+            if has_avx2_fma() {
+                // SAFETY: AVX2/FMA were checked above. Every sparse index
+                // selects a complete RHS row of `columns` values.
+                unsafe {
+                    x86::gemm_4x16_sparse(
+                        output,
+                        right,
+                        &indices[entry_start..entry_end],
+                        &values[entry_start * BLOCK_ROWS..entry_end * BLOCK_ROWS],
+                        columns,
+                        columns,
+                        bias,
+                        activation,
+                    )
+                };
+                return;
+            }
             #[cfg(target_arch = "aarch64")]
             // SAFETY: Every sparse index identifies a complete RHS row and
             // weights contain four values per entry.
@@ -622,26 +889,50 @@ pub(crate) fn gemm_sparse_packed_left(
                     columns,
                     bias,
                 );
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            for row in 0..BLOCK_ROWS {
-                for column in 0..columns {
-                    let mut sum = bias.map_or(0.0, |bias| bias[row]);
-                    for entry in entry_start..entry_end {
-                        let index = indices[entry] as usize;
-                        sum = values[entry * BLOCK_ROWS + row]
-                            .mul_add(right[index * columns + column], sum);
-                    }
-                    output[row * columns + column] = sum;
+                if let Some(activation) = activation {
+                    unary_chunk(output, activation);
                 }
             }
-            if gelu {
-                unary_chunk(output, UnaryOperation::Gelu);
-            }
+            #[cfg(not(target_arch = "aarch64"))]
+            gemm_4_sparse_scalar(
+                output,
+                right,
+                &indices[entry_start..entry_end],
+                &values[entry_start * BLOCK_ROWS..entry_end * BLOCK_ROWS],
+                columns,
+                columns,
+                bias,
+                activation,
+            );
         });
 }
 
-#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(target_arch = "aarch64"))]
+fn gemm_4_sparse_scalar(
+    output: &mut [f32],
+    right: &[f32],
+    indices: &[u32],
+    values: &[f32],
+    columns: usize,
+    right_stride: usize,
+    bias: Option<&[f32]>,
+    activation: Option<UnaryOperation>,
+) {
+    for row in 0..4 {
+        for column in 0..columns {
+            let mut sum = bias.map_or(0.0, |bias| bias[row]);
+            for (entry, &index) in indices.iter().enumerate() {
+                sum = values[entry * 4 + row]
+                    .mul_add(right[index as usize * right_stride + column], sum);
+            }
+            output[row * columns + column] =
+                activation.map_or(sum, |activation| activation.apply(sum));
+        }
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
 fn gemm_packed_panels_blocked(
     output: &mut [f32],
@@ -651,7 +942,7 @@ fn gemm_packed_panels_blocked(
     inner: usize,
     _panels: usize,
     bias: Option<&[f32]>,
-    gelu: bool,
+    activation: Option<UnaryOperation>,
 ) {
     const PANEL_COLUMNS: usize = 16;
     const DEPTH_BLOCK: usize = 256;
@@ -670,6 +961,25 @@ fn gemm_packed_panels_blocked(
                     let left_start = row_start * inner + depth_start * 4;
                     let left = &left[left_start..left_start + depth * 4];
                     let bias = bias.map(|bias| &bias[row_start..row_start + 4]);
+                    #[cfg(target_arch = "x86_64")]
+                    // SAFETY: AVX2/FMA availability is checked by the caller;
+                    // slices describe one packed 4x16 tile.
+                    unsafe {
+                        x86::gemm_4x16_packed(
+                            output,
+                            left,
+                            right,
+                            depth,
+                            PANEL_COLUMNS,
+                            PANEL_COLUMNS,
+                            bias,
+                            depth_start != 0,
+                            (depth_start + depth == inner)
+                                .then_some(activation)
+                                .flatten(),
+                        )
+                    };
+                    #[cfg(target_arch = "aarch64")]
                     // SAFETY: The slices describe a complete 4x16 tile and
                     // NEON is mandatory on AArch64.
                     unsafe {
@@ -687,10 +997,11 @@ fn gemm_packed_panels_blocked(
                 }
             });
     }
-    if gelu {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(activation) = activation {
         output
             .par_chunks_mut(rows * PANEL_COLUMNS)
-            .for_each(|output| unary_chunk(output, UnaryOperation::Gelu));
+            .for_each(|output| unary_chunk(output, activation));
     }
 }
 
@@ -706,6 +1017,7 @@ fn gemm_rows(
     bias: Option<&[f32]>,
     column_bias: Option<&[f32]>,
     packed_left: bool,
+    activation: Option<UnaryOperation>,
 ) {
     #[cfg(target_arch = "x86_64")]
     if has_avx2_fma() {
@@ -723,6 +1035,7 @@ fn gemm_rows(
                     right_stride,
                     bias,
                     None,
+                    activation,
                 )
             };
             return;
@@ -742,6 +1055,7 @@ fn gemm_rows(
                         right_stride,
                         bias,
                         None,
+                        activation,
                     )
                 } else {
                     x86::gemm_rows_8::<8, false>(
@@ -753,6 +1067,7 @@ fn gemm_rows(
                         right_stride,
                         bias,
                         column_bias,
+                        activation,
                     )
                 }
             };
@@ -773,6 +1088,7 @@ fn gemm_rows(
                         right_stride,
                         bias,
                         None,
+                        activation,
                     )
                 } else {
                     x86::gemm_rows_8::<4, false>(
@@ -784,6 +1100,7 @@ fn gemm_rows(
                         right_stride,
                         bias,
                         column_bias,
+                        activation,
                     )
                 }
             };
@@ -813,6 +1130,9 @@ fn gemm_rows(
                 )
             };
         }
+        if let Some(activation) = activation {
+            unary_chunk(output, activation);
+        }
         return;
     }
     #[cfg(target_arch = "aarch64")]
@@ -836,6 +1156,9 @@ fn gemm_rows(
                 )
             }
         };
+        if let Some(activation) = activation {
+            unary_chunk(output, activation);
+        }
         return;
     }
     #[cfg(target_arch = "aarch64")]
@@ -867,6 +1190,9 @@ fn gemm_rows(
                 )
             }
         };
+        if let Some(activation) = activation {
+            unary_chunk(output, activation);
+        }
         return;
     }
     gemm_scalar_strided(
@@ -881,6 +1207,9 @@ fn gemm_rows(
         column_bias,
         packed_left,
     );
+    if let Some(activation) = activation {
+        unary_chunk(output, activation);
+    }
 }
 
 pub(crate) fn max_pool_2x2_same_upper(output: &mut [f32], input: &[f32], width: usize) {
@@ -995,6 +1324,13 @@ pub(crate) fn bias_softmax_in_place(values: &mut [f32], bias: &[f32]) {
     unsafe {
         neon::bias_softmax(values, bias)
     };
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2_fma() {
+        // SAFETY: AVX2/FMA were detected and equal-length slices bound every
+        // load and store, including the scalar tail.
+        unsafe { x86::bias_softmax(values, bias) };
+        return;
+    }
     #[cfg(not(target_arch = "aarch64"))]
     {
         add_in_place(values, bias);
@@ -1020,6 +1356,33 @@ pub(crate) fn mean(values: &[f32]) -> f32 {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let sum = values.iter().copied().sum::<f32>();
     sum / values.len() as f32
+}
+
+pub(crate) fn layer_norm_in_place(values: &mut [f32], weight: &[f32], bias: &[f32], epsilon: f32) {
+    assert!(!values.is_empty());
+    assert_eq!(values.len(), weight.len());
+    assert_eq!(values.len(), bias.len());
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2_fma() {
+        // SAFETY: Runtime feature detection covers the AVX2/FMA kernel and all
+        // three slices have the same validated length.
+        unsafe { x86::layer_norm(values, weight, bias, epsilon) };
+        return;
+    }
+
+    let mean = mean(values);
+    let variance = values
+        .iter()
+        .map(|value| {
+            let centered = *value - mean;
+            centered * centered
+        })
+        .sum::<f32>()
+        / values.len() as f32;
+    let inverse_std = (variance + epsilon).sqrt().recip();
+    for ((value, weight), bias) in values.iter_mut().zip(weight).zip(bias) {
+        *value = (*value - mean).mul_add(inverse_std * *weight, *bias);
+    }
 }
 
 fn unary_chunk(values: &mut [f32], operation: UnaryOperation) {
@@ -1053,6 +1416,11 @@ fn unary_chunk(values: &mut [f32], operation: UnaryOperation) {
                 unsafe { x86::gelu(values) };
                 return;
             }
+            UnaryOperation::Silu => {
+                // SAFETY: Same feature and slice-bounds argument as ReLU.
+                unsafe { x86::silu(values) };
+                return;
+            }
             _ => {}
         }
     }
@@ -1075,7 +1443,7 @@ pub(crate) enum UnaryOperation {
 
 impl UnaryOperation {
     #[inline]
-    fn apply(self, value: f32) -> f32 {
+    pub(super) fn apply(self, value: f32) -> f32 {
         match self {
             Self::Relu => value.max(0.0),
             Self::Erf => erf(value),
@@ -1207,10 +1575,10 @@ mod tests {
                 inner,
                 columns,
                 Some(&bias),
-                false,
                 &row_offsets,
                 &indices,
                 &weights,
+                None,
             );
 
             let mut expected = vec![0.0; rows * columns];
@@ -1234,7 +1602,20 @@ mod tests {
     #[test]
     fn depthwise_same_matches_scalar_reference() {
         for kernel in [3, 5, 7, 9] {
-            for (height, width) in [(2, 3), (9, 37)] {
+            for (height, width) in [
+                (2, 3),
+                (9, 7),
+                (9, 8),
+                (9, 9),
+                (9, 15),
+                (9, 16),
+                (9, 17),
+                (9, 31),
+                (9, 32),
+                (9, 33),
+                (9, 37),
+                (11, 41),
+            ] {
                 let input = (0..height * width)
                     .map(|index| ((index * 17 % 43) as f32 - 21.0) / 13.0)
                     .collect::<Vec<_>>();
@@ -1284,8 +1665,17 @@ mod tests {
     fn depthwise_stride2_matches_scalar_reference() {
         for (height, width) in [
             (2usize, 3usize),
+            (9, 7),
+            (9, 8),
+            (9, 9),
+            (9, 15),
+            (9, 16),
             (9, 17),
             (9, 18),
+            (9, 19),
+            (9, 20),
+            (9, 31),
+            (9, 32),
             (9, 33),
             (9, 34),
             (9, 37),

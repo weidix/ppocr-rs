@@ -348,13 +348,22 @@ impl Conv2d {
             && groups == 1
             && (kernel_height != 1 || kernel_width != 1)
             && exact_sparse_weights.is_none();
+        let direct_spatial = groups == 1
+            && (kernel_height != 1 || kernel_width != 1)
+            && strides.into_iter().all(|stride| matches!(stride, 1 | 2))
+            && output_channels.is_multiple_of(4)
+            && exact_sparse_weights.is_none()
+            && kernels::supports_direct_spatial_conv();
         let packed_pointwise = groups == 1
             && ((kernel_height == 1 && kernel_width == 1)
                 || (strides != [1, 1] && output_channels >= 48)
                 || tiled_spatial)
             && !system_dense_pointwise
-            && !system_dense_spatial;
-        let weight = if packed_pointwise {
+            && !system_dense_spatial
+            && !direct_spatial;
+        let weight = if direct_spatial {
+            pack_conv_rows(weight, output_channels, 4)?
+        } else if packed_pointwise {
             if tiled_spatial || exact_sparse_weights.is_some() {
                 pack_conv_rows(weight, output_channels, 4)?
             } else {
@@ -370,6 +379,7 @@ impl Conv2d {
                 strides,
                 pads,
                 groups,
+                direct_spatial,
                 packed_pointwise,
                 system_dense_pointwise,
                 system_dense_spatial,
@@ -379,26 +389,34 @@ impl Conv2d {
     }
 
     pub(crate) fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        self.run(input, false)
+        self.run(input, None)
+    }
+
+    pub(crate) fn forward_relu(&self, input: &Tensor) -> Result<Tensor> {
+        self.run(input, Some(kernels::UnaryOperation::Relu))
+    }
+
+    pub(crate) fn forward_silu(&self, input: &Tensor) -> Result<Tensor> {
+        self.run(input, Some(kernels::UnaryOperation::Silu))
     }
 
     pub(crate) fn forward_gelu(&self, input: &Tensor) -> Result<Tensor> {
-        self.run(input, true)
+        self.run(input, Some(kernels::UnaryOperation::Gelu))
     }
 
-    fn run(&self, input: &Tensor, gelu: bool) -> Result<Tensor> {
+    fn run(&self, input: &Tensor, activation: Option<kernels::UnaryOperation>) -> Result<Tensor> {
         let mut inputs = vec![input.clone(), self.weight.clone()];
         if let Some(bias) = &self.bias {
             inputs.push(bias.clone());
         }
-        run(
-            if gelu {
-                Operation::ConvGelu(self.options.clone())
-            } else {
-                Operation::Conv(self.options.clone())
-            },
-            inputs,
-        )
+        let operation = match activation {
+            None => Operation::Conv(self.options.clone()),
+            Some(kernels::UnaryOperation::Gelu) => Operation::ConvGelu(self.options.clone()),
+            Some(kernels::UnaryOperation::Relu) => Operation::ConvRelu(self.options.clone()),
+            Some(kernels::UnaryOperation::Silu) => Operation::ConvSilu(self.options.clone()),
+            Some(_) => unreachable!("unsupported fused Conv activation"),
+        };
+        run(operation, inputs)
     }
 }
 
@@ -469,6 +487,7 @@ impl ConvTranspose2d {
                 strides,
                 pads,
                 groups,
+                direct_spatial: false,
                 packed_pointwise: false,
                 system_dense_pointwise: false,
                 system_dense_spatial: false,
@@ -520,19 +539,7 @@ impl LayerNorm {
         let bias = self.bias.as_f32()?;
         let mut output = input.as_f32()?.to_vec();
         output.par_chunks_mut(features).for_each(|row| {
-            let mean = kernels::mean(row);
-            let variance = row
-                .iter()
-                .map(|value| {
-                    let centered = *value - mean;
-                    centered * centered
-                })
-                .sum::<f32>()
-                / features as f32;
-            let inverse_std = (variance + self.epsilon).sqrt().recip();
-            for ((value, weight), bias) in row.iter_mut().zip(weight).zip(bias) {
-                *value = (*value - mean).mul_add(inverse_std * *weight, *bias);
-            }
+            kernels::layer_norm_in_place(row, weight, bias, self.epsilon);
         });
         Ok(Tensor::new_f32(input.shape.clone(), output))
     }
@@ -540,8 +547,8 @@ impl LayerNorm {
 
 #[derive(Clone)]
 pub(crate) struct Linear {
-    // Accelerate consumes the native [out, in] layout directly. Other targets
-    // interleave output rows for the packed-left kernels.
+    // x86 kernels consume weights packed in eight-row blocks. Other targets
+    // consume the native [out, in] layout directly.
     weight: Tensor,
     input_features: usize,
     output_features: usize,
@@ -566,8 +573,8 @@ impl Linear {
                 "Linear bias length does not match output features"
             );
         }
-        #[cfg(not(target_os = "macos"))]
-        let weight = pack_conv_rows(weight, output_features, 12)?;
+        #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+        let weight = pack_conv_rows(weight, output_features, 8)?;
         Ok(Self {
             weight,
             input_features,
@@ -577,14 +584,23 @@ impl Linear {
     }
 
     pub(crate) fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        self.run(input, false)
+        self.run(input, None, false)
+    }
+
+    pub(crate) fn forward_silu(&self, input: &Tensor) -> Result<Tensor> {
+        self.run(input, Some(kernels::UnaryOperation::Silu), false)
     }
 
     pub(crate) fn forward_softmax(&self, input: &Tensor) -> Result<Tensor> {
-        self.run(input, true)
+        self.run(input, None, true)
     }
 
-    fn run(&self, input: &Tensor, apply_softmax: bool) -> Result<Tensor> {
+    fn run(
+        &self,
+        input: &Tensor,
+        activation: Option<kernels::UnaryOperation>,
+        apply_softmax: bool,
+    ) -> Result<Tensor> {
         ensure!(
             !input.shape.is_empty(),
             "Linear input must have at least one dimension"
@@ -605,62 +621,39 @@ impl Linear {
             return Ok(Tensor::new_f32(output_shape, Vec::new()));
         }
 
+        let input = input.as_f32()?;
+        let weight = self.weight.as_f32()?;
+        let bias = self.bias.as_ref().map(Tensor::as_f32).transpose()?;
+        let mut output = vec![0.0; output_len];
         #[cfg(target_os = "macos")]
-        {
-            let mut output = vec![0.0; output_len];
-            kernels::linear_system_dense(
-                &mut output,
-                input.as_f32()?,
-                self.weight.as_f32()?,
-                rows,
-                self.input_features,
-                self.output_features,
-                self.bias.as_ref().map(Tensor::as_f32).transpose()?,
-                apply_softmax,
-            );
-            Ok(Tensor::new_f32(output_shape, output))
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        let transposed_input = transpose_matrix(input.as_f32()?, rows, self.input_features);
-        #[cfg(not(target_os = "macos"))]
-        let mut transposed_output = vec![0.0; output_len];
-        #[cfg(not(target_os = "macos"))]
-        kernels::gemm_packed_left(
-            &mut transposed_output,
-            self.weight.as_f32()?,
-            &transposed_input,
-            self.output_features,
-            self.input_features,
+        kernels::linear_system_dense(
+            &mut output,
+            input,
+            weight,
             rows,
-            self.bias.as_ref().map(Tensor::as_f32).transpose()?,
+            self.input_features,
+            self.output_features,
+            bias,
+            apply_softmax,
         );
-        #[cfg(not(target_os = "macos"))]
-        let mut output = transpose_matrix(&transposed_output, self.output_features, rows);
-        #[cfg(not(target_os = "macos"))]
-        if apply_softmax {
-            output
-                .par_chunks_mut(self.output_features)
-                .for_each(kernels::softmax_in_place);
+        #[cfg(target_os = "macos")]
+        if let Some(activation) = activation {
+            kernels::unary_in_place(&mut output, activation);
         }
         #[cfg(not(target_os = "macos"))]
+        kernels::linear_right_transposed(
+            &mut output,
+            input,
+            weight,
+            rows,
+            self.input_features,
+            self.output_features,
+            bias,
+            activation,
+            apply_softmax,
+        );
         Ok(Tensor::new_f32(output_shape, output))
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn transpose_matrix(input: &[f32], rows: usize, columns: usize) -> Vec<f32> {
-    assert_eq!(rows.checked_mul(columns), Some(input.len()));
-    let mut output = vec![0.0; input.len()];
-    output
-        .par_chunks_mut(rows)
-        .enumerate()
-        .for_each(|(column, output_row)| {
-            for (row, output) in output_row.iter_mut().enumerate() {
-                *output = input[row * columns + column];
-            }
-        });
-    output
 }
 
 #[cfg(test)]
@@ -692,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn linear_transposes_weights_once_and_fuses_softmax() {
+    fn linear_fuses_bias_and_softmax() {
         let weight = tensor([2, 3], &[1.0, 0.0, -1.0, 0.0, 1.0, 1.0]);
         let bias = tensor([2], &[0.5, -0.5]);
         let linear = Linear::new(weight, Some(bias)).unwrap();
@@ -708,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_linear_matches_dynamic_matmul_with_leading_dimensions() {
+    fn direct_linear_matches_dynamic_matmul_with_leading_dimensions() {
         let weight = tensor(
             [4, 3],
             &[

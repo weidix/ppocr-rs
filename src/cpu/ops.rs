@@ -24,6 +24,8 @@ pub(crate) enum Operation {
     Concat { axis: i64 },
     Conv(ConvOptions),
     ConvGelu(ConvOptions),
+    ConvRelu(ConvOptions),
+    ConvSilu(ConvOptions),
     ConvTranspose(ConvOptions),
     Div,
     Erf,
@@ -57,6 +59,7 @@ pub(crate) struct ConvOptions {
     pub strides: [usize; 2],
     pub pads: [usize; 4],
     pub groups: usize,
+    pub direct_spatial: bool,
     pub packed_pointwise: bool,
     pub system_dense_pointwise: bool,
     pub system_dense_spatial: bool,
@@ -75,7 +78,7 @@ impl ExactSparseConvWeights {
         const BLOCK_ROWS: usize = 4;
         const MAXIMUM_ACTIVE_RATIO: f32 = 0.55;
 
-        if !cfg!(target_arch = "aarch64")
+        if !kernels::supports_exact_sparse_gemm()
             || !rows.is_multiple_of(BLOCK_ROWS)
             || weight.len() != rows * inner
             || inner > u32::MAX as usize
@@ -127,8 +130,10 @@ impl Node {
             Operation::BatchNormalization { epsilon } => batch_normalization(inputs, *epsilon),
             Operation::BiasSoftmax { axis } => bias_softmax(inputs, *axis),
             Operation::Concat { axis } => concat(inputs, *axis),
-            Operation::Conv(options) => conv(inputs, options, false),
-            Operation::ConvGelu(options) => conv(inputs, options, true),
+            Operation::Conv(options) => conv(inputs, options, None),
+            Operation::ConvGelu(options) => conv(inputs, options, Some(UnaryOperation::Gelu)),
+            Operation::ConvRelu(options) => conv(inputs, options, Some(UnaryOperation::Relu)),
+            Operation::ConvSilu(options) => conv(inputs, options, Some(UnaryOperation::Silu)),
             Operation::ConvTranspose(options) => conv_transpose(inputs, options),
             Operation::Div => binary(inputs, BinaryOperation::Div),
             Operation::Erf => unary(inputs, UnaryOperation::Erf),
@@ -316,7 +321,11 @@ fn is_repeated_suffix(input: &[usize], output: &[usize]) -> bool {
         && suffix == &output[output.len() - suffix.len()..]
 }
 
-fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor> {
+fn conv(
+    inputs: Vec<Tensor>,
+    options: &ConvOptions,
+    activation: Option<UnaryOperation>,
+) -> Result<Tensor> {
     ensure!(
         (2..=3).contains(&inputs.len()),
         "Conv expects two or three inputs"
@@ -386,10 +395,10 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
                     input_channels,
                     output_plane,
                     bias,
-                    gelu,
                     &sparse.row_offsets,
                     &sparse.indices,
                     &sparse.values,
+                    activation,
                 );
             } else if options.system_dense_pointwise {
                 kernels::gemm_system_dense(
@@ -400,32 +409,10 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
                     input_channels,
                     output_plane,
                     bias,
-                    gelu,
+                    activation,
                 );
             } else if options.packed_pointwise {
-                if gelu {
-                    kernels::gemm_packed_left_gelu(
-                        output,
-                        weight,
-                        input,
-                        output_channels,
-                        input_channels,
-                        output_plane,
-                        bias,
-                    );
-                } else {
-                    kernels::gemm_packed_left(
-                        output,
-                        weight,
-                        input,
-                        output_channels,
-                        input_channels,
-                        output_plane,
-                        bias,
-                    );
-                }
-            } else if gelu {
-                kernels::gemm_gelu(
+                kernels::gemm_packed_left_with_activation(
                     output,
                     weight,
                     input,
@@ -433,9 +420,10 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
                     input_channels,
                     output_plane,
                     bias,
+                    activation,
                 );
             } else {
-                kernels::gemm(
+                kernels::gemm_with_activation(
                     output,
                     weight,
                     input,
@@ -443,8 +431,37 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
                     input_channels,
                     output_plane,
                     bias,
+                    activation,
                 );
             }
+        }
+        return Ok(Tensor::new_f32(
+            vec![batch, output_channels, output_height, output_width],
+            output,
+        ));
+    }
+
+    if options.direct_spatial {
+        for batch_index in 0..batch {
+            kernels::spatial_conv2d_direct(
+                &mut output[batch_index * output_channels * output_plane
+                    ..(batch_index + 1) * output_channels * output_plane],
+                &input[batch_index * input_channels * input_plane
+                    ..(batch_index + 1) * input_channels * input_plane],
+                weight,
+                bias,
+                input_channels,
+                input_height,
+                input_width,
+                output_channels,
+                output_height,
+                output_width,
+                kernel_height,
+                kernel_width,
+                options.strides,
+                options.pads,
+                activation,
+            );
         }
         return Ok(Tensor::new_f32(
             vec![batch, output_channels, output_height, output_width],
@@ -472,7 +489,7 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
                 kernel_width,
                 patch_size,
                 options,
-                gelu,
+                activation,
             );
         }
         return Ok(Tensor::new_f32(
@@ -503,8 +520,8 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
             );
             let output = &mut output[batch_index * output_channels * output_plane
                 ..(batch_index + 1) * output_channels * output_plane];
-            if options.packed_pointwise && gelu {
-                kernels::gemm_packed_left_gelu(
+            if options.packed_pointwise {
+                kernels::gemm_packed_left_with_activation(
                     output,
                     weight,
                     &columns,
@@ -512,29 +529,10 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
                     patch_size,
                     output_plane,
                     bias,
-                );
-            } else if options.packed_pointwise {
-                kernels::gemm_packed_left(
-                    output,
-                    weight,
-                    &columns,
-                    output_channels,
-                    patch_size,
-                    output_plane,
-                    bias,
-                );
-            } else if gelu {
-                kernels::gemm_gelu(
-                    output,
-                    weight,
-                    &columns,
-                    output_channels,
-                    patch_size,
-                    output_plane,
-                    bias,
+                    activation,
                 );
             } else {
-                kernels::gemm(
+                kernels::gemm_with_activation(
                     output,
                     weight,
                     &columns,
@@ -542,6 +540,7 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
                     patch_size,
                     output_plane,
                     bias,
+                    activation,
                 );
             }
         }
@@ -575,7 +574,7 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
                 kernel_width,
                 patch_size,
                 options,
-                gelu,
+                activation,
             );
         }
         return Ok(Tensor::new_f32(
@@ -608,11 +607,11 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
                     kernel_height,
                     bias.map_or(0.0, |bias| bias[output_channel]),
                 );
+                if let Some(activation) = activation {
+                    kernels::unary_in_place(output_plane_values, activation);
+                }
             },
         );
-        if gelu {
-            kernels::unary_in_place(&mut output, UnaryOperation::Gelu);
-        }
         return Ok(Tensor::new_f32(
             vec![batch, output_channels, output_height, output_width],
             output,
@@ -640,11 +639,11 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
                     input_width,
                     bias.map_or(0.0, |bias| bias[output_channel]),
                 );
+                if let Some(activation) = activation {
+                    kernels::unary_in_place(output_plane_values, activation);
+                }
             },
         );
-        if gelu {
-            kernels::unary_in_place(&mut output, UnaryOperation::Gelu);
-        }
         return Ok(Tensor::new_f32(
             vec![batch, output_channels, output_height, output_width],
             output,
@@ -742,11 +741,11 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
                     }
                 }
             }
+            if let Some(activation) = activation {
+                kernels::unary_in_place(output_plane_values, activation);
+            }
         },
     );
-    if gelu {
-        kernels::unary_in_place(&mut output, UnaryOperation::Gelu);
-    }
 
     Ok(Tensor::new_f32(
         vec![batch, output_channels, output_height, output_width],
@@ -770,7 +769,7 @@ fn conv_im2col_system_tiled(
     kernel_width: usize,
     patch_size: usize,
     options: &ConvOptions,
-    gelu: bool,
+    activation: Option<UnaryOperation>,
 ) {
     const TARGET_COLUMN_ELEMENTS: usize = 4 * 1024 * 1024;
 
@@ -806,7 +805,7 @@ fn conv_im2col_system_tiled(
             patch_size,
             tile_plane,
             bias,
-            gelu,
+            activation,
         );
         output
             .par_chunks_mut(output_plane)
@@ -897,7 +896,7 @@ fn conv_im2col_tiled(
     kernel_width: usize,
     patch_size: usize,
     options: &ConvOptions,
-    gelu: bool,
+    activation: Option<UnaryOperation>,
 ) {
     let output_plane = output_height * output_width;
     const TARGET_COLUMN_ELEMENTS: usize = 4 * 1024 * 1024;
@@ -935,10 +934,10 @@ fn conv_im2col_tiled(
                 patch_size,
                 tile_panels,
                 bias,
-                gelu,
                 &sparse.row_offsets,
                 &sparse.indices,
                 &sparse.values,
+                activation,
             );
         } else {
             kernels::gemm_packed_panels(
@@ -949,7 +948,7 @@ fn conv_im2col_tiled(
                 patch_size,
                 tile_panels,
                 bias,
-                gelu,
+                activation,
             );
         }
         output
@@ -990,6 +989,7 @@ fn im2col_panels(
 ) {
     let input_plane = input_height * input_width;
     let panels_per_row = output_width.div_ceil(SPATIAL_PANEL_COLUMNS);
+    let stride2_simd = options.strides[1] == 2 && kernels::supports_stride2_simd_copy();
     debug_assert_eq!(
         columns.len(),
         output_rows
@@ -1007,35 +1007,63 @@ fn im2col_panels(
             output.fill(0.0);
             let local_y = panel / panels_per_row;
             let output_x = panel % panels_per_row * SPATIAL_PANEL_COLUMNS;
-            for patch_index in 0..input_channels * kernel_height * kernel_width {
-                let kernel_x = patch_index % kernel_width;
-                let patch = patch_index / kernel_width;
-                let kernel_y = patch % kernel_height;
-                let channel = patch / kernel_height;
-                let input_y = (output_y_start + local_y) * options.strides[0] + kernel_y;
-                if input_y < options.pads[0] || input_y - options.pads[0] >= input_height {
-                    continue;
-                }
-                let input_y = input_y - options.pads[0];
-                let input = &input[channel * input_plane..(channel + 1) * input_plane];
-                let available = (output_width - output_x).min(SPATIAL_PANEL_COLUMNS);
-                let padded_input_x = output_x * options.strides[1] + kernel_x;
-                let destination = &mut output[patch_index * SPATIAL_PANEL_COLUMNS
-                    ..patch_index * SPATIAL_PANEL_COLUMNS + available];
-                if available == SPATIAL_PANEL_COLUMNS
-                    && options.strides[1] == 1
-                    && padded_input_x >= options.pads[1]
-                    && padded_input_x - options.pads[1] + SPATIAL_PANEL_COLUMNS <= input_width
-                {
-                    let input_x = padded_input_x - options.pads[1];
-                    let source = input_y * input_width + input_x;
-                    destination.copy_from_slice(&input[source..source + SPATIAL_PANEL_COLUMNS]);
-                    continue;
-                }
-                for (lane, destination) in destination.iter_mut().enumerate() {
-                    let input_x = (output_x + lane) * options.strides[1] + kernel_x;
-                    if input_x >= options.pads[1] && input_x - options.pads[1] < input_width {
-                        *destination = input[input_y * input_width + input_x - options.pads[1]];
+            let available = (output_width - output_x).min(SPATIAL_PANEL_COLUMNS);
+            for channel in 0..input_channels {
+                let channel_input = &input[channel * input_plane..(channel + 1) * input_plane];
+                for kernel_y in 0..kernel_height {
+                    let input_y = (output_y_start + local_y) * options.strides[0] + kernel_y;
+                    if input_y < options.pads[0] || input_y - options.pads[0] >= input_height {
+                        continue;
+                    }
+                    let input_y = input_y - options.pads[0];
+                    for kernel_x in 0..kernel_width {
+                        let patch_index =
+                            (channel * kernel_height + kernel_y) * kernel_width + kernel_x;
+                        let destination =
+                            unsafe { output.as_mut_ptr().add(patch_index * SPATIAL_PANEL_COLUMNS) };
+                        let padded_input_x = output_x * options.strides[1] + kernel_x;
+                        if available == SPATIAL_PANEL_COLUMNS
+                            && options.strides[1] == 1
+                            && padded_input_x >= options.pads[1]
+                            && padded_input_x - options.pads[1] + SPATIAL_PANEL_COLUMNS
+                                <= input_width
+                        {
+                            let input_x = padded_input_x - options.pads[1];
+                            let source = input_y * input_width + input_x;
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    channel_input.as_ptr().add(source),
+                                    destination,
+                                    SPATIAL_PANEL_COLUMNS,
+                                )
+                            };
+                            continue;
+                        }
+                        if available == SPATIAL_PANEL_COLUMNS
+                            && stride2_simd
+                            && padded_input_x >= options.pads[1]
+                            && padded_input_x - options.pads[1] + 31 <= input_width
+                        {
+                            let input_x = padded_input_x - options.pads[1];
+                            let source = input_y * input_width + input_x;
+                            unsafe {
+                                kernels::copy_stride2_16(
+                                    destination,
+                                    channel_input.as_ptr().add(source),
+                                )
+                            };
+                            continue;
+                        }
+                        for lane in 0..available {
+                            let input_x = (output_x + lane) * options.strides[1] + kernel_x;
+                            if input_x >= options.pads[1] && input_x - options.pads[1] < input_width
+                            {
+                                unsafe {
+                                    *destination.add(lane) = channel_input
+                                        [input_y * input_width + input_x - options.pads[1]]
+                                };
+                            }
+                        }
                     }
                 }
             }
@@ -2134,9 +2162,11 @@ fn ensure_input_count(inputs: &[Tensor], expected: usize) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[cfg(target_arch = "aarch64")]
     #[test]
     fn exact_sparse_weights_retain_every_nonzero_value() {
+        if !kernels::supports_exact_sparse_gemm() {
+            return;
+        }
         let smallest = f32::from_bits(1);
         let weights = [smallest, 0.0, -smallest, 0.0, 0.0, 0.0, 0.0, 0.0];
         let sparse = ExactSparseConvWeights::from_dense(&weights, 4, 2)

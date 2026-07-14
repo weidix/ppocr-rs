@@ -147,6 +147,14 @@ impl Conv2d {
         self.convolution.forward(input)
     }
 
+    fn forward_relu(&self, input: &Tensor) -> Result<Tensor> {
+        self.convolution.forward_relu(input)
+    }
+
+    fn forward_silu(&self, input: &Tensor) -> Result<Tensor> {
+        self.convolution.forward_silu(input)
+    }
+
     fn forward_gelu(&self, input: &Tensor) -> Result<Tensor> {
         self.convolution.forward_gelu(input)
     }
@@ -431,10 +439,13 @@ impl ConvBnAct {
     }
 
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        if matches!(self.activation, Activation::None) {
-            self.conv.forward(input)
-        } else {
-            self.activation.forward(self.conv.forward(input)?)
+        match self.activation {
+            Activation::None => self.conv.forward(input),
+            Activation::Relu => self.conv.forward_relu(input),
+            Activation::Silu => self.conv.forward_silu(input),
+            Activation::HardSigmoid | Activation::HardSigmoidFive => {
+                self.activation.forward(self.conv.forward(input)?)
+            }
         }
     }
 }
@@ -472,7 +483,7 @@ impl SqueezeExcitation {
 
     fn forward(&self, input: Tensor) -> Result<Tensor> {
         let pooled = input.global_avg_pool2d()?;
-        let reduced = self.reduce.forward(&pooled)?.into_relu()?;
+        let reduced = self.reduce.forward_relu(&pooled)?;
         let attention = Activation::HardSigmoid.forward(self.expand.forward(&reduced)?)?;
         input.into_mul(&attention)
     }
@@ -1093,7 +1104,7 @@ impl VariantSqueezeExcitation {
 
     fn attention(&self, input: &Tensor) -> Result<Tensor> {
         let pooled = input.global_avg_pool2d()?;
-        let hidden = self.reduce.forward(&pooled)?.into_relu()?;
+        let hidden = self.reduce.forward_relu(&pooled)?;
         Activation::HardSigmoidFive.forward(self.expand.forward(&hidden)?)
     }
 }
@@ -1573,7 +1584,7 @@ impl RecMlp {
     }
 
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        self.fc2.forward(&self.fc1.forward(input)?.into_silu()?)
+        self.fc2.forward(&self.fc1.forward_silu(input)?)
     }
 }
 
