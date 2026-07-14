@@ -88,6 +88,50 @@ pub(crate) fn depthwise_conv2d_same(
     }
 }
 
+pub(crate) fn depthwise_conv2d_same_3x3_stride2(
+    output: &mut [f32],
+    input: &[f32],
+    weights: &[f32],
+    height: usize,
+    width: usize,
+    bias: f32,
+) {
+    assert!(height > 0 && width > 0);
+    assert_eq!(output.len(), height.div_ceil(2) * width.div_ceil(2));
+    assert_eq!(input.len(), height * width);
+    assert_eq!(weights.len(), 9);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: Slice dimensions are checked above. The NEON kernel only
+    // vectorizes complete interior windows and handles borders separately.
+    unsafe {
+        neon::depthwise_conv2d_same_3x3_stride2(output, input, weights, height, width, bias)
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let output_width = width.div_ceil(2);
+        for output_y in 0..height.div_ceil(2) {
+            for output_x in 0..output_width {
+                let mut sum = bias;
+                for kernel_y in 0..3 {
+                    let input_y = output_y * 2 + kernel_y;
+                    if input_y == 0 || input_y > height {
+                        continue;
+                    }
+                    for kernel_x in 0..3 {
+                        let input_x = output_x * 2 + kernel_x;
+                        if input_x == 0 || input_x > width {
+                            continue;
+                        }
+                        sum = input[(input_y - 1) * width + input_x - 1]
+                            .mul_add(weights[kernel_y * 3 + kernel_x], sum);
+                    }
+                }
+                output[output_y * output_width + output_x] = sum;
+            }
+        }
+    }
+}
+
 #[cfg(not(target_arch = "aarch64"))]
 fn depthwise_conv2d_same_scalar<const K: usize>(
     output: &mut [f32],
@@ -307,6 +351,34 @@ pub(crate) fn gemm_system_dense(
     } else {
         gemm(output, left, right, rows, inner, columns, bias);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_os = "macos")]
+pub(crate) fn linear_system_dense(
+    output: &mut [f32],
+    input: &[f32],
+    weight: &[f32],
+    rows: usize,
+    inner: usize,
+    columns: usize,
+    bias: Option<&[f32]>,
+    softmax: bool,
+) {
+    assert!(rows > 0 && inner > 0 && columns > 0);
+    assert!(bias.is_none_or(|bias| bias.len() == columns));
+    accelerate::sgemm_right_transposed(output, input, weight, rows, inner, columns);
+    output.par_chunks_mut(columns).for_each(|row| {
+        if softmax {
+            if let Some(bias) = bias {
+                bias_softmax_in_place(row, bias);
+            } else {
+                softmax_in_place(row);
+            }
+        } else if let Some(bias) = bias {
+            add_in_place(row, bias);
+        }
+    });
 }
 
 pub(crate) fn gemm_column_bias_softmax(
@@ -916,6 +988,20 @@ pub(crate) fn softmax_in_place(values: &mut [f32]) {
     }
 }
 
+pub(crate) fn bias_softmax_in_place(values: &mut [f32], bias: &[f32]) {
+    assert_eq!(values.len(), bias.len());
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: Equal-length slices bound all vector loads and stores.
+    unsafe {
+        neon::bias_softmax(values, bias)
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        add_in_place(values, bias);
+        softmax_in_place(values);
+    }
+}
+
 pub(crate) fn mean(values: &[f32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     let sum = {
@@ -1025,6 +1111,25 @@ mod tests {
         assert!(erf(0.0).abs() < 1e-6);
         assert!((erf(1.0) - 0.842_700_8).abs() < 2e-7);
         assert!((erf(-2.0) + 0.995_322_3).abs() < 2e-7);
+    }
+
+    #[test]
+    fn vector_gelu_stays_close_to_scalar_formula() {
+        let input = (0..1025)
+            .map(|index| index as f32 * (16.0 / 1024.0) - 8.0)
+            .collect::<Vec<_>>();
+        let expected = input
+            .iter()
+            .map(|value| UnaryOperation::Gelu.apply(*value))
+            .collect::<Vec<_>>();
+        let mut actual = input;
+        unary_in_place(&mut actual, UnaryOperation::Gelu);
+        let maximum_error = actual
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(maximum_error < 2.0e-5, "maximum error: {maximum_error}");
     }
 
     #[test]
@@ -1176,10 +1281,69 @@ mod tests {
     }
 
     #[test]
+    fn depthwise_stride2_matches_scalar_reference() {
+        for (height, width) in [
+            (2usize, 3usize),
+            (9, 17),
+            (9, 18),
+            (9, 33),
+            (9, 34),
+            (9, 37),
+            (10, 38),
+            (47, 92),
+        ] {
+            let input = (0..height * width)
+                .map(|index| ((index * 17 % 43) as f32 - 21.0) / 13.0)
+                .collect::<Vec<_>>();
+            let weights = (0..9)
+                .map(|index| ((index * 11 % 31) as f32 - 15.0) / 19.0)
+                .collect::<Vec<_>>();
+            let bias = -0.375;
+            let output_height = height.div_ceil(2);
+            let output_width = width.div_ceil(2);
+            let mut expected = vec![0.0; output_height * output_width];
+            for output_y in 0..output_height {
+                for output_x in 0..output_width {
+                    let mut sum = bias;
+                    for kernel_y in 0..3 {
+                        let input_y = output_y * 2 + kernel_y;
+                        if input_y == 0 || input_y > height {
+                            continue;
+                        }
+                        for kernel_x in 0..3 {
+                            let input_x = output_x * 2 + kernel_x;
+                            if input_x == 0 || input_x > width {
+                                continue;
+                            }
+                            sum = input[(input_y - 1) * width + input_x - 1]
+                                .mul_add(weights[kernel_y * 3 + kernel_x], sum);
+                        }
+                    }
+                    expected[output_y * output_width + output_x] = sum;
+                }
+            }
+            let mut actual = vec![0.0; expected.len()];
+            depthwise_conv2d_same_3x3_stride2(&mut actual, &input, &weights, height, width, bias);
+            assert_eq!(actual, expected, "shape={height}x{width}");
+        }
+    }
+
+    #[test]
     fn softmax_is_normalized_and_ordered() {
-        let mut values = [-3.0, 0.5, 2.0, -0.25, 1.0, 0.0, -1.0];
+        let input = [-3.0, 0.5, 2.0, -0.25, 1.0, 0.0, -1.0];
+        let maximum = input.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut expected = input.map(|value| (value - maximum).exp());
+        let sum = expected.iter().sum::<f32>();
+        expected.iter_mut().for_each(|value| *value /= sum);
+        let mut values = input;
         softmax_in_place(&mut values);
         assert!((values.iter().sum::<f32>() - 1.0).abs() < 2e-6);
+        assert!(
+            values
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| (*actual - expected).abs() < 2e-6)
+        );
         assert_eq!(
             values
                 .iter()
@@ -1188,6 +1352,21 @@ mod tests {
                 .map(|(index, _)| index),
             Some(2)
         );
+    }
+
+    #[test]
+    fn fused_bias_softmax_matches_separate_operations() {
+        let mut expected = (0..37)
+            .map(|index| ((index * 17 % 43) as f32 - 21.0) / 13.0)
+            .collect::<Vec<_>>();
+        let bias = (0..37)
+            .map(|index| ((index * 11 % 31) as f32 - 15.0) / 19.0)
+            .collect::<Vec<_>>();
+        let mut actual = expected.clone();
+        add_in_place(&mut expected, &bias);
+        softmax_in_place(&mut expected);
+        bias_softmax_in_place(&mut actual, &bias);
+        assert_eq!(actual, expected);
     }
 
     #[test]

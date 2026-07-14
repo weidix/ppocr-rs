@@ -59,6 +59,7 @@ pub(crate) struct ConvOptions {
     pub groups: usize,
     pub packed_pointwise: bool,
     pub system_dense_pointwise: bool,
+    pub system_dense_spatial: bool,
     pub exact_sparse_weights: Option<ExactSparseConvWeights>,
 }
 
@@ -451,6 +452,35 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
         ));
     }
 
+    if options.system_dense_spatial {
+        let patch_size = input_channels * kernel_height * kernel_width;
+        for batch_index in 0..batch {
+            conv_im2col_system_tiled(
+                &mut output[batch_index * output_channels * output_plane
+                    ..(batch_index + 1) * output_channels * output_plane],
+                &input[batch_index * input_channels * input_plane
+                    ..(batch_index + 1) * input_channels * input_plane],
+                weight,
+                bias,
+                input_channels,
+                input_height,
+                input_width,
+                output_channels,
+                output_height,
+                output_width,
+                kernel_height,
+                kernel_width,
+                patch_size,
+                options,
+                gelu,
+            );
+        }
+        return Ok(Tensor::new_f32(
+            vec![batch, output_channels, output_height, output_width],
+            output,
+        ));
+    }
+
     if options.groups == 1
         && options.strides != [1, 1]
         && !((kernel_height != 1 || kernel_width != 1)
@@ -589,6 +619,38 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
         ));
     }
 
+    if options.groups == input_channels
+        && output_channels == input_channels
+        && channels_per_group == 1
+        && options.strides == [2, 2]
+        && kernel_height == 3
+        && kernel_width == 3
+        && options.pads == [1; 4]
+    {
+        output.par_chunks_mut(output_plane).enumerate().for_each(
+            |(plane_index, output_plane_values)| {
+                let output_channel = plane_index % output_channels;
+                let input_base = plane_index * input_plane;
+                let weight_base = output_channel * 9;
+                kernels::depthwise_conv2d_same_3x3_stride2(
+                    output_plane_values,
+                    &input[input_base..input_base + input_plane],
+                    &weight[weight_base..weight_base + 9],
+                    input_height,
+                    input_width,
+                    bias.map_or(0.0, |bias| bias[output_channel]),
+                );
+            },
+        );
+        if gelu {
+            kernels::unary_in_place(&mut output, UnaryOperation::Gelu);
+        }
+        return Ok(Tensor::new_f32(
+            vec![batch, output_channels, output_height, output_width],
+            output,
+        ));
+    }
+
     output.par_chunks_mut(output_plane).enumerate().for_each(
         |(plane_index, output_plane_values)| {
             let batch_index = plane_index / output_channels;
@@ -690,6 +752,133 @@ fn conv(inputs: Vec<Tensor>, options: &ConvOptions, gelu: bool) -> Result<Tensor
         vec![batch, output_channels, output_height, output_width],
         output,
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv_im2col_system_tiled(
+    output: &mut [f32],
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    input_channels: usize,
+    input_height: usize,
+    input_width: usize,
+    output_channels: usize,
+    output_height: usize,
+    output_width: usize,
+    kernel_height: usize,
+    kernel_width: usize,
+    patch_size: usize,
+    options: &ConvOptions,
+    gelu: bool,
+) {
+    const TARGET_COLUMN_ELEMENTS: usize = 4 * 1024 * 1024;
+
+    let output_plane = output_height * output_width;
+    let rows_per_tile =
+        (TARGET_COLUMN_ELEMENTS / (patch_size * output_width)).clamp(1, output_height);
+    let maximum_tile_plane = rows_per_tile * output_width;
+    let mut columns = vec![0.0; patch_size * maximum_tile_plane];
+    let mut tile_output = vec![0.0; output_channels * maximum_tile_plane];
+    for output_y_start in (0..output_height).step_by(rows_per_tile) {
+        let tile_rows = (output_height - output_y_start).min(rows_per_tile);
+        let tile_plane = tile_rows * output_width;
+        let columns = &mut columns[..patch_size * tile_plane];
+        im2col_tile(
+            columns,
+            input,
+            input_channels,
+            input_height,
+            input_width,
+            kernel_height,
+            kernel_width,
+            output_y_start,
+            tile_rows,
+            output_width,
+            options,
+        );
+        let tile_output = &mut tile_output[..output_channels * tile_plane];
+        kernels::gemm_system_dense(
+            tile_output,
+            weight,
+            columns,
+            output_channels,
+            patch_size,
+            tile_plane,
+            bias,
+            gelu,
+        );
+        output
+            .par_chunks_mut(output_plane)
+            .zip(tile_output.par_chunks(tile_plane))
+            .for_each(|(output, tile)| {
+                let start = output_y_start * output_width;
+                output[start..start + tile_plane].copy_from_slice(tile);
+            });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn im2col_tile(
+    columns: &mut [f32],
+    input: &[f32],
+    input_channels: usize,
+    input_height: usize,
+    input_width: usize,
+    kernel_height: usize,
+    kernel_width: usize,
+    output_y_start: usize,
+    output_rows: usize,
+    output_width: usize,
+    options: &ConvOptions,
+) {
+    let input_plane = input_height * input_width;
+    let tile_plane = output_rows * output_width;
+    debug_assert_eq!(
+        columns.len(),
+        input_channels * kernel_height * kernel_width * tile_plane
+    );
+    columns
+        .par_chunks_mut(tile_plane)
+        .enumerate()
+        .for_each(|(patch_index, output)| {
+            output.fill(0.0);
+            let kernel_x = patch_index % kernel_width;
+            let patch = patch_index / kernel_width;
+            let kernel_y = patch % kernel_height;
+            let channel = patch / kernel_height;
+            let input = &input[channel * input_plane..(channel + 1) * input_plane];
+            for local_y in 0..output_rows {
+                let input_y = (output_y_start + local_y) * options.strides[0] + kernel_y;
+                if input_y < options.pads[0] || input_y - options.pads[0] >= input_height {
+                    continue;
+                }
+                let input_y = input_y - options.pads[0];
+                let output_row = &mut output[local_y * output_width..(local_y + 1) * output_width];
+                if options.strides[1] == 1 {
+                    let output_x_start = options.pads[1].saturating_sub(kernel_x);
+                    let output_x_end = output_width.min(
+                        input_width
+                            .saturating_add(options.pads[1])
+                            .saturating_sub(kernel_x),
+                    );
+                    if output_x_start < output_x_end {
+                        let input_x = output_x_start + kernel_x - options.pads[1];
+                        let len = output_x_end - output_x_start;
+                        let source = input_y * input_width + input_x;
+                        output_row[output_x_start..output_x_end]
+                            .copy_from_slice(&input[source..source + len]);
+                    }
+                } else {
+                    for (output_x, destination) in output_row.iter_mut().enumerate() {
+                        let input_x = output_x * options.strides[1] + kernel_x;
+                        if input_x >= options.pads[1] && input_x - options.pads[1] < input_width {
+                            *destination = input[input_y * input_width + input_x - options.pads[1]];
+                        }
+                    }
+                }
+            }
+        });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1806,8 +1995,7 @@ fn bias_softmax(mut inputs: Vec<Tensor>, axis: i64) -> Result<Tensor> {
         .f32_mut()?
         .par_chunks_mut(axis_len)
         .for_each(|values| {
-            kernels::add_in_place(values, bias);
-            kernels::softmax_in_place(values);
+            kernels::bias_softmax_in_place(values, bias);
         });
     Ok(input)
 }

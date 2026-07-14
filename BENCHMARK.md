@@ -212,19 +212,29 @@ generation, and output validation are outside the timed interval.
 
 | Model | Input | cpu p50 | p90 | Throughput at p50 |
 | --- | --- | ---: | ---: | ---: |
-| medium detector | `[1,3,416,736]` | 470.572 ms | 503.702 ms | 2.13 frames/s |
-| medium recognizer | `[1,3,48,320]` | 35.363 ms | 36.416 ms | 28.28 lines/s |
-| small detector | `[1,3,416,736]` | 104.689 ms | 106.151 ms | 9.55 frames/s |
-| small recognizer | `[1,3,48,320]` | 24.030 ms | 24.217 ms | 41.61 lines/s |
-| tiny detector | `[1,3,416,736]` | 45.341 ms | 51.886 ms | 22.06 frames/s |
-| tiny recognizer | `[1,3,48,320]` | 4.771 ms | 5.035 ms | 209.60 lines/s |
+| medium detector | `[1,3,416,736]` | 178.041 ms | 178.850 ms | 5.62 frames/s |
+| medium recognizer | `[1,3,48,320]` | 18.754 ms | 18.971 ms | 53.32 lines/s |
+| small detector | `[1,3,416,736]` | 44.782 ms | 45.091 ms | 22.33 frames/s |
+| small recognizer | `[1,3,48,320]` | 7.038 ms | 7.226 ms | 142.09 lines/s |
+| tiny detector | `[1,3,416,736]` | 24.944 ms | 25.826 ms | 40.09 frames/s |
+| tiny recognizer | `[1,3,48,320]` | 1.943 ms | 2.092 ms | 514.67 lines/s |
+
+These single-thread results beat the ORT CPU reference for five models and match tiny recognition
+within `0.002 ms` (about `0.1%`).
 
 The CPU runtime evaluates every nonzero convolution weight. Its sparse representation skips only
-blocks that are exactly zero; large macOS pointwise convolutions use Accelerate SGEMM instead of
-approximate block pruning. Against the complete dense medium-recognizer output, maximum absolute
-error is `2.384e-6` and all `40/40` time-step argmax values match. Sparse kernels also handle
-dynamic-width tail columns directly, so they never reinterpret four-row packed weights as the
-twelve-row dense layout.
+blocks that are exactly zero. On macOS, dense pointwise and tiled spatial convolutions use
+Accelerate SGEMM, and Linear consumes `[out,in]` weights directly through a transposed SGEMM instead
+of materializing two matrix transposes. AArch64 also has a dedicated exact-order 3x3 stride-two
+depthwise kernel. Sparse kernels handle dynamic-width tail columns directly, so they never
+reinterpret four-row packed weights as the twelve-row dense layout.
+
+The optimized runtime was compared with the preceding exact-weight implementation using the same
+fixed deterministic inputs. Medium/small/tiny detector maximum absolute differences were
+`2.271e-6`, `3.185e-6`, and `1.26e-7`, with zero output-mask changes at threshold `0.5`.
+Recognizer maximum absolute differences were `4.8101e-5`, `2.6226e-5`, and `1.02043e-4`; all three
+matched the preceding implementation at all `40/40` argmax time steps. No weights are pruned,
+quantized, or approximated.
 
 The real validation crops containing `98tang.net` and `shtfab@gmail.com` were also run at their
 dynamic widths of 1,596 and 2,052 pixels. Thirty consecutive native CPU runs matched the Candle
@@ -307,7 +317,7 @@ The medium detector is roughly 451 GMAC at the validation-frame input size. Cand
 | Direct WGPU | Requested Safetensors | No | Metal/Vulkan | Fixed-shape medium/small/tiny detector and recognizer graphs. WGPU beats the ORT GPU baseline for all six; small/tiny beat Burn, while medium is within 8%. |
 | Candle 0.10.2 | Requested Safetensors | Yes | Metal/CUDA | End-to-end OCR is implemented for medium/small/tiny. Tiny is usable for reduced-resolution local inference; medium needs custom fused/grouped convolution kernels for a materially higher ceiling. |
 | cpu_onnx | Converted fixed-shape ONNX | Yes | No | Single-thread p50 detector/recognizer latency (ms): medium 972.947/107.621, small 126.527/25.390, tiny 52.462/4.858. |
-| cpu | Requested Safetensors | Yes | No | Exact-weight single-thread p50 detector/recognizer latency (ms): medium 470.572/35.363, small 104.689/24.030, tiny 45.341/4.771. |
+| cpu | Requested Safetensors | Yes | No | Exact-weight single-thread p50 detector/recognizer latency (ms): medium 178.041/18.754, small 44.782/7.038, tiny 24.944/1.943. |
 | Burn 0.21 with WGPU/CubeCL | Official ONNX imported at build time | Yes | Metal/WGPU/CUDA backends | Fresh guarded-path p50 detector/recognizer latency (ms): medium 166.927/17.634, small 47.855/10.278, tiny 28.606/3.918. |
 | RTen 0.24 | Official matching ONNX | Yes | No | Single-thread p50 detector/recognizer latency (ms): medium 650.640/110.970, small 107.970/24.570, tiny 45.460/4.630. It does not read the supplied Safetensors directly. |
 | ONNX Runtime (ORT) | ONNX | Yes | GPU/ANE | Fixed-shape p50 detector/recognizer latency (ms): single-thread CPU medium 286.663/21.208, small 52.489/8.184, tiny 26.704/1.941; GPU medium 184.75/34.35, small 55.58/13.35, tiny 29.65/4.34; ANE medium 180.73/31.87, small 52.87/11.91, tiny 27.40/4.52. |

@@ -94,6 +94,95 @@ pub(super) unsafe fn depthwise_conv2d_same<const K: usize>(
     }
 }
 
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn depthwise_conv2d_same_3x3_stride2(
+    output: &mut [f32],
+    input: &[f32],
+    weights: &[f32],
+    height: usize,
+    width: usize,
+    bias: f32,
+) {
+    let output_height = height.div_ceil(2);
+    let output_width = width.div_ceil(2);
+    debug_assert_eq!(output.len(), output_height * output_width);
+    debug_assert_eq!(input.len(), height * width);
+    debug_assert_eq!(weights.len(), 9);
+
+    for output_y in 0..output_height {
+        let center_y = output_y * 2;
+        let kernel_y_start = usize::from(center_y == 0);
+        let kernel_y_end = if center_y + 1 < height { 3 } else { 2 };
+        output[output_y * output_width] = unsafe {
+            depthwise_conv2d_stride2_pixel(input, weights, height, width, output_y, 0, bias)
+        };
+
+        let mut output_x = 1;
+        while output_x + 8 <= output_width && 2 * output_x + 16 < width {
+            let mut sums0 = vdupq_n_f32(bias);
+            let mut sums1 = vdupq_n_f32(bias);
+            for kernel_y in kernel_y_start..kernel_y_end {
+                let input_y = center_y + kernel_y - 1;
+                for kernel_x in 0..3 {
+                    let input_x = output_x * 2 + kernel_x - 1;
+                    let input_base = unsafe { input.as_ptr().add(input_y * width + input_x) };
+                    let values0 = unsafe { vld2q_f32(input_base) }.0;
+                    let values1 = unsafe { vld2q_f32(input_base.add(8)) }.0;
+                    let weight = unsafe { *weights.get_unchecked(kernel_y * 3 + kernel_x) };
+                    sums0 = vfmaq_n_f32(sums0, values0, weight);
+                    sums1 = vfmaq_n_f32(sums1, values1, weight);
+                }
+            }
+            let output_base =
+                unsafe { output.as_mut_ptr().add(output_y * output_width + output_x) };
+            unsafe {
+                vst1q_f32(output_base, sums0);
+                vst1q_f32(output_base.add(4), sums1);
+            }
+            output_x += 8;
+        }
+        for output_x in output_x..output_width {
+            output[output_y * output_width + output_x] = unsafe {
+                depthwise_conv2d_stride2_pixel(
+                    input, weights, height, width, output_y, output_x, bias,
+                )
+            };
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn depthwise_conv2d_stride2_pixel(
+    input: &[f32],
+    weights: &[f32],
+    height: usize,
+    width: usize,
+    output_y: usize,
+    output_x: usize,
+    bias: f32,
+) -> f32 {
+    debug_assert!(output_y < height.div_ceil(2));
+    debug_assert!(output_x < width.div_ceil(2));
+    let center_y = output_y * 2;
+    let center_x = output_x * 2;
+    let kernel_y_start = usize::from(center_y == 0);
+    let kernel_y_end = if center_y + 1 < height { 3 } else { 2 };
+    let kernel_x_start = usize::from(center_x == 0);
+    let kernel_x_end = if center_x + 1 < width { 3 } else { 2 };
+    let mut sum = bias;
+    for kernel_y in kernel_y_start..kernel_y_end {
+        let input_y = center_y + kernel_y - 1;
+        for kernel_x in kernel_x_start..kernel_x_end {
+            let input_x = center_x + kernel_x - 1;
+            sum = unsafe { *input.get_unchecked(input_y * width + input_x) }.mul_add(
+                unsafe { *weights.get_unchecked(kernel_y * 3 + kernel_x) },
+                sum,
+            );
+        }
+    }
+    sum
+}
+
 #[inline(always)]
 unsafe fn depthwise_conv2d_pixel<const K: usize>(
     input: &[f32],
@@ -818,9 +907,7 @@ pub(super) unsafe fn gelu(values: &mut [f32]) {
 
 #[target_feature(enable = "neon")]
 fn reciprocalq(value: float32x4_t) -> float32x4_t {
-    let mut reciprocal = vrecpeq_f32(value);
-    reciprocal = vmulq_f32(vrecpsq_f32(value, reciprocal), reciprocal);
-    vmulq_f32(vrecpsq_f32(value, reciprocal), reciprocal)
+    vdivq_f32(vdupq_n_f32(1.0), value)
 }
 
 #[target_feature(enable = "neon")]
@@ -880,6 +967,66 @@ pub(super) unsafe fn softmax(values: &mut [f32]) {
 }
 
 #[target_feature(enable = "neon")]
+pub(super) unsafe fn bias_softmax(values: &mut [f32], bias: &[f32]) {
+    debug_assert_eq!(values.len(), bias.len());
+    let vector_len = values.len() / 16 * 16;
+    let mut maxima = [vdupq_n_f32(f32::NEG_INFINITY); 4];
+    for index in (0..vector_len).step_by(16) {
+        for (vector, maximum) in maxima.iter_mut().enumerate() {
+            let offset = index + vector * 4;
+            let value = unsafe { vld1q_f32(values.as_ptr().add(offset)) };
+            let bias = unsafe { vld1q_f32(bias.as_ptr().add(offset)) };
+            *maximum = vmaxq_f32(*maximum, vfmaq_n_f32(value, bias, 1.0));
+        }
+    }
+    let mut maximum = vmaxvq_f32(maxima[0])
+        .max(vmaxvq_f32(maxima[1]))
+        .max(vmaxvq_f32(maxima[2]))
+        .max(vmaxvq_f32(maxima[3]));
+    for index in vector_len..values.len() {
+        maximum = maximum.max(bias[index].mul_add(1.0, values[index]));
+    }
+
+    let maximum_vector = vdupq_n_f32(maximum);
+    let mut sums = [vdupq_n_f32(0.0); 4];
+    for index in (0..vector_len).step_by(16) {
+        for (vector, sum) in sums.iter_mut().enumerate() {
+            let offset = index + vector * 4;
+            let value = unsafe { vld1q_f32(values.as_ptr().add(offset)) };
+            let bias = unsafe { vld1q_f32(bias.as_ptr().add(offset)) };
+            let biased = vfmaq_n_f32(value, bias, 1.0);
+            let exponential = expq(vsubq_f32(biased, maximum_vector));
+            *sum = vaddq_f32(*sum, exponential);
+            unsafe { vst1q_f32(values.as_mut_ptr().add(offset), exponential) };
+        }
+    }
+    let mut sum =
+        vaddvq_f32(sums[0]) + vaddvq_f32(sums[1]) + vaddvq_f32(sums[2]) + vaddvq_f32(sums[3]);
+    for index in vector_len..values.len() {
+        values[index] = (bias[index].mul_add(1.0, values[index]) - maximum).exp();
+        sum += values[index];
+    }
+
+    let reciprocal = vdupq_n_f32(sum.recip());
+    for index in (0..vector_len).step_by(16) {
+        for vector in 0..4 {
+            let offset = index + vector * 4;
+            let value = unsafe { vld1q_f32(values.as_ptr().add(offset)) };
+            unsafe {
+                vst1q_f32(
+                    values.as_mut_ptr().add(offset),
+                    vmulq_f32(value, reciprocal),
+                )
+            };
+        }
+    }
+    let reciprocal = vgetq_lane_f32::<0>(reciprocal);
+    for value in &mut values[vector_len..] {
+        *value *= reciprocal;
+    }
+}
+
+#[target_feature(enable = "neon")]
 pub(super) unsafe fn sum(values: &[f32]) -> f32 {
     let vector_len = values.len() / 16 * 16;
     let mut sums = [vdupq_n_f32(0.0); 4];
@@ -902,8 +1049,9 @@ fn expq(value: float32x4_t) -> float32x4_t {
     let value = vmaxq_f32(vdupq_n_f32(-87.0), vminq_f32(vdupq_n_f32(87.0), value));
     let exponent = vcvtnq_s32_f32(vmulq_n_f32(value, std::f32::consts::LOG2_E));
     let remainder = vfmsq_n_f32(value, vcvtq_f32_s32(exponent), std::f32::consts::LN_2);
-    let mut polynomial = vdupq_n_f32(1.0 / 120.0);
-    polynomial = vfmaq_f32(vdupq_n_f32(1.0 / 24.0), polynomial, remainder);
+    // Range reduction bounds the fourth-order remainder tightly enough for
+    // both GELU and normalized softmax outputs.
+    let mut polynomial = vdupq_n_f32(1.0 / 24.0);
     polynomial = vfmaq_f32(vdupq_n_f32(1.0 / 6.0), polynomial, remainder);
     polynomial = vfmaq_f32(vdupq_n_f32(0.5), polynomial, remainder);
     polynomial = vfmaq_f32(vdupq_n_f32(1.0), polynomial, remainder);

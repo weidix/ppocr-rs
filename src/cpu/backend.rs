@@ -338,13 +338,22 @@ impl Conv2d {
             )
         })
         .flatten();
-        let system_dense_pointwise =
-            cfg!(target_os = "macos") && sparse_pointwise && strides == [1, 1] && pads == [0; 4];
+        let system_dense_pointwise = cfg!(target_os = "macos")
+            && groups == 1
+            && kernel_height == 1
+            && kernel_width == 1
+            && strides == [1, 1]
+            && pads == [0; 4];
+        let system_dense_spatial = cfg!(target_os = "macos")
+            && groups == 1
+            && (kernel_height != 1 || kernel_width != 1)
+            && exact_sparse_weights.is_none();
         let packed_pointwise = groups == 1
             && ((kernel_height == 1 && kernel_width == 1)
                 || (strides != [1, 1] && output_channels >= 48)
                 || tiled_spatial)
-            && !system_dense_pointwise;
+            && !system_dense_pointwise
+            && !system_dense_spatial;
         let weight = if packed_pointwise {
             if tiled_spatial || exact_sparse_weights.is_some() {
                 pack_conv_rows(weight, output_channels, 4)?
@@ -363,6 +372,7 @@ impl Conv2d {
                 groups,
                 packed_pointwise,
                 system_dense_pointwise,
+                system_dense_spatial,
                 exact_sparse_weights,
             },
         })
@@ -461,6 +471,7 @@ impl ConvTranspose2d {
                 groups,
                 packed_pointwise: false,
                 system_dense_pointwise: false,
+                system_dense_spatial: false,
                 exact_sparse_weights: None,
             },
         })
@@ -529,9 +540,9 @@ impl LayerNorm {
 
 #[derive(Clone)]
 pub(crate) struct Linear {
-    // Safetensors stores Linear weights as [out, in]. Keep that orientation and
-    // interleave blocks of output rows for the packed-left GEMM kernels.
-    packed_weight: Tensor,
+    // Accelerate consumes the native [out, in] layout directly. Other targets
+    // interleave output rows for the packed-left kernels.
+    weight: Tensor,
     input_features: usize,
     output_features: usize,
     bias: Option<Tensor>,
@@ -555,9 +566,10 @@ impl Linear {
                 "Linear bias length does not match output features"
             );
         }
-        let packed_weight = pack_conv_rows(weight, output_features, 12)?;
+        #[cfg(not(target_os = "macos"))]
+        let weight = pack_conv_rows(weight, output_features, 12)?;
         Ok(Self {
-            packed_weight,
+            weight,
             input_features,
             output_features,
             bias,
@@ -593,27 +605,50 @@ impl Linear {
             return Ok(Tensor::new_f32(output_shape, Vec::new()));
         }
 
+        #[cfg(target_os = "macos")]
+        {
+            let mut output = vec![0.0; output_len];
+            kernels::linear_system_dense(
+                &mut output,
+                input.as_f32()?,
+                self.weight.as_f32()?,
+                rows,
+                self.input_features,
+                self.output_features,
+                self.bias.as_ref().map(Tensor::as_f32).transpose()?,
+                apply_softmax,
+            );
+            Ok(Tensor::new_f32(output_shape, output))
+        }
+
+        #[cfg(not(target_os = "macos"))]
         let transposed_input = transpose_matrix(input.as_f32()?, rows, self.input_features);
+        #[cfg(not(target_os = "macos"))]
         let mut transposed_output = vec![0.0; output_len];
+        #[cfg(not(target_os = "macos"))]
         kernels::gemm_packed_left(
             &mut transposed_output,
-            self.packed_weight.as_f32()?,
+            self.weight.as_f32()?,
             &transposed_input,
             self.output_features,
             self.input_features,
             rows,
             self.bias.as_ref().map(Tensor::as_f32).transpose()?,
         );
+        #[cfg(not(target_os = "macos"))]
         let mut output = transpose_matrix(&transposed_output, self.output_features, rows);
+        #[cfg(not(target_os = "macos"))]
         if apply_softmax {
             output
                 .par_chunks_mut(self.output_features)
                 .for_each(kernels::softmax_in_place);
         }
+        #[cfg(not(target_os = "macos"))]
         Ok(Tensor::new_f32(output_shape, output))
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn transpose_matrix(input: &[f32], rows: usize, columns: usize) -> Vec<f32> {
     assert_eq!(rows.checked_mul(columns), Some(input.len()));
     let mut output = vec![0.0; input.len()];
