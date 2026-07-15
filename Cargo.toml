@@ -2,12 +2,10 @@
 name = "ppocr-rs"
 version = "0.1.0"
 edition = "2024"
-build = "build.rs"
 autobins = false
-default-run = "ppocr-rs"
 
 [features]
-default = ["candle-metal"]
+default = ["cpu"]
 
 # Direct PP-OCRv6 Safetensors inference through native CPU kernels or WGPU.
 cpu = ["dep:rayon", "dep:safetensors"]
@@ -16,54 +14,12 @@ cpu = ["dep:rayon", "dep:safetensors"]
 cpu-profile = ["cpu"]
 gpu = ["dep:safetensors", "dep:wgpu"]
 
-# Self-contained CPU inference. ONNX decoding is isolated to the offline
-# converter; deployed inference only needs the packed model and CPU kernels.
-cpu_onnx = ["dep:rayon"]
-cpu_onnx-convert = ["cpu_onnx", "dep:rten-onnx"]
-
-# Direct PP-OCRv6 Safetensors inference.
-candle = ["dep:candle-core", "dep:candle-nn"]
-candle-metal = ["candle", "candle-core/metal", "candle-nn/metal"]
-candle-cuda = ["candle", "candle-core/cuda", "candle-nn/cuda"]
-candle-cudnn = ["candle-cuda", "candle-core/cudnn", "candle-nn/cudnn"]
-candle-mkl = ["candle", "candle-core/mkl", "candle-nn/mkl"]
-candle-accelerate = ["candle", "candle-core/accelerate", "candle-nn/accelerate"]
-
-# The migrated Candle CRNN trainer. It deliberately remains separate from
-# the PP-OCRv6 inference model because their checkpoint formats differ.
-training = ["candle", "dep:candle-optimisers", "dep:clap", "dep:rand"]
-
-# Burn is opt-in so its WGPU/CubeCL dependency graph does not affect Candle
-# consumers. ONNX model generation is isolated to the Burn inference features.
-onnx-tools = ["dep:onnx-ir", "dep:protobuf"]
-burn = ["dep:burn", "dep:burn-store"]
-burn-metal = ["burn", "burn/metal", "burn/fusion"]
-burn-autotune = ["burn-metal", "burn/autotune"]
-burn-infer = [
-    "burn-metal",
-    "dep:burn-onnx",
-    "dep:onnx-ir-build",
-    "dep:protobuf-build",
-]
-burn-bench = ["burn-infer"]
-
 [dependencies]
 anyhow = "1.0"
-burn = { version = "=0.21.0", optional = true, default-features = false, features = ["std"] }
-burn-store = { version = "=0.21.0", optional = true, default-features = false, features = ["std", "burnpack"] }
-candle-core = { version = "=0.10.2", optional = true }
-candle-nn = { version = "=0.10.2", optional = true }
-candle-optimisers = { version = "=0.10.2", optional = true }
-clap = { version = "4.5", optional = true, features = ["derive"] }
 image = { version = "0.25.9", default-features = false, features = ["jpeg", "png"] }
-onnx-ir = { version = "=0.21.0", optional = true }
-protobuf = { version = "=3.7.2", optional = true }
-rand = { version = "0.8", optional = true }
 rayon = { version = "1.11", optional = true }
-rten-onnx = { version = "=0.24.0", optional = true }
 safetensors = { version = "=0.7.0", optional = true, default-features = false, features = ["std"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 wgpu = { version = "=29.0.4", optional = true, default-features = false, features = ["std", "wgsl", "metal"] }
@@ -71,56 +27,9 @@ wgpu = { version = "=29.0.4", optional = true, default-features = false, feature
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 wgpu = { version = "=29.0.4", optional = true, default-features = false, features = ["std", "wgsl", "vulkan"] }
 
-[build-dependencies]
-burn-onnx = { version = "=0.21.0", optional = true }
-onnx-ir-build = { package = "onnx-ir", version = "=0.21.0", optional = true }
-protobuf-build = { package = "protobuf", version = "=3.7.2", optional = true }
-
-[patch.crates-io]
-burn-cubecl = { path = "vendor/burn-cubecl" }
-
 [profile.release]
 lto = "thin"
 codegen-units = 1
-
-[[bin]]
-name = "ppocr-rs"
-path = "src/main.rs"
-required-features = ["candle"]
-
-[[bin]]
-name = "ppocr-burn-bench"
-path = "src/bin/ppocr-burn-bench.rs"
-required-features = ["burn-bench"]
-test = false
-bench = false
-
-[[bin]]
-name = "ppocr-burn"
-path = "src/bin/ppocr-burn.rs"
-required-features = ["burn-infer"]
-test = false
-bench = false
-
-[[bin]]
-name = "ppocr-onnx-staticize"
-path = "src/bin/ppocr-onnx-staticize.rs"
-required-features = ["onnx-tools"]
-
-[[bin]]
-name = "ppocr-cpu-onnx-inspect"
-path = "src/bin/ppocr-cpu-onnx-inspect.rs"
-required-features = ["cpu_onnx-convert"]
-
-[[bin]]
-name = "ppocr-cpu-onnx-convert"
-path = "src/bin/ppocr-cpu-onnx-convert.rs"
-required-features = ["cpu_onnx-convert"]
-
-[[bin]]
-name = "ppocr-cpu-onnx-bench"
-path = "src/bin/ppocr-cpu-onnx-bench.rs"
-required-features = ["cpu_onnx"]
 
 [[bin]]
 name = "ppocr-cpu-bench"
@@ -131,8 +40,3 @@ required-features = ["cpu"]
 name = "ppocr-gpu-bench"
 path = "src/bin/ppocr-gpu-bench.rs"
 required-features = ["gpu"]
-
-[[bin]]
-name = "ppocr-candle-train"
-path = "src/bin/ppocr-candle-train.rs"
-required-features = ["training"]
