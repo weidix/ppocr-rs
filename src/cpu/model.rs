@@ -1414,7 +1414,7 @@ fn upsample_and_cat_nchw(features: &[Tensor], scales: &[usize]) -> Result<Tensor
     let output_len = batch
         .checked_mul(output_batch)
         .context("upsample-cat output length overflow")?;
-    let mut output = Buffer::zeroed(output_len);
+    let mut output = Buffer::for_overwrite(output_len);
 
     for batch_index in 0..batch {
         let mut output_channel = 0usize;

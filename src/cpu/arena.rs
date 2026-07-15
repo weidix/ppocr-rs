@@ -129,8 +129,7 @@ impl ArenaInner {
         Vec::with_capacity(bucket_ceiling)
     }
 
-    fn recycle(&self, mut buffer: Vec<f32>) {
-        buffer.clear();
+    fn recycle(&self, buffer: Vec<f32>) {
         let capacity = buffer.capacity();
         let Some(bytes) = capacity.checked_mul(size_of::<f32>()) else {
             return;
@@ -175,6 +174,10 @@ impl Handle {
     pub(crate) fn zeroed(&self, len: usize) -> Buffer {
         Buffer::zeroed_with(self.arena.clone(), len)
     }
+
+    pub(crate) fn for_overwrite(&self, len: usize) -> Buffer {
+        Buffer::for_overwrite_with(self.arena.clone(), len)
+    }
 }
 
 impl Buffer {
@@ -188,6 +191,27 @@ impl Buffer {
             .and_then(Weak::upgrade)
             .map_or_else(|| Vec::with_capacity(len), |arena| arena.take(len));
         values.resize(len, 0.0);
+        values.fill(0.0);
+        Self {
+            values: Some(values),
+            arena,
+        }
+    }
+
+    /// Returns initialized storage whose previous values are unspecified.
+    ///
+    /// This avoids clearing a recycled allocation. Callers must overwrite every
+    /// element that can be observed before constructing an output tensor.
+    pub(crate) fn for_overwrite(len: usize) -> Self {
+        Self::for_overwrite_with(active_arena(), len)
+    }
+
+    fn for_overwrite_with(arena: Option<Weak<ArenaInner>>, len: usize) -> Self {
+        let mut values = arena
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map_or_else(|| Vec::with_capacity(len), |arena| arena.take(len));
+        values.resize(len, 0.0);
         Self {
             values: Some(values),
             arena,
@@ -196,10 +220,11 @@ impl Buffer {
 
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         let arena = active_arena();
-        let values = arena.as_ref().and_then(Weak::upgrade).map_or_else(
+        let mut values = arena.as_ref().and_then(Weak::upgrade).map_or_else(
             || Vec::with_capacity(capacity),
             |arena| arena.take(capacity),
         );
+        values.clear();
         Self {
             values: Some(values),
             arena,
@@ -371,6 +396,26 @@ mod tests {
             drop(second);
             let reused = Buffer::zeroed(1024);
             assert_eq!(reused.as_ptr(), second_address);
+        });
+    }
+
+    #[test]
+    fn overwrite_skips_clear_but_zeroed_resets_recycled_values() {
+        let arena = InferenceArena::with_limits(64 * 1024, 64 * 1024, 4);
+        arena.scope(|| {
+            let mut first = Buffer::zeroed(1024);
+            first.fill(7.0);
+            let address = first.as_ptr();
+            drop(first);
+
+            let overwrite = Buffer::for_overwrite(1024);
+            assert_eq!(overwrite.as_ptr(), address);
+            assert!(overwrite.iter().all(|&value| value == 7.0));
+            drop(overwrite);
+
+            let zeroed = Buffer::zeroed(1024);
+            assert_eq!(zeroed.as_ptr(), address);
+            assert!(zeroed.iter().all(|&value| value == 0.0));
         });
     }
 

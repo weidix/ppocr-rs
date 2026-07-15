@@ -1497,23 +1497,36 @@ pub(super) unsafe fn gemm_6x16_packed<const SOFTWARE_PREFETCH: bool>(
         let mut sum3 = initial!(3);
         let mut sum4 = initial!(4);
         let mut sum5 = initial!(5);
+        macro_rules! k_step {
+            ($index:expr) => {{
+                let index = $index;
+                let right =
+                    unsafe { _mm256_loadu_ps(right.as_ptr().add(index * right_stride + column)) };
+                let left = unsafe { left.as_ptr().add(index * ROWS) };
+                let scale = _mm256_set1_ps(unsafe { *left });
+                sum0 = _mm256_fmadd_ps(scale, right, sum0);
+                let scale = _mm256_set1_ps(unsafe { *left.add(1) });
+                sum1 = _mm256_fmadd_ps(scale, right, sum1);
+                let scale = _mm256_set1_ps(unsafe { *left.add(2) });
+                sum2 = _mm256_fmadd_ps(scale, right, sum2);
+                let scale = _mm256_set1_ps(unsafe { *left.add(3) });
+                sum3 = _mm256_fmadd_ps(scale, right, sum3);
+                let scale = _mm256_set1_ps(unsafe { *left.add(4) });
+                sum4 = _mm256_fmadd_ps(scale, right, sum4);
+                let scale = _mm256_set1_ps(unsafe { *left.add(5) });
+                sum5 = _mm256_fmadd_ps(scale, right, sum5);
+            }};
+        }
         let mut index = 0;
+        while index + 4 <= inner {
+            k_step!(index);
+            k_step!(index + 1);
+            k_step!(index + 2);
+            k_step!(index + 3);
+            index += 4;
+        }
         while index < inner {
-            let right =
-                unsafe { _mm256_loadu_ps(right.as_ptr().add(index * right_stride + column)) };
-            let left = unsafe { left.as_ptr().add(index * ROWS) };
-            let scale = _mm256_set1_ps(unsafe { *left });
-            sum0 = _mm256_fmadd_ps(scale, right, sum0);
-            let scale = _mm256_set1_ps(unsafe { *left.add(1) });
-            sum1 = _mm256_fmadd_ps(scale, right, sum1);
-            let scale = _mm256_set1_ps(unsafe { *left.add(2) });
-            sum2 = _mm256_fmadd_ps(scale, right, sum2);
-            let scale = _mm256_set1_ps(unsafe { *left.add(3) });
-            sum3 = _mm256_fmadd_ps(scale, right, sum3);
-            let scale = _mm256_set1_ps(unsafe { *left.add(4) });
-            sum4 = _mm256_fmadd_ps(scale, right, sum4);
-            let scale = _mm256_set1_ps(unsafe { *left.add(5) });
-            sum5 = _mm256_fmadd_ps(scale, right, sum5);
+            k_step!(index);
             index += 1;
         }
         macro_rules! store {

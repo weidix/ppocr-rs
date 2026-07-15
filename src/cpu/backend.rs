@@ -1,5 +1,5 @@
 use super::{
-    arena::Buffer,
+    arena::{Buffer, Handle as ArenaHandle},
     kernels,
     ops::{ConvOptions, ExactSparseConvWeights, Node, Operation, PoolOptions},
     tensor::{IntoShape, Tensor, element_count},
@@ -373,8 +373,8 @@ impl Conv2d {
         // better use of the wide NCHW feature planes used by these models.
         let blocked_pointwise = cfg!(target_arch = "x86_64")
             && groups == 1
-            && output_channels >= 128
-            && inner >= 96
+            && output_channels >= 64
+            && inner >= 64
             && kernel_height == 1
             && kernel_width == 1
             && strides == [1, 1]
@@ -494,119 +494,201 @@ impl Conv2d {
         let first_block_rows = first_block_rows.expect("compatible packing");
         let second_block_rows = second_block_rows.expect("compatible packing");
 
-        const TILE_COLUMNS: usize = 16;
         // Small NCHW planes are already cache-resident and can be consumed
         // directly. Larger planes benefit from a compact tile before GEMM.
         const PACK_INPUT_MIN_ELEMENTS: usize = 128 * 1024;
         let pack_input = input_batch >= PACK_INPUT_MIN_ELEMENTS;
-        let mut input_tile = Buffer::zeroed(if pack_input {
-            input_channels * TILE_COLUMNS
-        } else {
-            0
-        });
-        let mut hidden_tile = Buffer::zeroed(hidden_channels * TILE_COLUMNS);
-        let mut output_tile = Buffer::zeroed(output_channels * TILE_COLUMNS);
-
         if residual {
             let mut output = input;
             let values = output.f32_mut()?;
-            for batch_index in 0..batch {
-                let batch_start = batch_index * input_batch;
-                for column_start in (0..plane).step_by(TILE_COLUMNS) {
-                    let columns = (plane - column_start).min(TILE_COLUMNS);
-                    let (first_input, first_stride) = if pack_input {
-                        for input_channel in 0..input_channels {
-                            let source = batch_start + input_channel * plane + column_start;
-                            let destination = input_channel * columns;
-                            input_tile[destination..destination + columns]
-                                .copy_from_slice(&values[source..source + columns]);
-                        }
-                        (&input_tile[..input_channels * columns], columns)
-                    } else {
-                        (&values[batch_start + column_start..], plane)
-                    };
-                    self.run_packed_pointwise_tile(
-                        &mut hidden_tile[..hidden_channels * columns],
-                        first_input,
-                        input_channels,
-                        columns,
-                        first_stride,
-                        first_block_rows,
-                        Some(kernels::UnaryOperation::Gelu),
-                    )?;
-                    second.run_packed_pointwise_tile(
-                        &mut output_tile[..output_channels * columns],
-                        &hidden_tile[..hidden_channels * columns],
-                        hidden_channels,
-                        columns,
-                        columns,
-                        second_block_rows,
-                        None,
-                    )?;
-                    for output_channel in 0..output_channels {
-                        let output_start = batch_start + output_channel * plane + column_start;
-                        let tile_start = output_channel * columns;
-                        kernels::add_in_place(
-                            &mut values[output_start..output_start + columns],
-                            &output_tile[tile_start..tile_start + columns],
-                        );
-                    }
-                }
-            }
+            self.run_pointwise_pair_tiles(
+                second,
+                values.as_ptr(),
+                values.as_mut_ptr(),
+                batch,
+                input_channels,
+                hidden_channels,
+                output_channels,
+                plane,
+                input_batch,
+                first_block_rows,
+                second_block_rows,
+                pack_input,
+                true,
+            )?;
             #[cfg(feature = "cpu-profile")]
             profile_direct("PointwisePairGelu", &output, started);
             Ok(output)
         } else {
             let input_values = input.as_f32()?;
-            let mut output_values = Buffer::zeroed(output_len);
-            for batch_index in 0..batch {
-                let input_start = batch_index * input_batch;
-                let output_start = batch_index * output_batch;
-                for column_start in (0..plane).step_by(TILE_COLUMNS) {
-                    let columns = (plane - column_start).min(TILE_COLUMNS);
-                    let (first_input, first_stride) = if pack_input {
-                        for input_channel in 0..input_channels {
-                            let source = input_start + input_channel * plane + column_start;
-                            let destination = input_channel * columns;
-                            input_tile[destination..destination + columns]
-                                .copy_from_slice(&input_values[source..source + columns]);
-                        }
-                        (&input_tile[..input_channels * columns], columns)
-                    } else {
-                        (&input_values[input_start + column_start..], plane)
-                    };
-                    self.run_packed_pointwise_tile(
-                        &mut hidden_tile[..hidden_channels * columns],
-                        first_input,
-                        input_channels,
-                        columns,
-                        first_stride,
-                        first_block_rows,
-                        Some(kernels::UnaryOperation::Gelu),
-                    )?;
-                    second.run_packed_pointwise_tile(
-                        &mut output_tile[..output_channels * columns],
-                        &hidden_tile[..hidden_channels * columns],
-                        hidden_channels,
-                        columns,
-                        columns,
-                        second_block_rows,
-                        None,
-                    )?;
-                    for output_channel in 0..output_channels {
-                        let destination = output_start + output_channel * plane + column_start;
-                        let tile_start = output_channel * columns;
-                        output_values[destination..destination + columns]
-                            .copy_from_slice(&output_tile[tile_start..tile_start + columns]);
-                    }
-                }
-            }
+            let mut output_values = Buffer::for_overwrite(output_len);
+            self.run_pointwise_pair_tiles(
+                second,
+                input_values.as_ptr(),
+                output_values.as_mut_ptr(),
+                batch,
+                input_channels,
+                hidden_channels,
+                output_channels,
+                plane,
+                input_batch,
+                first_block_rows,
+                second_block_rows,
+                pack_input,
+                false,
+            )?;
             let output =
                 Tensor::new_f32(vec![batch, output_channels, height, width], output_values);
             #[cfg(feature = "cpu-profile")]
             profile_direct("PointwisePairGelu", &output, started);
             Ok(output)
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_pointwise_pair_tiles(
+        &self,
+        second: &Self,
+        input: *const f32,
+        output: *mut f32,
+        batch: usize,
+        input_channels: usize,
+        hidden_channels: usize,
+        output_channels: usize,
+        plane: usize,
+        input_batch: usize,
+        first_block_rows: usize,
+        second_block_rows: usize,
+        pack_input: bool,
+        residual: bool,
+    ) -> Result<()> {
+        let first_weight = self.weight.as_f32()?;
+        let first_bias = self.bias.as_ref().map(Tensor::as_f32).transpose()?;
+        let second_weight = second.weight.as_f32()?;
+        let second_bias = second.bias.as_ref().map(Tensor::as_f32).transpose()?;
+        let tile_columns = if rayon::current_num_threads() == 1 && hidden_channels <= 512 {
+            32
+        } else {
+            16
+        };
+        let tiles_per_batch = plane.div_ceil(tile_columns);
+        let total_tiles = batch * tiles_per_batch;
+        let task_count = rayon::current_num_threads().min(total_tiles);
+        let tiles_per_task = total_tiles.div_ceil(task_count);
+        #[cfg(feature = "cpu-profile")]
+        eprintln!(
+            "cpu-profile pointwise-pair input_channels={input_channels} hidden_channels={hidden_channels} output_channels={output_channels} plane={plane} tile_columns={tile_columns} pack_input={pack_input}"
+        );
+        // Residual execution reuses the input allocation for output. Packing
+        // keeps parallel tasks' reads disjoint from the other tasks' in-place
+        // writes; a single task can retain the cheaper strided input view.
+        let pack_input = pack_input || (residual && task_count > 1);
+        let input_address = input as usize;
+        let output_address = output as usize;
+        let arena = ArenaHandle::current();
+
+        let run_task = |task: usize| {
+            let tile_start = task * tiles_per_task;
+            let tile_end = (tile_start + tiles_per_task).min(total_tiles);
+            let input_tile_len = if pack_input {
+                input_channels * tile_columns
+            } else {
+                0
+            };
+            let hidden_tile_len = hidden_channels * tile_columns;
+            let output_tile_len = output_channels * tile_columns;
+            let mut scratch =
+                arena.for_overwrite(input_tile_len + hidden_tile_len + output_tile_len);
+            let (input_tile, remaining) = scratch.split_at_mut(input_tile_len);
+            let (hidden_tile, output_tile) = remaining.split_at_mut(hidden_tile_len);
+
+            for tile in tile_start..tile_end {
+                let batch_index = tile / tiles_per_batch;
+                let column_start = tile % tiles_per_batch * tile_columns;
+                let columns = (plane - column_start).min(tile_columns);
+                let batch_start = batch_index * input_batch;
+                let input = input_address as *const f32;
+                let output = output_address as *mut f32;
+                let (first_input, first_stride) = if pack_input {
+                    for input_channel in 0..input_channels {
+                        let source = batch_start + input_channel * plane + column_start;
+                        let destination = input_channel * columns;
+                        // SAFETY: Every source range lies in the validated input tensor.
+                        // Scratch buffers are private to this parallel task.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                input.add(source),
+                                input_tile.as_mut_ptr().add(destination),
+                                columns,
+                            );
+                        }
+                    }
+                    (&input_tile[..input_channels * columns], columns)
+                } else {
+                    let length = (input_channels - 1) * plane + columns;
+                    // SAFETY: This view starts at the task's spatial tile and spans
+                    // the same columns in every complete NCHW input channel.
+                    (
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                input.add(batch_start + column_start),
+                                length,
+                            )
+                        },
+                        plane,
+                    )
+                };
+
+                kernels::gemm_packed_left_tile(
+                    &mut hidden_tile[..hidden_channels * columns],
+                    first_weight,
+                    first_input,
+                    hidden_channels,
+                    input_channels,
+                    columns,
+                    first_stride,
+                    first_bias,
+                    Some(kernels::UnaryOperation::Gelu),
+                    first_block_rows,
+                );
+                let output_batch = output_channels * plane;
+                kernels::gemm_packed_left_tile(
+                    &mut output_tile[..output_channels * columns],
+                    second_weight,
+                    &hidden_tile[..hidden_channels * columns],
+                    output_channels,
+                    hidden_channels,
+                    columns,
+                    columns,
+                    second_bias,
+                    None,
+                    second_block_rows,
+                );
+                for output_channel in 0..output_channels {
+                    let destination =
+                        batch_index * output_batch + output_channel * plane + column_start;
+                    let source = output_channel * columns;
+                    // SAFETY: Tasks own disjoint spatial tiles. Each range is within
+                    // one validated output channel, so parallel writes cannot overlap.
+                    unsafe {
+                        let destination =
+                            std::slice::from_raw_parts_mut(output.add(destination), columns);
+                        let source = &output_tile[source..source + columns];
+                        if residual {
+                            kernels::add_in_place(destination, source);
+                        } else {
+                            destination.copy_from_slice(source);
+                        }
+                    }
+                }
+            }
+        };
+        if task_count == 1 {
+            run_task(0);
+        } else {
+            (0..task_count).into_par_iter().for_each(run_task);
+        }
+        Ok(())
     }
 
     pub(crate) fn forward_depthwise_pointwise(
@@ -677,9 +759,9 @@ impl Conv2d {
         let tile_len = output_channels
             .checked_mul(TILE_COLUMNS)
             .context("depthwise-pointwise tile length overflow")?;
-        let mut depthwise_strip = Buffer::zeroed(strip_len);
-        let mut output_tile = Buffer::zeroed(tile_len);
-        let mut output_values = Buffer::zeroed(output_len);
+        let mut depthwise_strip = Buffer::for_overwrite(strip_len);
+        let mut output_tile = Buffer::for_overwrite(tile_len);
+        let mut output_values = Buffer::for_overwrite(output_len);
 
         for batch_index in 0..batch {
             let input_start = batch_index * input_batch;
@@ -848,7 +930,7 @@ impl Conv2d {
         let input_values = input.as_f32()?;
         let weight_values = weight.as_f32()?;
         let bias = self.bias.as_ref().map(Tensor::as_f32).transpose()?;
-        let mut output_values = Buffer::zeroed(batch * output_batch);
+        let mut output_values = Buffer::for_overwrite(batch * output_batch);
         #[cfg(feature = "cpu-profile")]
         eprintln!(
             "cpu-profile gemm=LargeConv rows={output_channels} inner={input_channels} columns={plane}"
@@ -1014,8 +1096,8 @@ impl ConvTranspose2d {
         let input_values = input.as_f32()?;
         let weight_values = weight.as_f32()?;
         let bias = self.bias.as_ref().map(Tensor::as_f32).transpose()?;
-        let mut tile = Buffer::zeroed(packed_rows * input_plane);
-        let mut output_values = Buffer::zeroed(batch * output_batch);
+        let mut tile = Buffer::for_overwrite(packed_rows * input_plane);
+        let mut output_values = Buffer::for_overwrite(batch * output_batch);
         #[cfg(feature = "cpu-profile")]
         if packed_rows > 128 {
             eprintln!(
@@ -1127,7 +1209,7 @@ impl LayerNorm {
         let bias = self.bias.as_f32()?;
         let shape = input.shape.clone();
         let input_values = input.as_f32()?;
-        let mut output = Buffer::zeroed(input_values.len());
+        let mut output = Buffer::for_overwrite(input_values.len());
         output.copy_from_slice(input_values);
         output.par_chunks_mut(features).for_each(|row| {
             kernels::layer_norm_in_place(row, weight, bias, self.epsilon);
@@ -1232,7 +1314,7 @@ impl Linear {
         let input = input.as_f32()?;
         let weight = self.weight.as_f32()?;
         let bias = self.bias.as_ref().map(Tensor::as_f32).transpose()?;
-        let mut output = Buffer::zeroed(output_len);
+        let mut output = Buffer::for_overwrite(output_len);
         #[cfg(target_os = "macos")]
         kernels::linear_system_dense(
             &mut output,

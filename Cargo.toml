@@ -79,6 +79,10 @@ protobuf-build = { package = "protobuf", version = "=3.7.2", optional = true }
 [patch.crates-io]
 burn-cubecl = { path = "vendor/burn-cubecl" }
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [[bin]]
 name = "ppocr-rs"
 path = "src/main.rs"

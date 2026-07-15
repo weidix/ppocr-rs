@@ -132,7 +132,7 @@ impl Tensor {
         match &mut self.data {
             TensorData::F32(data) => {
                 if Arc::get_mut(data).is_none() {
-                    let mut values = Buffer::zeroed(data.len());
+                    let mut values = Buffer::for_overwrite(data.len());
                     values.copy_from_slice(data.values());
                     *data = Arc::new(values.into_f32_storage());
                 }

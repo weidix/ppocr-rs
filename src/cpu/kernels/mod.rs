@@ -107,6 +107,14 @@ pub(crate) fn spatial_conv2d_direct(
     assert_eq!(weight.len(), output_channels * patch_size);
     assert!(bias.is_none_or(|bias| bias.len() == output_channels));
     let output_plane = output_height * output_width;
+    #[cfg(feature = "cpu-profile")]
+    eprintln!(
+        "cpu-profile spatial-conv input_channels={input_channels} output_channels={output_channels} input={input_height}x{input_width} output={output_height}x{output_width} kernel={kernel_height}x{kernel_width} stride={} micro_panels={}",
+        strides[0],
+        rayon::current_num_threads() == 1
+            && output_channels >= 16
+            && spatial_panel_working_set_fits(weight.len(), patch_size, output_channels)
+    );
 
     #[cfg(target_arch = "x86_64")]
     if rayon::current_num_threads() == 1
@@ -226,7 +234,7 @@ unsafe fn spatial_conv2d_micro_panels(
 
     let patch_size = input_channels * kernel_height * kernel_width;
     let output_plane = output_height * output_width;
-    let mut panel = Buffer::zeroed(patch_size * PANEL_COLUMNS);
+    let mut panel = Buffer::for_overwrite(patch_size * PANEL_COLUMNS);
     let tail_rows = output_channels % BLOCK_ROWS;
     let panel_rows = if tail_rows == 2 {
         output_channels - tail_rows
@@ -1101,7 +1109,7 @@ pub(crate) fn gemm_packed_left_tile(
     block_rows: usize,
 ) {
     assert!(rows > 0 && inner > 0 && columns > 0);
-    assert!(columns <= 16);
+    assert!(columns <= 32);
     assert!(matches!(block_rows, 6 | 12));
     assert_eq!(output.len(), rows * columns);
     assert_eq!(left.len(), rows * inner);

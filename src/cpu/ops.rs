@@ -318,7 +318,7 @@ fn binary(mut inputs: Vec<Tensor>, operation: BinaryOperation) -> Result<Tensor>
     let left_strides = broadcast_strides(&left.shape, &output_shape)?;
     let right_strides = broadcast_strides(&right.shape, &output_shape)?;
     let output_strides = strides(&output_shape);
-    let mut output = Buffer::zeroed(output_len);
+    let mut output = Buffer::for_overwrite(output_len);
     output.par_iter_mut().enumerate().for_each(|(flat, value)| {
         let mut remainder = flat;
         let mut left_index = 0;
@@ -435,7 +435,7 @@ fn conv(
     let input_plane = input_height * input_width;
     let output_plane = output_height * output_width;
     let channels_per_output_group = output_channels / options.groups;
-    let mut output = Buffer::zeroed(batch * output_channels * output_plane);
+    let mut output = Buffer::for_overwrite(batch * output_channels * output_plane);
 
     if kernel_height == 1
         && kernel_width == 1
@@ -849,8 +849,8 @@ fn conv_im2col_system_tiled(
     let rows_per_tile =
         (TARGET_COLUMN_ELEMENTS / (patch_size * output_width)).clamp(1, output_height);
     let maximum_tile_plane = rows_per_tile * output_width;
-    let mut columns = Buffer::zeroed(patch_size * maximum_tile_plane);
-    let mut tile_output = Buffer::zeroed(output_channels * maximum_tile_plane);
+    let mut columns = Buffer::for_overwrite(patch_size * maximum_tile_plane);
+    let mut tile_output = Buffer::for_overwrite(output_channels * maximum_tile_plane);
     for output_y_start in (0..output_height).step_by(rows_per_tile) {
         let tile_rows = (output_height - output_y_start).min(rows_per_tile);
         let tile_plane = tile_rows * output_width;
@@ -977,8 +977,9 @@ fn conv_im2col_tiled(
         (TARGET_COLUMN_ELEMENTS / (patch_size * output_width)).clamp(1, output_height);
     let panels_per_row = output_width.div_ceil(SPATIAL_PANEL_COLUMNS);
     let maximum_panels = rows_per_tile * panels_per_row;
-    let mut columns = Buffer::zeroed(maximum_panels * patch_size * SPATIAL_PANEL_COLUMNS);
-    let mut tile_output = Buffer::zeroed(maximum_panels * output_channels * SPATIAL_PANEL_COLUMNS);
+    let mut columns = Buffer::for_overwrite(maximum_panels * patch_size * SPATIAL_PANEL_COLUMNS);
+    let mut tile_output =
+        Buffer::for_overwrite(maximum_panels * output_channels * SPATIAL_PANEL_COLUMNS);
     for output_y_start in (0..output_height).step_by(rows_per_tile) {
         let tile_rows = (output_height - output_y_start).min(rows_per_tile);
         let tile_plane = tile_rows * output_width;
@@ -1156,7 +1157,7 @@ fn im2col(
 ) -> Buffer {
     let input_plane = input_height * input_width;
     let output_plane = output_height * output_width;
-    let mut columns = Buffer::zeroed(channels * kernel_height * kernel_width * output_plane);
+    let mut columns = Buffer::for_overwrite(channels * kernel_height * kernel_width * output_plane);
     columns
         .par_chunks_mut(output_plane)
         .enumerate()
@@ -1230,7 +1231,7 @@ fn conv_transpose(inputs: Vec<Tensor>, options: &ConvOptions) -> Result<Tensor> 
                 ..(batch_index + 1) * output_channels * output_plane];
             for kernel_y in 0..2 {
                 for kernel_x in 0..2 {
-                    let mut matrix = Buffer::zeroed(output_channels * input_channels);
+                    let mut matrix = Buffer::for_overwrite(output_channels * input_channels);
                     for output_channel in 0..output_channels {
                         for input_channel in 0..input_channels {
                             matrix[output_channel * input_channels + input_channel] = weight
@@ -1240,7 +1241,7 @@ fn conv_transpose(inputs: Vec<Tensor>, options: &ConvOptions) -> Result<Tensor> 
                                     + kernel_x];
                         }
                     }
-                    let mut tile = Buffer::zeroed(output_channels * input_plane);
+                    let mut tile = Buffer::for_overwrite(output_channels * input_plane);
                     kernels::gemm(
                         &mut tile,
                         &matrix,
@@ -1370,7 +1371,7 @@ fn matmul_impl(inputs: Vec<Tensor>, softmax_axis: Option<i64>) -> Result<Tensor>
     let right_batch_strides =
         broadcast_batch_offsets(&inputs[1].shape[..right_rank - 2], &batch_shape, k * n)?;
     let batch_strides = strides(&batch_shape);
-    let mut output = Buffer::zeroed(batches * m * n);
+    let mut output = Buffer::for_overwrite(batches * m * n);
     for batch in 0..batches {
         let (left_batch, right_batch) = batch_offsets(
             batch,
@@ -1461,7 +1462,7 @@ fn reduce_mean(mut inputs: Vec<Tensor>, axes: &[i64], keep_dims: bool) -> Result
         element_count(&input.shape[suffix_start..]).context("ReduceMean shape overflow")?;
     let output_len = input.len() / reduction_len;
     let input_values = input.as_f32()?;
-    let mut output = Buffer::zeroed(output_len);
+    let mut output = Buffer::for_overwrite(output_len);
     output
         .par_iter_mut()
         .enumerate()
@@ -1482,7 +1483,7 @@ fn global_average_pool(mut inputs: Vec<Tensor>) -> Result<Tensor> {
     let [batch, channels, height, width] = shape4(&input.shape)?;
     let spatial = height * width;
     let input_values = input.as_f32()?;
-    let mut output = Buffer::zeroed(batch * channels);
+    let mut output = Buffer::for_overwrite(batch * channels);
     output
         .par_iter_mut()
         .enumerate()
@@ -1515,7 +1516,7 @@ fn pool(inputs: Vec<Tensor>, options: &PoolOptions, maximum: bool) -> Result<Ten
     )?;
     let input_plane = height * width;
     let output_plane = output_height * output_width;
-    let mut output = Buffer::zeroed(batch * channels * output_plane);
+    let mut output = Buffer::for_overwrite(batch * channels * output_plane);
     if maximum
         && options.kernel == [2, 2]
         && options.strides == [1, 1]
@@ -1632,7 +1633,7 @@ fn resize(inputs: Vec<Tensor>) -> Result<Tensor> {
     );
     let input_plane = height * width;
     let output_plane = output_height * output_width;
-    let mut output = Buffer::zeroed(batch * channels * output_plane);
+    let mut output = Buffer::for_overwrite(batch * channels * output_plane);
     output
         .par_chunks_mut(output_plane)
         .enumerate()
@@ -1742,7 +1743,7 @@ fn transpose(mut inputs: Vec<Tensor>, permutation: &[usize]) -> Result<Tensor> {
     let output_strides = strides(&output_shape);
     match &input.data {
         TensorData::F32(values) => {
-            let mut output = Buffer::zeroed(values.len());
+            let mut output = Buffer::for_overwrite(values.len());
             output
                 .par_iter_mut()
                 .enumerate()
@@ -1801,7 +1802,7 @@ fn transpose_3d_last_two<T: Copy + Default>(
 
 fn transpose_3d_last_two_f32(input: &[f32], batches: usize, rows: usize, columns: usize) -> Buffer {
     let matrix_len = rows * columns;
-    let mut output = Buffer::zeroed(batches * matrix_len);
+    let mut output = Buffer::for_overwrite(batches * matrix_len);
     for batch in 0..batches {
         let input = &input[batch * matrix_len..(batch + 1) * matrix_len];
         let output = &mut output[batch * matrix_len..(batch + 1) * matrix_len];
@@ -1946,7 +1947,7 @@ fn slice(inputs: Vec<Tensor>) -> Result<Tensor> {
     let output_strides = strides(&output_shape);
     match &inputs[0].data {
         TensorData::F32(values) => {
-            let mut output = Buffer::zeroed(output_len);
+            let mut output = Buffer::for_overwrite(output_len);
             copy_slice(
                 &mut output,
                 values,
