@@ -1,4 +1,5 @@
 use super::{
+    arena::{Buffer, InferenceArena},
     backend::{
         Conv2d as BackendConv2d, ConvTranspose2d as BackendConvTranspose2d, LayerNorm, Linear,
     },
@@ -1413,7 +1414,7 @@ fn upsample_and_cat_nchw(features: &[Tensor], scales: &[usize]) -> Result<Tensor
     let output_len = batch
         .checked_mul(output_batch)
         .context("upsample-cat output length overflow")?;
-    let mut output = vec![0.0; output_len];
+    let mut output = Buffer::zeroed(output_len);
 
     for batch_index in 0..batch {
         let mut output_channel = 0usize;
@@ -1576,6 +1577,7 @@ pub struct Detector {
     neck: DetectorNeckKind,
     head: DetectorHead,
     pool: ThreadPool,
+    arena: InferenceArena,
 }
 
 impl Detector {
@@ -1640,12 +1642,14 @@ impl Detector {
             neck,
             head,
             pool,
+            arena: InferenceArena::default(),
         })
     }
 
     pub fn run(&self, input: Tensor) -> Result<Tensor> {
         validate_input(&input, true)?;
-        self.pool.install(|| self.forward(&input))
+        self.pool
+            .install(|| self.arena.scope(|| self.forward(&input)))
     }
 
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
@@ -1983,6 +1987,7 @@ pub struct Recognizer {
     backbone: LcNetBackbone,
     head: RecognizerHeadKind,
     pool: ThreadPool,
+    arena: InferenceArena,
 }
 
 impl Recognizer {
@@ -2045,12 +2050,14 @@ impl Recognizer {
             backbone,
             head,
             pool,
+            arena: InferenceArena::default(),
         })
     }
 
     pub fn run(&self, input: Tensor) -> Result<Tensor> {
         validate_input(&input, false)?;
-        self.pool.install(|| self.forward(&input))
+        self.pool
+            .install(|| self.arena.scope(|| self.forward(&input)))
     }
 
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
@@ -2165,13 +2172,13 @@ mod tests {
             vec![2, 2, 2, 3],
             (0..2 * 2 * 2 * 3)
                 .map(|index| (index as f32 - 9.0) * 0.125)
-                .collect(),
+                .collect::<Vec<_>>(),
         );
         let feature = Tensor::new_f32(
             vec![2, 2, 4, 6],
             (0..2 * 2 * 4 * 6)
                 .map(|index| (index as f32 - 31.0) * 0.0625)
-                .collect(),
+                .collect::<Vec<_>>(),
         );
 
         let expected = feature.clone().into_add(&upsample(&upper, 2)?)?;
@@ -2190,7 +2197,7 @@ mod tests {
                 shape.to_vec(),
                 (0..length)
                     .map(|index| offset + index as f32 * 0.25)
-                    .collect(),
+                    .collect::<Vec<_>>(),
             )
         };
         // DetectorNeck concatenates deepest-to-shallowest after reversing refined features.
@@ -2257,7 +2264,7 @@ mod tests {
             vec![out_channels],
             (0..out_channels)
                 .map(|channel| (channel as f32 - 2.0) / 13.0)
-                .collect(),
+                .collect::<Vec<_>>(),
         );
         let dense = BackendConv2d::new(
             weight.clone(),
@@ -2271,7 +2278,7 @@ mod tests {
             vec![1, in_channels, height, width],
             (0..in_channels * height * width)
                 .map(|index| ((index * 23 % 61) as f32 - 30.0) / 37.0)
-                .collect(),
+                .collect::<Vec<_>>(),
         );
 
         let expected = dense.forward(&input)?;

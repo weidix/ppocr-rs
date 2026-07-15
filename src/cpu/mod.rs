@@ -1,5 +1,6 @@
 //! Direct Safetensors CPU inference.
 
+mod arena;
 mod backend;
 mod kernels;
 mod model;

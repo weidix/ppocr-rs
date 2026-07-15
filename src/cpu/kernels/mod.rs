@@ -1,5 +1,6 @@
 //! Architecture-specific CPU kernels.
 
+use super::arena::{Buffer, Handle as ArenaHandle};
 use rayon::prelude::*;
 
 #[cfg(target_os = "macos")]
@@ -225,7 +226,7 @@ unsafe fn spatial_conv2d_micro_panels(
 
     let patch_size = input_channels * kernel_height * kernel_width;
     let output_plane = output_height * output_width;
-    let mut panel = vec![0.0; patch_size * PANEL_COLUMNS];
+    let mut panel = Buffer::zeroed(patch_size * PANEL_COLUMNS);
     let tail_rows = output_channels % BLOCK_ROWS;
     let panel_rows = if tail_rows == 2 {
         output_channels - tail_rows
@@ -947,6 +948,57 @@ pub(crate) fn gemm_packed_left_blocked_6(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_external(
+    output: &mut [f32],
+    left: &[f32],
+    right: &[f32],
+    rows: usize,
+    inner: usize,
+    columns: usize,
+    bias: Option<&[f32]>,
+    activation: Option<UnaryOperation>,
+) {
+    assert_eq!(output.len(), rows * columns);
+    assert_eq!(left.len(), rows * inner);
+    assert_eq!(right.len(), inner * columns);
+    assert!(bias.is_none_or(|bias| bias.len() == rows));
+    unsafe {
+        gemm::gemm(
+            rows,
+            columns,
+            inner,
+            output.as_mut_ptr(),
+            1,
+            columns as isize,
+            false,
+            left.as_ptr(),
+            1,
+            inner as isize,
+            right.as_ptr(),
+            1,
+            columns as isize,
+            0.0,
+            1.0,
+            false,
+            false,
+            false,
+            gemm::Parallelism::None,
+        );
+    }
+    output
+        .par_chunks_mut(columns)
+        .enumerate()
+        .for_each(|(row, values)| {
+            if let Some(bias) = bias {
+                affine_in_place(values, 1.0, bias[row]);
+            }
+            if let Some(activation) = activation {
+                unary_chunk(values, activation);
+            }
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn gemm_packed_left_tile(
     output: &mut [f32],
     left: &[f32],
@@ -1194,6 +1246,7 @@ fn linear_right_transposed_6x16(
     let row_blocks = rows.div_ceil(MICRO_ROWS);
     let blocks_per_task = row_blocks.div_ceil(rayon::current_num_threads()).max(1);
     let task_rows = blocks_per_task * MICRO_ROWS;
+    let arena = ArenaHandle::current();
     output
         .par_chunks_mut(task_rows * columns)
         .enumerate()
@@ -1205,7 +1258,7 @@ fn linear_right_transposed_6x16(
                 let task_input_start = row_start * inner;
                 let task_input =
                     &input[task_input_start..task_input_start + task_row_count * inner];
-                let mut packed_input = vec![0.0; task_row_count * inner];
+                let mut packed_input = arena.zeroed(task_row_count * inner);
                 for local_row in (0..task_row_count).step_by(MICRO_ROWS) {
                     let block_rows = (task_row_count - local_row).min(MICRO_ROWS);
                     let packed_start = local_row * inner;
