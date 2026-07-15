@@ -296,7 +296,7 @@ impl Tensor {
 #[derive(Clone)]
 pub(crate) struct Conv2d {
     weight: Tensor,
-    dense_pointwise_weight: Option<Tensor>,
+    large_pointwise_weight: Option<Tensor>,
     bias: Option<Tensor>,
     options: ConvOptions,
 }
@@ -387,12 +387,9 @@ impl Conv2d {
             && !system_dense_pointwise
             && !system_dense_spatial
             && !direct_spatial;
-        let dense_pointwise_weight = (groups == 1
-            && kernel_height == 1
-            && kernel_width == 1
-            && strides == [1, 1]
-            && pads == [0; 4])
-            .then(|| weight.clone());
+        let large_pointwise_weight = (blocked_pointwise && output_channels.is_multiple_of(16))
+            .then(|| pack_conv_rows(weight.clone(), output_channels, 16))
+            .transpose()?;
         let weight = if direct_spatial {
             pack_conv_rows(weight, output_channels, 6)?
         } else if packed_pointwise {
@@ -408,7 +405,7 @@ impl Conv2d {
         };
         Ok(Self {
             weight,
-            dense_pointwise_weight,
+            large_pointwise_weight,
             bias,
             options: ConvOptions {
                 strides,
@@ -778,10 +775,10 @@ impl Conv2d {
 
     fn run(&self, input: &Tensor, activation: Option<kernels::UnaryOperation>) -> Result<Tensor> {
         if self.options.blocked_pointwise
-            && self.dense_pointwise_weight.is_some()
-            && self.external_pointwise_work(input) >= 64_000_000
+            && self.large_pointwise_weight.is_some()
+            && self.large_pointwise_work(input) >= 64_000_000
         {
-            return self.run_external_pointwise(input, activation);
+            return self.run_large_pointwise(input, activation);
         }
         let mut inputs = vec![input.clone(), self.weight.clone()];
         if let Some(bias) = &self.bias {
@@ -797,8 +794,8 @@ impl Conv2d {
         run(operation, inputs)
     }
 
-    fn external_pointwise_work(&self, input: &Tensor) -> usize {
-        let Some(weight) = &self.dense_pointwise_weight else {
+    fn large_pointwise_work(&self, input: &Tensor) -> usize {
+        let Some(weight) = &self.large_pointwise_weight else {
             return 0;
         };
         let Ok(shape): Result<[usize; 4], _> = weight.shape.as_slice().try_into() else {
@@ -821,7 +818,7 @@ impl Conv2d {
             .unwrap_or(usize::MAX)
     }
 
-    fn run_external_pointwise(
+    fn run_large_pointwise(
         &self,
         input: &Tensor,
         activation: Option<kernels::UnaryOperation>,
@@ -829,9 +826,9 @@ impl Conv2d {
         #[cfg(feature = "cpu-profile")]
         let started = Instant::now();
         let weight = self
-            .dense_pointwise_weight
+            .large_pointwise_weight
             .as_ref()
-            .expect("external pointwise weight");
+            .expect("large pointwise weight");
         let [output_channels, input_channels, _, _]: [usize; 4] = weight
             .shape
             .as_slice()
@@ -852,8 +849,12 @@ impl Conv2d {
         let weight_values = weight.as_f32()?;
         let bias = self.bias.as_ref().map(Tensor::as_f32).transpose()?;
         let mut output_values = Buffer::zeroed(batch * output_batch);
+        #[cfg(feature = "cpu-profile")]
+        eprintln!(
+            "cpu-profile gemm=LargeConv rows={output_channels} inner={input_channels} columns={plane}"
+        );
         for batch_index in 0..batch {
-            kernels::gemm_external(
+            kernels::gemm_packed_left_cached_blocked_16(
                 &mut output_values[batch_index * output_batch..(batch_index + 1) * output_batch],
                 weight_values,
                 &input_values[batch_index * input_batch..(batch_index + 1) * input_batch],
@@ -868,11 +869,11 @@ impl Conv2d {
         #[cfg(feature = "cpu-profile")]
         profile_direct(
             match activation {
-                None => "ExternalConv",
-                Some(kernels::UnaryOperation::Gelu) => "ExternalConvGelu",
-                Some(kernels::UnaryOperation::Relu) => "ExternalConvRelu",
-                Some(kernels::UnaryOperation::Silu) => "ExternalConvSilu",
-                Some(_) => "ExternalConv",
+                None => "LargeConv",
+                Some(kernels::UnaryOperation::Gelu) => "LargeConvGelu",
+                Some(kernels::UnaryOperation::Relu) => "LargeConvRelu",
+                Some(kernels::UnaryOperation::Silu) => "LargeConvSilu",
+                Some(_) => "LargeConv",
             },
             &output,
             started,
@@ -942,24 +943,31 @@ impl ConvTranspose2d {
                 "ConvTranspose bias length does not match output channels"
             );
         }
-        let packed_2x2_weight =
-            (groups == 1 && strides == [2, 2] && pads == [0; 4] && weight.shape[2..] == [2, 2])
-                .then(|| {
-                    let source = weight.as_f32().expect("ConvTranspose weight was validated");
-                    let output_channels = output_channels_per_group;
-                    let mut packed = vec![0.0; output_channels * 4 * input_channels];
-                    for output_channel in 0..output_channels {
-                        for kernel_index in 0..4 {
-                            for input_channel in 0..input_channels {
-                                packed[(output_channel * 4 + kernel_index) * input_channels
-                                    + input_channel] =
-                                    source[(input_channel * output_channels + output_channel) * 4
-                                        + kernel_index];
-                            }
-                        }
+        let packed_2x2_weight = (groups == 1
+            && strides == [2, 2]
+            && pads == [0; 4]
+            && weight.shape[2..] == [2, 2])
+        .then(|| {
+            let source = weight.as_f32().expect("ConvTranspose weight was validated");
+            let output_channels = output_channels_per_group;
+            let mut packed = vec![0.0; output_channels * 4 * input_channels];
+            for output_channel in 0..output_channels {
+                for kernel_index in 0..4 {
+                    for input_channel in 0..input_channels {
+                        packed[(output_channel * 4 + kernel_index) * input_channels
+                            + input_channel] = source
+                            [(input_channel * output_channels + output_channel) * 4 + kernel_index];
                     }
-                    Tensor::new_f32(vec![output_channels * 4, input_channels], packed)
-                });
+                }
+            }
+            let packed_rows = output_channels * 4;
+            let weight = Tensor::new_f32(vec![packed_rows, input_channels], packed);
+            #[cfg(target_arch = "x86_64")]
+            if packed_rows > 128 && packed_rows.is_multiple_of(16) {
+                return pack_conv_rows(weight, packed_rows, 16).expect("pack ConvTranspose rows");
+            }
+            weight
+        });
         Ok(Self {
             weight,
             packed_2x2_weight,
@@ -1008,10 +1016,16 @@ impl ConvTranspose2d {
         let bias = self.bias.as_ref().map(Tensor::as_f32).transpose()?;
         let mut tile = Buffer::zeroed(packed_rows * input_plane);
         let mut output_values = Buffer::zeroed(batch * output_batch);
+        #[cfg(feature = "cpu-profile")]
+        if packed_rows > 128 {
+            eprintln!(
+                "cpu-profile gemm=ConvTranspose rows={packed_rows} inner={input_channels} columns={input_plane}"
+            );
+        }
         for batch_index in 0..batch {
             let batch_input =
                 &input_values[batch_index * input_batch..(batch_index + 1) * input_batch];
-            if packed_rows <= 128 {
+            if packed_rows <= 128 || !packed_rows.is_multiple_of(16) {
                 kernels::gemm(
                     &mut tile,
                     weight_values,
@@ -1022,7 +1036,8 @@ impl ConvTranspose2d {
                     None,
                 );
             } else {
-                kernels::gemm_external(
+                #[cfg(target_arch = "x86_64")]
+                kernels::gemm_packed_left_cached_blocked_16(
                     &mut tile,
                     weight_values,
                     batch_input,
@@ -1030,6 +1045,16 @@ impl ConvTranspose2d {
                     input_channels,
                     input_plane,
                     None,
+                    None,
+                );
+                #[cfg(not(target_arch = "x86_64"))]
+                kernels::gemm(
+                    &mut tile,
+                    weight_values,
+                    batch_input,
+                    packed_rows,
+                    input_channels,
+                    input_plane,
                     None,
                 );
             }

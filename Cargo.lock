@@ -4466,7 +4466,6 @@ dependencies = [
  "candle-nn",
  "candle-optimisers",
  "clap",
- "gemm 0.19.0",
  "image",
  "onnx-ir",
  "protobuf",

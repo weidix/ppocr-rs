@@ -1554,6 +1554,110 @@ pub(super) unsafe fn gemm_6x16_packed<const SOFTWARE_PREFETCH: bool>(
 }
 
 #[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn gemm_16x6_packed<
+    const COLUMNS: usize,
+    const HAS_BIAS: bool,
+    const HAS_ACTIVATION: bool,
+>(
+    output: &mut [f32],
+    left: &[f32],
+    right: &[f32],
+    inner: usize,
+    output_stride: usize,
+    bias: Option<&[f32]>,
+    activation: Option<super::UnaryOperation>,
+) {
+    const ROWS: usize = 16;
+    const RIGHT_STRIDE: usize = 6;
+
+    debug_assert!((1..=RIGHT_STRIDE).contains(&COLUMNS));
+    debug_assert!(output.len() >= (ROWS - 1) * output_stride + COLUMNS);
+    debug_assert_eq!(left.len(), ROWS * inner);
+    debug_assert!(right.len() >= inner * RIGHT_STRIDE);
+    debug_assert!(bias.is_none_or(|bias| bias.len() == ROWS));
+    debug_assert_eq!(HAS_BIAS, bias.is_some());
+    debug_assert_eq!(HAS_ACTIVATION, activation.is_some());
+
+    let (initial0, initial1) = if HAS_BIAS {
+        let bias = unsafe { bias.unwrap_unchecked() };
+        unsafe {
+            (
+                _mm256_loadu_ps(bias.as_ptr()),
+                _mm256_loadu_ps(bias.as_ptr().add(8)),
+            )
+        }
+    } else {
+        (_mm256_setzero_ps(), _mm256_setzero_ps())
+    };
+    let mut sums0 = [initial0; RIGHT_STRIDE];
+    let mut sums1 = [initial1; RIGHT_STRIDE];
+
+    macro_rules! k_step {
+        ($index:expr) => {{
+            let index = $index;
+            let left = unsafe { left.as_ptr().add(index * ROWS) };
+            let left0 = unsafe { _mm256_loadu_ps(left) };
+            let left1 = unsafe { _mm256_loadu_ps(left.add(8)) };
+            let right = unsafe { right.as_ptr().add(index * RIGHT_STRIDE) };
+            macro_rules! column {
+                ($column:literal) => {
+                    if COLUMNS > $column {
+                        let scale = _mm256_set1_ps(unsafe { *right.add($column) });
+                        sums0[$column] = _mm256_fmadd_ps(left0, scale, sums0[$column]);
+                        sums1[$column] = _mm256_fmadd_ps(left1, scale, sums1[$column]);
+                    }
+                };
+            }
+            column!(0);
+            column!(1);
+            column!(2);
+            column!(3);
+            column!(4);
+            column!(5);
+        }};
+    }
+
+    let mut index = 0;
+    while index + 4 <= inner {
+        k_step!(index);
+        k_step!(index + 1);
+        k_step!(index + 2);
+        k_step!(index + 3);
+        index += 4;
+    }
+    while index < inner {
+        k_step!(index);
+        index += 1;
+    }
+
+    let mut lower = [[0.0f32; 8]; RIGHT_STRIDE];
+    let mut upper = [[0.0f32; 8]; RIGHT_STRIDE];
+    for column in 0..COLUMNS {
+        let (lower_value, upper_value) = if HAS_ACTIVATION {
+            (
+                apply_vector_post_op(sums0[column], activation),
+                apply_vector_post_op(sums1[column], activation),
+            )
+        } else {
+            (sums0[column], sums1[column])
+        };
+        unsafe {
+            _mm256_storeu_ps(lower[column].as_mut_ptr(), lower_value);
+            _mm256_storeu_ps(upper[column].as_mut_ptr(), upper_value);
+        }
+    }
+    for row in 0..8 {
+        for column in 0..COLUMNS {
+            unsafe {
+                *output.get_unchecked_mut(row * output_stride + column) = lower[column][row];
+                *output.get_unchecked_mut((row + 8) * output_stride + column) = upper[column][row];
+            }
+        }
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
 fn apply_vector_post_op(value: __m256, activation: Option<super::UnaryOperation>) -> __m256 {
     let zero = _mm256_setzero_ps();
     let one = _mm256_set1_ps(1.0);

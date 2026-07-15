@@ -838,6 +838,146 @@ pub(crate) fn gemm_packed_left_with_activation(
     );
 }
 
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_packed_left_cached_blocked_16(
+    output: &mut [f32],
+    left: &[f32],
+    right: &[f32],
+    rows: usize,
+    inner: usize,
+    columns: usize,
+    bias: Option<&[f32]>,
+    activation: Option<UnaryOperation>,
+) {
+    macro_rules! dispatch {
+        ($column_block:literal) => {
+            match (bias.is_some(), activation.is_some()) {
+                (false, false) => {
+                    gemm_packed_left_cached_blocked_16_impl::<$column_block, false, false>(
+                        output, left, right, rows, inner, columns, bias, activation,
+                    )
+                }
+                (false, true) => {
+                    gemm_packed_left_cached_blocked_16_impl::<$column_block, false, true>(
+                        output, left, right, rows, inner, columns, bias, activation,
+                    )
+                }
+                (true, false) => {
+                    gemm_packed_left_cached_blocked_16_impl::<$column_block, true, false>(
+                        output, left, right, rows, inner, columns, bias, activation,
+                    )
+                }
+                (true, true) => {
+                    gemm_packed_left_cached_blocked_16_impl::<$column_block, true, true>(
+                        output, left, right, rows, inner, columns, bias, activation,
+                    )
+                }
+            }
+        };
+    }
+    if inner >= 768 || (inner <= 128 && columns >= 10_000) {
+        dispatch!(96);
+    } else {
+        dispatch!(24);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+fn gemm_packed_left_cached_blocked_16_impl<
+    const COLUMN_BLOCK: usize,
+    const HAS_BIAS: bool,
+    const HAS_ACTIVATION: bool,
+>(
+    output: &mut [f32],
+    left: &[f32],
+    right: &[f32],
+    rows: usize,
+    inner: usize,
+    columns: usize,
+    bias: Option<&[f32]>,
+    activation: Option<UnaryOperation>,
+) {
+    const BLOCK_ROWS: usize = 16;
+    const MICRO_COLUMNS: usize = 6;
+
+    assert!(rows > 0 && inner > 0 && columns > 0);
+    assert!(COLUMN_BLOCK > 0 && COLUMN_BLOCK.is_multiple_of(MICRO_COLUMNS));
+    assert!(rows.is_multiple_of(BLOCK_ROWS));
+    assert_eq!(output.len(), rows * columns);
+    assert_eq!(left.len(), rows * inner);
+    assert_eq!(right.len(), inner * columns);
+    assert!(bias.is_none_or(|bias| bias.len() == rows));
+    assert_eq!(HAS_BIAS, bias.is_some());
+    assert_eq!(HAS_ACTIVATION, activation.is_some());
+
+    if has_avx2_fma() {
+        let mut packed_right = Buffer::zeroed(inner * COLUMN_BLOCK);
+        for column_block_start in (0..columns).step_by(COLUMN_BLOCK) {
+            let column_block = (columns - column_block_start).min(COLUMN_BLOCK);
+            let panels = column_block.div_ceil(MICRO_COLUMNS);
+            for index in 0..inner {
+                let source = &right[index * columns + column_block_start..];
+                for panel in 0..panels {
+                    let panel_column = panel * MICRO_COLUMNS;
+                    let panel_columns = (column_block - panel_column).min(MICRO_COLUMNS);
+                    let packed_start = (panel * inner + index) * MICRO_COLUMNS;
+                    packed_right[packed_start..packed_start + panel_columns]
+                        .copy_from_slice(&source[panel_column..panel_column + panel_columns]);
+                }
+            }
+            for panel in 0..panels {
+                let panel_column = panel * MICRO_COLUMNS;
+                let panel_columns = (column_block - panel_column).min(MICRO_COLUMNS);
+                let column_start = column_block_start + panel_column;
+                let right_start = panel * inner * MICRO_COLUMNS;
+                let right = &packed_right[right_start..right_start + inner * MICRO_COLUMNS];
+                for row_start in (0..rows).step_by(BLOCK_ROWS) {
+                    let output = &mut output[row_start * columns + column_start..];
+                    let left = &left[row_start * inner..(row_start + BLOCK_ROWS) * inner];
+                    let bias = bias.map(|bias| &bias[row_start..row_start + BLOCK_ROWS]);
+                    macro_rules! kernel {
+                        ($columns:literal) => {
+                            // SAFETY: AVX2/FMA were detected above. The operands
+                            // contain complete 16-row and 6-column packed panels.
+                            unsafe {
+                                x86::gemm_16x6_packed::<$columns, HAS_BIAS, HAS_ACTIVATION>(
+                                    output, left, right, inner, columns, bias, activation,
+                                )
+                            }
+                        };
+                    }
+                    match panel_columns {
+                        1 => kernel!(1),
+                        2 => kernel!(2),
+                        3 => kernel!(3),
+                        4 => kernel!(4),
+                        5 => kernel!(5),
+                        6 => kernel!(6),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    for row_start in (0..rows).step_by(BLOCK_ROWS) {
+        for row in 0..BLOCK_ROWS {
+            for column in 0..columns {
+                let mut sum = bias.map_or(0.0, |bias| bias[row_start + row]);
+                for index in 0..inner {
+                    sum = left[row_start * inner + index * BLOCK_ROWS + row]
+                        .mul_add(right[index * columns + column], sum);
+                }
+                output[(row_start + row) * columns + column] =
+                    activation.map_or(sum, |activation| activation.apply(sum));
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gemm_packed_left_blocked_6(
     output: &mut [f32],
@@ -945,57 +1085,6 @@ pub(crate) fn gemm_packed_left_blocked_6(
             }
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn gemm_external(
-    output: &mut [f32],
-    left: &[f32],
-    right: &[f32],
-    rows: usize,
-    inner: usize,
-    columns: usize,
-    bias: Option<&[f32]>,
-    activation: Option<UnaryOperation>,
-) {
-    assert_eq!(output.len(), rows * columns);
-    assert_eq!(left.len(), rows * inner);
-    assert_eq!(right.len(), inner * columns);
-    assert!(bias.is_none_or(|bias| bias.len() == rows));
-    unsafe {
-        gemm::gemm(
-            rows,
-            columns,
-            inner,
-            output.as_mut_ptr(),
-            1,
-            columns as isize,
-            false,
-            left.as_ptr(),
-            1,
-            inner as isize,
-            right.as_ptr(),
-            1,
-            columns as isize,
-            0.0,
-            1.0,
-            false,
-            false,
-            false,
-            gemm::Parallelism::None,
-        );
-    }
-    output
-        .par_chunks_mut(columns)
-        .enumerate()
-        .for_each(|(row, values)| {
-            if let Some(bias) = bias {
-                affine_in_place(values, 1.0, bias[row]);
-            }
-            if let Some(activation) = activation {
-                unary_chunk(values, activation);
-            }
-        });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2397,6 +2486,59 @@ mod tests {
         }
         let mut actual = vec![0.0; rows * columns];
         gemm_packed_left_blocked_6(
+            &mut actual,
+            &packed,
+            &right,
+            rows,
+            inner,
+            columns,
+            Some(&bias),
+            Some(UnaryOperation::Silu),
+        );
+        let maximum_error = expected
+            .iter()
+            .zip(&actual)
+            .map(|(expected, actual)| (expected - actual).abs())
+            .fold(0.0f32, f32::max);
+        assert!(maximum_error < 3e-5, "maximum error: {maximum_error}");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cached_16x6_gemm_matches_scalar_across_depth_and_column_tails() {
+        let rows = 32;
+        let inner = 319;
+        let columns = 25;
+        let left = (0..rows * inner)
+            .map(|index| ((index * 19 % 59) as f32 - 29.0) / 31.0)
+            .collect::<Vec<_>>();
+        let right = (0..inner * columns)
+            .map(|index| ((index * 11 % 43) as f32 - 21.0) / 29.0)
+            .collect::<Vec<_>>();
+        let bias = (0..rows)
+            .map(|row| (row as f32 - 4.0) / 13.0)
+            .collect::<Vec<_>>();
+        let mut packed = Vec::with_capacity(left.len());
+        for row_start in (0..rows).step_by(16) {
+            for index in 0..inner {
+                for row in 0..16 {
+                    packed.push(left[(row_start + row) * inner + index]);
+                }
+            }
+        }
+
+        let mut expected = vec![0.0; rows * columns];
+        for row in 0..rows {
+            for column in 0..columns {
+                let mut sum = bias[row];
+                for index in 0..inner {
+                    sum = left[row * inner + index].mul_add(right[index * columns + column], sum);
+                }
+                expected[row * columns + column] = UnaryOperation::Silu.apply(sum);
+            }
+        }
+        let mut actual = vec![0.0; expected.len()];
+        gemm_packed_left_cached_blocked_16(
             &mut actual,
             &packed,
             &right,
