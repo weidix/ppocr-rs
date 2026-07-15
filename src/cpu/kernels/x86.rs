@@ -19,16 +19,39 @@ pub(super) unsafe fn depthwise_conv2d_same<const K: usize>(
     debug_assert_eq!(output.len(), height * width);
     debug_assert_eq!(input.len(), height * width);
     debug_assert_eq!(weights.len(), K * K);
+    unsafe {
+        depthwise_conv2d_same_rows::<K>(output, input, weights, height, width, 0, height, bias)
+    };
+}
+
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn depthwise_conv2d_same_rows<const K: usize>(
+    output: &mut [f32],
+    input: &[f32],
+    weights: &[f32],
+    height: usize,
+    width: usize,
+    y_start: usize,
+    rows: usize,
+    bias: f32,
+) {
+    debug_assert!(matches!(K, 3 | 5 | 7 | 9));
+    debug_assert!(y_start <= height && rows <= height - y_start);
+    debug_assert_eq!(output.len(), rows * width);
+    debug_assert_eq!(input.len(), height * width);
+    debug_assert_eq!(weights.len(), K * K);
     let padding = K / 2;
 
-    for y in 0..height {
+    for local_y in 0..rows {
+        let y = y_start + local_y;
         let kernel_y_start = padding.saturating_sub(y);
         let kernel_y_end = K.min(height + padding - y);
         let vector_start = if width >= K { padding } else { 0 };
         let vector_end = if width >= K { width - padding } else { 0 };
 
         for x in 0..vector_start {
-            output[y * width + x] =
+            output[local_y * width + x] =
                 unsafe { depthwise_conv2d_pixel::<K>(input, weights, height, width, y, x, bias) };
         }
 
@@ -48,7 +71,7 @@ pub(super) unsafe fn depthwise_conv2d_same<const K: usize>(
                     }
                 }
             }
-            let output_base = unsafe { output.as_mut_ptr().add(y * width + x) };
+            let output_base = unsafe { output.as_mut_ptr().add(local_y * width + x) };
             for (vector, sum) in sums.into_iter().enumerate() {
                 unsafe { _mm256_storeu_ps(output_base.add(vector * 8), sum) };
             }
@@ -68,12 +91,12 @@ pub(super) unsafe fn depthwise_conv2d_same<const K: usize>(
                     sum = _mm256_fmadd_ps(values, weight, sum);
                 }
             }
-            unsafe { _mm256_storeu_ps(output.as_mut_ptr().add(y * width + x), sum) };
+            unsafe { _mm256_storeu_ps(output.as_mut_ptr().add(local_y * width + x), sum) };
             x += 8;
         }
 
         for x in x..width {
-            output[y * width + x] =
+            output[local_y * width + x] =
                 unsafe { depthwise_conv2d_pixel::<K>(input, weights, height, width, y, x, bias) };
         }
     }
@@ -167,8 +190,8 @@ pub(super) unsafe fn depthwise_conv2d_same_3x3_stride2(
 }
 
 #[target_feature(enable = "avx2,fma")]
-#[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn spatial_conv2d_packed_4(
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub(super) unsafe fn spatial_conv2d_packed<const OUTPUT_CHANNELS: usize>(
     output: &mut [f32],
     input: &[f32],
     weight: &[f32],
@@ -184,8 +207,7 @@ pub(super) unsafe fn spatial_conv2d_packed_4(
     bias: Option<&[f32]>,
     activation: Option<super::UnaryOperation>,
 ) {
-    const OUTPUT_CHANNELS: usize = 4;
-
+    debug_assert!(matches!(OUTPUT_CHANNELS, 2 | 4 | 6));
     debug_assert!(input_channels > 0);
     debug_assert!(input_height > 0 && input_width > 0);
     debug_assert!(output_height > 0 && output_width > 0);
@@ -223,7 +245,7 @@ pub(super) unsafe fn spatial_conv2d_packed_4(
 
     for output_y in 0..output_height {
         for output_x in 0..vector_start {
-            let values = spatial_conv2d_packed_4_pixel(
+            let values = spatial_conv2d_packed_pixel::<OUTPUT_CHANNELS>(
                 input,
                 weight,
                 input_channels,
@@ -321,7 +343,7 @@ pub(super) unsafe fn spatial_conv2d_packed_4(
         }
 
         for output_x in output_x..output_width {
-            let values = spatial_conv2d_packed_4_pixel(
+            let values = spatial_conv2d_packed_pixel::<OUTPUT_CHANNELS>(
                 input,
                 weight,
                 input_channels,
@@ -346,7 +368,7 @@ pub(super) unsafe fn spatial_conv2d_packed_4(
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn spatial_conv2d_packed_4_pixel(
+fn spatial_conv2d_packed_pixel<const OUTPUT_CHANNELS: usize>(
     input: &[f32],
     weight: &[f32],
     input_channels: usize,
@@ -360,9 +382,7 @@ fn spatial_conv2d_packed_4_pixel(
     pads: [usize; 4],
     bias: Option<&[f32]>,
     activation: Option<super::UnaryOperation>,
-) -> [f32; 4] {
-    const OUTPUT_CHANNELS: usize = 4;
-
+) -> [f32; OUTPUT_CHANNELS] {
     let input_plane = input_height * input_width;
     let mut sums =
         std::array::from_fn(|output_channel| bias.map_or(0.0, |bias| bias[output_channel]));
@@ -407,6 +427,61 @@ pub(super) unsafe fn copy_stride2_16(output: *mut f32, input: *const f32) {
         _mm256_storeu_ps(output, low);
         _mm256_storeu_ps(output.add(8), high);
     }
+}
+
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn max_pool_2x2_row(output: &mut [f32], current: &[f32], next: Option<&[f32]>) {
+    debug_assert_eq!(output.len(), current.len());
+    debug_assert!(next.is_none_or(|next| next.len() == current.len()));
+
+    // The shifted load needs one additional source value, so leave the final
+    // one-to-eight outputs to the scalar tail.
+    let vector_len = current.len().saturating_sub(1) / 8 * 8;
+    for offset in (0..vector_len).step_by(8) {
+        let current0 = unsafe { _mm256_loadu_ps(current.as_ptr().add(offset)) };
+        let current1 = unsafe { _mm256_loadu_ps(current.as_ptr().add(offset + 1)) };
+        let mut maximum = max_number(current0, current1);
+        if let Some(next) = next {
+            let next0 = unsafe { _mm256_loadu_ps(next.as_ptr().add(offset)) };
+            let next1 = unsafe { _mm256_loadu_ps(next.as_ptr().add(offset + 1)) };
+            maximum = max_number(maximum, next0);
+            maximum = max_number(maximum, next1);
+        }
+        unsafe { _mm256_storeu_ps(output.as_mut_ptr().add(offset), maximum) };
+    }
+
+    for x in vector_len..current.len() {
+        let mut maximum = current[x];
+        if x + 1 < current.len() {
+            maximum = maximum.max(current[x + 1]);
+        }
+        if let Some(next) = next {
+            maximum = maximum.max(next[x]);
+            if x + 1 < next.len() {
+                maximum = maximum.max(next[x + 1]);
+            }
+        }
+        output[x] = maximum;
+    }
+}
+
+#[target_feature(enable = "avx2")]
+#[inline]
+fn max_number(left: __m256, right: __m256) -> __m256 {
+    let zero = _mm256_setzero_ps();
+    let left_nan = _mm256_cmp_ps::<_CMP_UNORD_Q>(left, left);
+    let right_nan = _mm256_cmp_ps::<_CMP_UNORD_Q>(right, right);
+    let right_only_nan = _mm256_andnot_ps(left_nan, right_nan);
+    let mut maximum = _mm256_max_ps(left, right);
+    maximum = _mm256_blendv_ps(maximum, left, right_only_nan);
+
+    // `f32::max` selects +0.0 when the operands are opposite signed zeros.
+    let both_zero = _mm256_and_ps(
+        _mm256_cmp_ps::<_CMP_EQ_OQ>(left, zero),
+        _mm256_cmp_ps::<_CMP_EQ_OQ>(right, zero),
+    );
+    let maximum_zero = _mm256_and_ps(left, right);
+    _mm256_blendv_ps(maximum, maximum_zero, both_zero)
 }
 
 #[inline(always)]
@@ -751,6 +826,189 @@ pub(super) unsafe fn linear_rows_8<const ROWS: usize>(
 
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn linear_6x16_packed<const ROWS: usize>(
+    output: &mut [f32],
+    output_stride: usize,
+    packed_input: &[f32],
+    weight: &[f32],
+    inner: usize,
+    columns: usize,
+    bias: Option<&[f32]>,
+    activation: Option<super::UnaryOperation>,
+) {
+    debug_assert!(ROWS > 0 && ROWS <= 6);
+    debug_assert!(columns > 0 && columns <= 16);
+    debug_assert!(output_stride >= columns);
+    debug_assert!(output.len() >= (ROWS - 1) * output_stride + columns);
+    debug_assert_eq!(packed_input.len(), ROWS * inner);
+    debug_assert_eq!(weight.len(), columns * inner);
+    debug_assert!(bias.is_none_or(|bias| bias.len() == columns));
+
+    let lane_indices = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let low_columns = columns.min(8);
+    let high_columns = columns.saturating_sub(8);
+    let low_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(low_columns as i32), lane_indices);
+    let high_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(high_columns as i32), lane_indices);
+    let zero = _mm256_setzero_ps();
+    let (initial0, initial1) = match bias {
+        Some(bias) => {
+            let initial0 = if low_columns == 8 {
+                unsafe { _mm256_loadu_ps(bias.as_ptr()) }
+            } else {
+                unsafe { _mm256_maskload_ps(bias.as_ptr(), low_mask) }
+            };
+            let initial1 = if high_columns == 8 {
+                unsafe { _mm256_loadu_ps(bias.as_ptr().add(8)) }
+            } else if high_columns > 0 {
+                unsafe { _mm256_maskload_ps(bias.as_ptr().add(8), high_mask) }
+            } else {
+                zero
+            };
+            (initial0, initial1)
+        }
+        None => (zero, zero),
+    };
+
+    let mut sum00 = initial0;
+    let mut sum01 = initial1;
+    let mut sum10 = initial0;
+    let mut sum11 = initial1;
+    let mut sum20 = initial0;
+    let mut sum21 = initial1;
+    let mut sum30 = initial0;
+    let mut sum31 = initial1;
+    let mut sum40 = initial0;
+    let mut sum41 = initial1;
+    let mut sum50 = initial0;
+    let mut sum51 = initial1;
+
+    macro_rules! accumulate {
+        ($index:expr, $weight0:expr, $weight1:expr) => {{
+            let input = unsafe { packed_input.as_ptr().add($index * ROWS) };
+            let scale = _mm256_set1_ps(unsafe { *input });
+            sum00 = _mm256_fmadd_ps(scale, $weight0, sum00);
+            sum01 = _mm256_fmadd_ps(scale, $weight1, sum01);
+            if ROWS > 1 {
+                let scale = _mm256_set1_ps(unsafe { *input.add(1) });
+                sum10 = _mm256_fmadd_ps(scale, $weight0, sum10);
+                sum11 = _mm256_fmadd_ps(scale, $weight1, sum11);
+            }
+            if ROWS > 2 {
+                let scale = _mm256_set1_ps(unsafe { *input.add(2) });
+                sum20 = _mm256_fmadd_ps(scale, $weight0, sum20);
+                sum21 = _mm256_fmadd_ps(scale, $weight1, sum21);
+            }
+            if ROWS > 3 {
+                let scale = _mm256_set1_ps(unsafe { *input.add(3) });
+                sum30 = _mm256_fmadd_ps(scale, $weight0, sum30);
+                sum31 = _mm256_fmadd_ps(scale, $weight1, sum31);
+            }
+            if ROWS > 4 {
+                let scale = _mm256_set1_ps(unsafe { *input.add(4) });
+                sum40 = _mm256_fmadd_ps(scale, $weight0, sum40);
+                sum41 = _mm256_fmadd_ps(scale, $weight1, sum41);
+            }
+            if ROWS > 5 {
+                let scale = _mm256_set1_ps(unsafe { *input.add(5) });
+                sum50 = _mm256_fmadd_ps(scale, $weight0, sum50);
+                sum51 = _mm256_fmadd_ps(scale, $weight1, sum51);
+            }
+        }};
+    }
+
+    macro_rules! full_step {
+        ($index:expr) => {{
+            let weight = unsafe { weight.as_ptr().add($index * 16) };
+            let weight0 = unsafe { _mm256_loadu_ps(weight) };
+            let weight1 = unsafe { _mm256_loadu_ps(weight.add(8)) };
+            accumulate!($index, weight0, weight1);
+        }};
+    }
+
+    macro_rules! tail_step {
+        ($index:expr) => {{
+            let weight = unsafe { weight.as_ptr().add($index * columns) };
+            let weight0 = if low_columns == 8 {
+                unsafe { _mm256_loadu_ps(weight) }
+            } else {
+                unsafe { _mm256_maskload_ps(weight, low_mask) }
+            };
+            let weight1 = if high_columns > 0 {
+                unsafe { _mm256_maskload_ps(weight.add(8), high_mask) }
+            } else {
+                zero
+            };
+            accumulate!($index, weight0, weight1);
+        }};
+    }
+
+    let mut index = 0;
+    if columns == 16 {
+        while index + 4 <= inner {
+            full_step!(index);
+            full_step!(index + 1);
+            full_step!(index + 2);
+            full_step!(index + 3);
+            index += 4;
+        }
+        while index < inner {
+            full_step!(index);
+            index += 1;
+        }
+    } else {
+        while index + 4 <= inner {
+            tail_step!(index);
+            tail_step!(index + 1);
+            tail_step!(index + 2);
+            tail_step!(index + 3);
+            index += 4;
+        }
+        while index < inner {
+            tail_step!(index);
+            index += 1;
+        }
+    }
+
+    macro_rules! store_row {
+        ($row:expr, $sum0:expr, $sum1:expr) => {{
+            let output = unsafe { output.as_mut_ptr().add($row * output_stride) };
+            let value0 = apply_vector_post_op($sum0, activation);
+            if low_columns == 8 {
+                unsafe { _mm256_storeu_ps(output, value0) };
+            } else {
+                unsafe { _mm256_maskstore_ps(output, low_mask, value0) };
+            }
+            if high_columns > 0 {
+                let value1 = apply_vector_post_op($sum1, activation);
+                if high_columns == 8 {
+                    unsafe { _mm256_storeu_ps(output.add(8), value1) };
+                } else {
+                    unsafe { _mm256_maskstore_ps(output.add(8), high_mask, value1) };
+                }
+            }
+        }};
+    }
+
+    store_row!(0, sum00, sum01);
+    if ROWS > 1 {
+        store_row!(1, sum10, sum11);
+    }
+    if ROWS > 2 {
+        store_row!(2, sum20, sum21);
+    }
+    if ROWS > 3 {
+        store_row!(3, sum30, sum31);
+    }
+    if ROWS > 4 {
+        store_row!(4, sum40, sum41);
+    }
+    if ROWS > 5 {
+        store_row!(5, sum50, sum51);
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub(super) unsafe fn gemm_4x16_sparse(
     output: &mut [f32],
     right: &[f32],
@@ -854,6 +1112,7 @@ pub(super) unsafe fn gemm_4x16_packed(
     right: &[f32],
     inner: usize,
     columns: usize,
+    output_stride: usize,
     right_stride: usize,
     bias: Option<&[f32]>,
     accumulate: bool,
@@ -862,37 +1121,82 @@ pub(super) unsafe fn gemm_4x16_packed(
     const ROWS: usize = 4;
     const PREFETCH_DISTANCE: usize = 16;
 
-    debug_assert_eq!(output.len(), ROWS * columns);
+    debug_assert!(output_stride >= columns);
+    debug_assert!(columns == 0 || output.len() >= (ROWS - 1) * output_stride + columns);
     debug_assert_eq!(left.len(), ROWS * inner);
+    debug_assert!(right_stride >= columns);
     debug_assert!(inner == 0 || right.len() >= inner.saturating_sub(1) * right_stride + columns);
     debug_assert!(bias.is_none_or(|bias| bias.len() == ROWS));
 
     let vector_columns = columns / 16 * 16;
     for column in (0..vector_columns).step_by(16) {
-        let mut accumulators = [_mm256_setzero_ps(); ROWS * 2];
-        for row in 0..ROWS {
-            if accumulate {
-                let output_base = unsafe { output.as_ptr().add(row * columns + column) };
-                accumulators[row * 2] = unsafe { _mm256_loadu_ps(output_base) };
-                accumulators[row * 2 + 1] = unsafe { _mm256_loadu_ps(output_base.add(8)) };
-            } else {
-                let initial = _mm256_set1_ps(bias.map_or(0.0, |bias| bias[row]));
-                accumulators[row * 2] = initial;
-                accumulators[row * 2 + 1] = initial;
-            }
-        }
+        let initial0 = _mm256_set1_ps(bias.map_or(0.0, |bias| bias[0]));
+        let initial1 = _mm256_set1_ps(bias.map_or(0.0, |bias| bias[1]));
+        let initial2 = _mm256_set1_ps(bias.map_or(0.0, |bias| bias[2]));
+        let initial3 = _mm256_set1_ps(bias.map_or(0.0, |bias| bias[3]));
+        let output0 = unsafe { output.as_ptr().add(column) };
+        let output1 = unsafe { output.as_ptr().add(output_stride + column) };
+        let output2 = unsafe { output.as_ptr().add(2 * output_stride + column) };
+        let output3 = unsafe { output.as_ptr().add(3 * output_stride + column) };
+        let mut sum00 = if accumulate {
+            unsafe { _mm256_loadu_ps(output0) }
+        } else {
+            initial0
+        };
+        let mut sum01 = if accumulate {
+            unsafe { _mm256_loadu_ps(output0.add(8)) }
+        } else {
+            initial0
+        };
+        let mut sum10 = if accumulate {
+            unsafe { _mm256_loadu_ps(output1) }
+        } else {
+            initial1
+        };
+        let mut sum11 = if accumulate {
+            unsafe { _mm256_loadu_ps(output1.add(8)) }
+        } else {
+            initial1
+        };
+        let mut sum20 = if accumulate {
+            unsafe { _mm256_loadu_ps(output2) }
+        } else {
+            initial2
+        };
+        let mut sum21 = if accumulate {
+            unsafe { _mm256_loadu_ps(output2.add(8)) }
+        } else {
+            initial2
+        };
+        let mut sum30 = if accumulate {
+            unsafe { _mm256_loadu_ps(output3) }
+        } else {
+            initial3
+        };
+        let mut sum31 = if accumulate {
+            unsafe { _mm256_loadu_ps(output3.add(8)) }
+        } else {
+            initial3
+        };
         macro_rules! k_step {
             ($index:expr) => {{
                 let index = $index;
                 let right_base = unsafe { right.as_ptr().add(index * right_stride + column) };
                 let right0 = unsafe { _mm256_loadu_ps(right_base) };
                 let right1 = unsafe { _mm256_loadu_ps(right_base.add(8)) };
-                for row in 0..ROWS {
-                    let scale = _mm256_set1_ps(unsafe { *left.get_unchecked(index * ROWS + row) });
-                    accumulators[row * 2] = _mm256_fmadd_ps(scale, right0, accumulators[row * 2]);
-                    accumulators[row * 2 + 1] =
-                        _mm256_fmadd_ps(scale, right1, accumulators[row * 2 + 1]);
-                }
+                let left = unsafe { left.as_ptr().add(index * ROWS) };
+                let scale0 = _mm256_set1_ps(unsafe { *left });
+                let scale1 = _mm256_set1_ps(unsafe { *left.add(1) });
+                let scale2 = _mm256_set1_ps(unsafe { *left.add(2) });
+                let scale3 = _mm256_set1_ps(unsafe { *left.add(3) });
+                sum00 = _mm256_fmadd_ps(scale0, right0, sum00);
+                sum01 = _mm256_fmadd_ps(scale0, right1, sum01);
+                sum10 = _mm256_fmadd_ps(scale1, right0, sum10);
+                sum11 = _mm256_fmadd_ps(scale1, right1, sum11);
+                sum20 = _mm256_fmadd_ps(scale2, right0, sum20);
+                sum21 = _mm256_fmadd_ps(scale2, right1, sum21);
+                sum30 = _mm256_fmadd_ps(scale3, right0, sum30);
+                sum31 = _mm256_fmadd_ps(scale3, right1, sum31);
             }};
         }
         let mut index = 0;
@@ -916,40 +1220,78 @@ pub(super) unsafe fn gemm_4x16_packed(
             k_step!(index);
             index += 1;
         }
-        for row in 0..ROWS {
-            let output_base = unsafe { output.as_mut_ptr().add(row * columns + column) };
-            unsafe {
-                _mm256_storeu_ps(
-                    output_base,
-                    apply_vector_post_op(accumulators[row * 2], activation),
-                );
-                _mm256_storeu_ps(
-                    output_base.add(8),
-                    apply_vector_post_op(accumulators[row * 2 + 1], activation),
-                );
-            }
+        unsafe {
+            _mm256_storeu_ps(
+                output.as_mut_ptr().add(column),
+                apply_vector_post_op(sum00, activation),
+            );
+            _mm256_storeu_ps(
+                output.as_mut_ptr().add(column + 8),
+                apply_vector_post_op(sum01, activation),
+            );
+            _mm256_storeu_ps(
+                output.as_mut_ptr().add(output_stride + column),
+                apply_vector_post_op(sum10, activation),
+            );
+            _mm256_storeu_ps(
+                output.as_mut_ptr().add(output_stride + column + 8),
+                apply_vector_post_op(sum11, activation),
+            );
+            _mm256_storeu_ps(
+                output.as_mut_ptr().add(2 * output_stride + column),
+                apply_vector_post_op(sum20, activation),
+            );
+            _mm256_storeu_ps(
+                output.as_mut_ptr().add(2 * output_stride + column + 8),
+                apply_vector_post_op(sum21, activation),
+            );
+            _mm256_storeu_ps(
+                output.as_mut_ptr().add(3 * output_stride + column),
+                apply_vector_post_op(sum30, activation),
+            );
+            _mm256_storeu_ps(
+                output.as_mut_ptr().add(3 * output_stride + column + 8),
+                apply_vector_post_op(sum31, activation),
+            );
         }
     }
 
     let mut column = vector_columns;
     if column + 8 <= columns {
-        let mut accumulators = [_mm256_setzero_ps(); ROWS];
-        for row in 0..ROWS {
-            accumulators[row] = if accumulate {
-                unsafe { _mm256_loadu_ps(output.as_ptr().add(row * columns + column)) }
-            } else {
-                _mm256_set1_ps(bias.map_or(0.0, |bias| bias[row]))
-            };
-        }
+        let mut sum0 = if accumulate {
+            unsafe { _mm256_loadu_ps(output.as_ptr().add(column)) }
+        } else {
+            _mm256_set1_ps(bias.map_or(0.0, |bias| bias[0]))
+        };
+        let mut sum1 = if accumulate {
+            unsafe { _mm256_loadu_ps(output.as_ptr().add(output_stride + column)) }
+        } else {
+            _mm256_set1_ps(bias.map_or(0.0, |bias| bias[1]))
+        };
+        let mut sum2 = if accumulate {
+            unsafe { _mm256_loadu_ps(output.as_ptr().add(2 * output_stride + column)) }
+        } else {
+            _mm256_set1_ps(bias.map_or(0.0, |bias| bias[2]))
+        };
+        let mut sum3 = if accumulate {
+            unsafe { _mm256_loadu_ps(output.as_ptr().add(3 * output_stride + column)) }
+        } else {
+            _mm256_set1_ps(bias.map_or(0.0, |bias| bias[3]))
+        };
         macro_rules! k_step {
             ($index:expr) => {{
                 let index = $index;
                 let right_value =
                     unsafe { _mm256_loadu_ps(right.as_ptr().add(index * right_stride + column)) };
-                for row in 0..ROWS {
-                    let scale = _mm256_set1_ps(unsafe { *left.get_unchecked(index * ROWS + row) });
-                    accumulators[row] = _mm256_fmadd_ps(scale, right_value, accumulators[row]);
-                }
+                let left = unsafe { left.as_ptr().add(index * ROWS) };
+                let scale0 = _mm256_set1_ps(unsafe { *left });
+                let scale1 = _mm256_set1_ps(unsafe { *left.add(1) });
+                let scale2 = _mm256_set1_ps(unsafe { *left.add(2) });
+                let scale3 = _mm256_set1_ps(unsafe { *left.add(3) });
+                sum0 = _mm256_fmadd_ps(scale0, right_value, sum0);
+                sum1 = _mm256_fmadd_ps(scale1, right_value, sum1);
+                sum2 = _mm256_fmadd_ps(scale2, right_value, sum2);
+                sum3 = _mm256_fmadd_ps(scale3, right_value, sum3);
             }};
         }
         let mut index = 0;
@@ -973,13 +1315,23 @@ pub(super) unsafe fn gemm_4x16_packed(
             k_step!(index);
             index += 1;
         }
-        for (row, accumulator) in accumulators.into_iter().enumerate() {
-            unsafe {
-                _mm256_storeu_ps(
-                    output.as_mut_ptr().add(row * columns + column),
-                    apply_vector_post_op(accumulator, activation),
-                )
-            };
+        unsafe {
+            _mm256_storeu_ps(
+                output.as_mut_ptr().add(column),
+                apply_vector_post_op(sum0, activation),
+            );
+            _mm256_storeu_ps(
+                output.as_mut_ptr().add(output_stride + column),
+                apply_vector_post_op(sum1, activation),
+            );
+            _mm256_storeu_ps(
+                output.as_mut_ptr().add(2 * output_stride + column),
+                apply_vector_post_op(sum2, activation),
+            );
+            _mm256_storeu_ps(
+                output.as_mut_ptr().add(3 * output_stride + column),
+                apply_vector_post_op(sum3, activation),
+            );
         }
         column += 8;
     }
@@ -987,14 +1339,216 @@ pub(super) unsafe fn gemm_4x16_packed(
     for row in 0..ROWS {
         for column in column..columns {
             let mut sum = if accumulate {
-                output[row * columns + column]
+                output[row * output_stride + column]
             } else {
                 bias.map_or(0.0, |bias| bias[row])
             };
             for index in 0..inner {
                 sum = left[index * ROWS + row].mul_add(right[index * right_stride + column], sum);
             }
-            output[row * columns + column] = apply_scalar_post_op(sum, activation);
+            output[row * output_stride + column] = apply_scalar_post_op(sum, activation);
+        }
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn gemm_6x16_packed<const SOFTWARE_PREFETCH: bool>(
+    output: &mut [f32],
+    left: &[f32],
+    right: &[f32],
+    inner: usize,
+    columns: usize,
+    output_stride: usize,
+    right_stride: usize,
+    bias: Option<&[f32]>,
+    accumulate: bool,
+    activation: Option<super::UnaryOperation>,
+) {
+    const ROWS: usize = 6;
+    const PREFETCH_DISTANCE: usize = 16;
+
+    debug_assert!(output_stride >= columns);
+    debug_assert!(columns == 0 || output.len() >= (ROWS - 1) * output_stride + columns);
+    debug_assert_eq!(left.len(), ROWS * inner);
+    debug_assert!(right_stride >= columns);
+    debug_assert!(inner == 0 || right.len() >= inner.saturating_sub(1) * right_stride + columns);
+    debug_assert!(bias.is_none_or(|bias| bias.len() == ROWS));
+
+    let vector_columns = columns / 16 * 16;
+    for column in (0..vector_columns).step_by(16) {
+        macro_rules! initial {
+            ($row:expr, $lane:expr) => {{
+                if accumulate {
+                    unsafe {
+                        _mm256_loadu_ps(output.as_ptr().add($row * output_stride + column + $lane))
+                    }
+                } else {
+                    _mm256_set1_ps(bias.map_or(0.0, |bias| bias[$row]))
+                }
+            }};
+        }
+        let mut sum00 = initial!(0, 0);
+        let mut sum01 = initial!(0, 8);
+        let mut sum10 = initial!(1, 0);
+        let mut sum11 = initial!(1, 8);
+        let mut sum20 = initial!(2, 0);
+        let mut sum21 = initial!(2, 8);
+        let mut sum30 = initial!(3, 0);
+        let mut sum31 = initial!(3, 8);
+        let mut sum40 = initial!(4, 0);
+        let mut sum41 = initial!(4, 8);
+        let mut sum50 = initial!(5, 0);
+        let mut sum51 = initial!(5, 8);
+
+        macro_rules! k_step {
+            ($index:expr) => {{
+                let index = $index;
+                let right_base = unsafe { right.as_ptr().add(index * right_stride + column) };
+                let right0 = unsafe { _mm256_loadu_ps(right_base) };
+                let right1 = unsafe { _mm256_loadu_ps(right_base.add(8)) };
+                let left = unsafe { left.as_ptr().add(index * ROWS) };
+                let scale = _mm256_set1_ps(unsafe { *left });
+                sum00 = _mm256_fmadd_ps(scale, right0, sum00);
+                sum01 = _mm256_fmadd_ps(scale, right1, sum01);
+                let scale = _mm256_set1_ps(unsafe { *left.add(1) });
+                sum10 = _mm256_fmadd_ps(scale, right0, sum10);
+                sum11 = _mm256_fmadd_ps(scale, right1, sum11);
+                let scale = _mm256_set1_ps(unsafe { *left.add(2) });
+                sum20 = _mm256_fmadd_ps(scale, right0, sum20);
+                sum21 = _mm256_fmadd_ps(scale, right1, sum21);
+                let scale = _mm256_set1_ps(unsafe { *left.add(3) });
+                sum30 = _mm256_fmadd_ps(scale, right0, sum30);
+                sum31 = _mm256_fmadd_ps(scale, right1, sum31);
+                let scale = _mm256_set1_ps(unsafe { *left.add(4) });
+                sum40 = _mm256_fmadd_ps(scale, right0, sum40);
+                sum41 = _mm256_fmadd_ps(scale, right1, sum41);
+                let scale = _mm256_set1_ps(unsafe { *left.add(5) });
+                sum50 = _mm256_fmadd_ps(scale, right0, sum50);
+                sum51 = _mm256_fmadd_ps(scale, right1, sum51);
+            }};
+        }
+
+        let mut index = 0;
+        while index + 4 <= inner {
+            if SOFTWARE_PREFETCH && inner - index > PREFETCH_DISTANCE {
+                let prefetch = index + PREFETCH_DISTANCE;
+                unsafe {
+                    _mm_prefetch::<_MM_HINT_T0>(left.as_ptr().add(prefetch * ROWS).cast());
+                    _mm_prefetch::<_MM_HINT_T0>(
+                        right.as_ptr().add(prefetch * right_stride + column).cast(),
+                    );
+                }
+            }
+            k_step!(index);
+            k_step!(index + 1);
+            k_step!(index + 2);
+            k_step!(index + 3);
+            index += 4;
+        }
+        while index < inner {
+            k_step!(index);
+            index += 1;
+        }
+
+        macro_rules! store {
+            ($row:expr, $lane:expr, $sum:expr) => {{
+                let value = activation.map_or($sum, |activation| {
+                    apply_vector_post_op($sum, Some(activation))
+                });
+                unsafe {
+                    _mm256_storeu_ps(
+                        output
+                            .as_mut_ptr()
+                            .add($row * output_stride + column + $lane),
+                        value,
+                    )
+                };
+            }};
+        }
+        store!(0, 0, sum00);
+        store!(0, 8, sum01);
+        store!(1, 0, sum10);
+        store!(1, 8, sum11);
+        store!(2, 0, sum20);
+        store!(2, 8, sum21);
+        store!(3, 0, sum30);
+        store!(3, 8, sum31);
+        store!(4, 0, sum40);
+        store!(4, 8, sum41);
+        store!(5, 0, sum50);
+        store!(5, 8, sum51);
+    }
+
+    let mut column = vector_columns;
+    if column + 8 <= columns {
+        macro_rules! initial {
+            ($row:expr) => {{
+                if accumulate {
+                    unsafe { _mm256_loadu_ps(output.as_ptr().add($row * output_stride + column)) }
+                } else {
+                    _mm256_set1_ps(bias.map_or(0.0, |bias| bias[$row]))
+                }
+            }};
+        }
+        let mut sum0 = initial!(0);
+        let mut sum1 = initial!(1);
+        let mut sum2 = initial!(2);
+        let mut sum3 = initial!(3);
+        let mut sum4 = initial!(4);
+        let mut sum5 = initial!(5);
+        let mut index = 0;
+        while index < inner {
+            let right =
+                unsafe { _mm256_loadu_ps(right.as_ptr().add(index * right_stride + column)) };
+            let left = unsafe { left.as_ptr().add(index * ROWS) };
+            let scale = _mm256_set1_ps(unsafe { *left });
+            sum0 = _mm256_fmadd_ps(scale, right, sum0);
+            let scale = _mm256_set1_ps(unsafe { *left.add(1) });
+            sum1 = _mm256_fmadd_ps(scale, right, sum1);
+            let scale = _mm256_set1_ps(unsafe { *left.add(2) });
+            sum2 = _mm256_fmadd_ps(scale, right, sum2);
+            let scale = _mm256_set1_ps(unsafe { *left.add(3) });
+            sum3 = _mm256_fmadd_ps(scale, right, sum3);
+            let scale = _mm256_set1_ps(unsafe { *left.add(4) });
+            sum4 = _mm256_fmadd_ps(scale, right, sum4);
+            let scale = _mm256_set1_ps(unsafe { *left.add(5) });
+            sum5 = _mm256_fmadd_ps(scale, right, sum5);
+            index += 1;
+        }
+        macro_rules! store {
+            ($row:expr, $sum:expr) => {{
+                let value = activation.map_or($sum, |activation| {
+                    apply_vector_post_op($sum, Some(activation))
+                });
+                unsafe {
+                    _mm256_storeu_ps(
+                        output.as_mut_ptr().add($row * output_stride + column),
+                        value,
+                    )
+                };
+            }};
+        }
+        store!(0, sum0);
+        store!(1, sum1);
+        store!(2, sum2);
+        store!(3, sum3);
+        store!(4, sum4);
+        store!(5, sum5);
+        column += 8;
+    }
+
+    for row in 0..ROWS {
+        for column in column..columns {
+            let mut sum = if accumulate {
+                output[row * output_stride + column]
+            } else {
+                bias.map_or(0.0, |bias| bias[row])
+            };
+            for index in 0..inner {
+                sum = left[index * ROWS + row].mul_add(right[index * right_stride + column], sum);
+            }
+            output[row * output_stride + column] = apply_scalar_post_op(sum, activation);
         }
     }
 }
@@ -1095,6 +1649,20 @@ pub(super) unsafe fn silu(values: &mut [f32]) {
     }
     for value in &mut values[vector_len..] {
         *value = *value / (1.0 + (-*value).exp());
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(super) unsafe fn sigmoid(values: &mut [f32]) {
+    let vector_len = values.len() / 8 * 8;
+    for offset in (0..vector_len).step_by(8) {
+        // SAFETY: `offset..offset + 8` is a complete in-bounds vector.
+        let input = unsafe { _mm256_loadu_ps(values.as_ptr().add(offset)) };
+        // SAFETY: The store covers the same in-bounds vector.
+        unsafe { _mm256_storeu_ps(values.as_mut_ptr().add(offset), sigmoid_vector(input)) };
+    }
+    for value in &mut values[vector_len..] {
+        *value = 1.0 / (1.0 + (-*value).exp());
     }
 }
 
@@ -1361,7 +1929,7 @@ mod tests {
     }
 
     #[test]
-    fn spatial_conv2d_packed_4_matches_scalar_with_padding_and_stride() {
+    fn spatial_conv2d_packed_6_matches_scalar_with_padding_and_stride() {
         if !simd_available() {
             return;
         }
@@ -1380,14 +1948,14 @@ mod tests {
             let input = (0..input_channels * input_height * input_width)
                 .map(|index| ((index * 17 % 43) as f32 - 21.0) / 13.0)
                 .collect::<Vec<_>>();
-            let weight = (0..input_channels * kernel_height * kernel_width * 4)
+            let weight = (0..input_channels * kernel_height * kernel_width * 6)
                 .map(|index| ((index * 11 % 31) as f32 - 15.0) / 19.0)
                 .collect::<Vec<_>>();
-            let bias = [-0.375, 0.25, -0.125, 0.5];
+            let bias = [-0.375, 0.25, -0.125, 0.5, -0.75, 0.625];
             let activation = relu.then_some(super::super::UnaryOperation::Relu);
             let output_plane = output_height * output_width;
-            let mut expected = vec![0.0; 4 * output_plane];
-            for output_channel in 0..4 {
+            let mut expected = vec![0.0; 6 * output_plane];
+            for output_channel in 0..6 {
                 for output_y in 0..output_height {
                     for output_x in 0..output_width {
                         let mut sum = bias[output_channel];
@@ -1415,7 +1983,7 @@ mod tests {
                                     let weight_index = ((input_channel * kernel_height + kernel_y)
                                         * kernel_width
                                         + kernel_x)
-                                        * 4
+                                        * 6
                                         + output_channel;
                                     sum = input_value.mul_add(weight[weight_index], sum);
                                 }
@@ -1431,7 +1999,7 @@ mod tests {
             let mut actual = vec![0.0; expected.len()];
             // SAFETY: The runtime feature check above covers this AVX2+FMA kernel.
             unsafe {
-                spatial_conv2d_packed_4(
+                spatial_conv2d_packed::<6>(
                     &mut actual,
                     &input,
                     &weight,
@@ -1450,6 +2018,20 @@ mod tests {
             };
             assert_close(&expected, &actual, 2e-5);
         }
+    }
+
+    #[test]
+    fn stride2_copy_uses_exact_31_value_source_extent() {
+        if !simd_available() {
+            return;
+        }
+        let input = (0..31).map(|value| value as f32).collect::<Vec<_>>();
+        let mut actual = [0.0; 16];
+        // SAFETY: The source contains offsets 0 through 30 and the destination
+        // contains all sixteen gathered values.
+        unsafe { copy_stride2_16(actual.as_mut_ptr(), input.as_ptr()) };
+        let expected = std::array::from_fn(|lane| (lane * 2) as f32);
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1529,10 +2111,97 @@ mod tests {
             .iter()
             .map(|&value| value / (1.0 + (-value).exp()))
             .collect::<Vec<_>>();
-        let mut actual = input;
+        let mut actual = input.clone();
         // SAFETY: The runtime feature check above covers this AVX2+FMA kernel.
         unsafe { silu(&mut actual) };
         assert_close(&expected, &actual, 4e-6);
+
+        let expected = input
+            .iter()
+            .map(|&value| 1.0 / (1.0 + (-value).exp()))
+            .collect::<Vec<_>>();
+        let mut actual = input;
+        // SAFETY: The runtime feature check above covers this AVX2+FMA kernel.
+        unsafe { sigmoid(&mut actual) };
+        assert_close(&expected, &actual, 4e-6);
+    }
+
+    #[test]
+    fn max_pool_rows_match_scalar_for_odd_even_widths_and_nans() {
+        if !simd_available() {
+            return;
+        }
+        for width in [17, 18] {
+            let mut current = (0..width)
+                .map(|index| (index as f32 - 9.0) * 0.25)
+                .collect::<Vec<_>>();
+            let mut next = (0..width)
+                .map(|index| (7.0 - index as f32) * 0.375)
+                .collect::<Vec<_>>();
+            current[2] = f32::NAN;
+            current[7] = -0.0;
+            current[8] = 0.0;
+            next[10] = f32::NAN;
+            next[width - 1] = f32::NAN;
+
+            for next_row in [None, Some(next.as_slice())] {
+                let mut expected = vec![0.0; width];
+                for x in 0..width {
+                    let mut maximum = current[x];
+                    if x + 1 < width {
+                        maximum = maximum.max(current[x + 1]);
+                    }
+                    if let Some(next) = next_row {
+                        maximum = maximum.max(next[x]);
+                        if x + 1 < width {
+                            maximum = maximum.max(next[x + 1]);
+                        }
+                    }
+                    expected[x] = maximum;
+                }
+                let mut actual = vec![0.0; width];
+                // SAFETY: The runtime feature check above covers this AVX2 kernel.
+                unsafe { max_pool_2x2_row(&mut actual, &current, next_row) };
+                for (expected, actual) in expected.iter().zip(&actual) {
+                    if expected.is_nan() {
+                        assert!(actual.is_nan());
+                    } else {
+                        assert_eq!(expected.to_bits(), actual.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sigmoid_preserves_nan_and_extreme_values_with_tail() {
+        if !simd_available() {
+            return;
+        }
+        let input = [
+            f32::NEG_INFINITY,
+            -100.0,
+            -10.0,
+            -0.0,
+            0.0,
+            10.0,
+            100.0,
+            f32::INFINITY,
+            f32::NAN,
+            -1.25,
+            2.5,
+        ];
+        let expected = input.map(|value| 1.0 / (1.0 + (-value).exp()));
+        let mut actual = input;
+        // SAFETY: The runtime feature check above covers this AVX2+FMA kernel.
+        unsafe { sigmoid(&mut actual) };
+        for (expected, actual) in expected.iter().zip(actual) {
+            if expected.is_nan() {
+                assert!(actual.is_nan());
+            } else {
+                assert!((expected - actual).abs() <= 4e-6);
+            }
+        }
     }
 
     #[test]
@@ -1723,57 +2392,107 @@ mod tests {
         assert_close(&expected, &actual, 2e-6);
     }
 
+    fn check_direct_linear_6x16<const ROWS: usize>(columns: usize) {
+        const CANARY: f32 = 12_345.0;
+        let inner = 13;
+        let output_stride = columns + 3;
+        let row_major_input = (0..ROWS * inner)
+            .map(|index| ((index * 17 % 31) as f32 - 15.0) / 19.0)
+            .collect::<Vec<_>>();
+        let mut packed_input = Vec::with_capacity(row_major_input.len());
+        for index in 0..inner {
+            for row in 0..ROWS {
+                packed_input.push(row_major_input[row * inner + index]);
+            }
+        }
+        let row_major_weight = (0..columns * inner)
+            .map(|index| ((index * 13 % 37) as f32 - 18.0) / 23.0)
+            .collect::<Vec<_>>();
+        let mut packed_weight = Vec::with_capacity(row_major_weight.len());
+        for index in 0..inner {
+            for column in 0..columns {
+                packed_weight.push(row_major_weight[column * inner + index]);
+            }
+        }
+        let bias = (0..columns)
+            .map(|column| (column as f32 - 9.0) / 29.0)
+            .collect::<Vec<_>>();
+
+        for (bias, activation, tolerance) in [
+            (None, None, 2e-6),
+            (
+                Some(bias.as_slice()),
+                Some(super::super::UnaryOperation::Silu),
+                3e-5,
+            ),
+        ] {
+            let mut expected = vec![0.0; ROWS * columns];
+            for row in 0..ROWS {
+                for column in 0..columns {
+                    let mut sum = bias.map_or(0.0, |bias| bias[column]);
+                    for index in 0..inner {
+                        sum = row_major_input[row * inner + index]
+                            .mul_add(row_major_weight[column * inner + index], sum);
+                    }
+                    expected[row * columns + column] =
+                        activation.map_or(sum, |activation| activation.apply(sum));
+                }
+            }
+
+            let mut output = vec![CANARY; ROWS * output_stride + 8];
+            // SAFETY: The caller checked AVX2/FMA. Buffers contain the exact
+            // packed dimensions passed to the kernel.
+            unsafe {
+                linear_6x16_packed::<ROWS>(
+                    &mut output,
+                    output_stride,
+                    &packed_input,
+                    &packed_weight,
+                    inner,
+                    columns,
+                    bias,
+                    activation,
+                )
+            };
+            let actual = (0..ROWS)
+                .flat_map(|row| output[row * output_stride..row * output_stride + columns].iter())
+                .copied()
+                .collect::<Vec<_>>();
+            assert_close(&expected, &actual, tolerance);
+            for row in 0..ROWS {
+                assert!(
+                    output[row * output_stride + columns..(row + 1) * output_stride]
+                        .iter()
+                        .all(|&value| value == CANARY),
+                    "row {row}, columns {columns}: output tail was overwritten"
+                );
+            }
+            assert!(
+                output[ROWS * output_stride..]
+                    .iter()
+                    .all(|&value| value == CANARY)
+            );
+        }
+    }
+
     #[test]
-    fn direct_linear_kernel_matches_scalar_with_output_tail_and_silu() {
+    fn direct_linear_6x16_matches_all_row_and_column_tails() {
         if !simd_available() {
             return;
         }
-        const ROWS: usize = 5;
-        let inner = 7;
-        let columns = 19;
-        let input = (0..ROWS * inner)
-            .map(|index| ((index * 17 % 31) as f32 - 15.0) / 9.0)
-            .collect::<Vec<_>>();
-        let row_major_weight = (0..columns * inner)
-            .map(|index| ((index * 13 % 37) as f32 - 18.0) / 11.0)
-            .collect::<Vec<_>>();
-        let bias = (0..columns)
-            .map(|column| (column as f32 - 9.0) / 13.0)
-            .collect::<Vec<_>>();
-        let mut packed_weight = Vec::with_capacity(row_major_weight.len());
-        for column_start in (0..columns).step_by(8) {
-            let block_columns = (columns - column_start).min(8);
-            for index in 0..inner {
-                for column in 0..block_columns {
-                    packed_weight.push(row_major_weight[(column_start + column) * inner + index]);
+        macro_rules! check_rows {
+            ($rows:literal) => {
+                for columns in [1, 6, 7, 8, 9, 10, 15, 16] {
+                    check_direct_linear_6x16::<$rows>(columns);
                 }
-            }
+            };
         }
-        let mut expected = vec![0.0; ROWS * columns];
-        for row in 0..ROWS {
-            for column in 0..columns {
-                let mut sum = bias[column];
-                for index in 0..inner {
-                    sum = input[row * inner + index]
-                        .mul_add(row_major_weight[column * inner + index], sum);
-                }
-                expected[row * columns + column] = sum / (1.0 + (-sum).exp());
-            }
-        }
-        let mut actual = vec![0.0; expected.len()];
-        // SAFETY: The runtime feature check above covers this AVX2+FMA kernel.
-        unsafe {
-            linear_rows_8::<ROWS>(
-                &mut actual,
-                &input,
-                &packed_weight,
-                inner,
-                columns,
-                Some(&bias),
-                Some(super::super::UnaryOperation::Silu),
-            )
-        };
-        assert_close(&expected, &actual, 8e-6);
+        check_rows!(1);
+        check_rows!(2);
+        check_rows!(3);
+        check_rows!(4);
+        check_rows!(5);
+        check_rows!(6);
     }
 
     #[test]
@@ -1856,6 +2575,7 @@ mod tests {
                 split,
                 columns,
                 columns,
+                columns,
                 Some(&bias),
                 false,
                 None,
@@ -1865,6 +2585,7 @@ mod tests {
                 &left[split * ROWS..],
                 &right[split * columns..],
                 inner - split,
+                columns,
                 columns,
                 columns,
                 Some(&bias),

@@ -5,6 +5,8 @@ use super::{
 use anyhow::{Context, Result, bail, ensure};
 use rayon::prelude::*;
 use std::sync::Arc;
+#[cfg(feature = "cpu-profile")]
+use std::time::Instant;
 
 const SPATIAL_PANEL_COLUMNS: usize = 16;
 
@@ -61,6 +63,7 @@ pub(crate) struct ConvOptions {
     pub groups: usize,
     pub direct_spatial: bool,
     pub packed_pointwise: bool,
+    pub blocked_pointwise: bool,
     pub system_dense_pointwise: bool,
     pub system_dense_spatial: bool,
     pub exact_sparse_weights: Option<ExactSparseConvWeights>,
@@ -124,6 +127,8 @@ pub(crate) struct PoolOptions {
 
 impl Node {
     pub(crate) fn run(&self, inputs: Vec<Tensor>) -> Result<Tensor> {
+        #[cfg(feature = "cpu-profile")]
+        let started = Instant::now();
         let result = match &self.operation {
             Operation::Add => binary(inputs, BinaryOperation::Add),
             Operation::AveragePool(options) => pool(inputs, options, false),
@@ -167,7 +172,62 @@ impl Node {
             Operation::Transpose { permutation } => transpose(inputs, permutation),
             Operation::Unsqueeze { axes } => unsqueeze(inputs, axes),
         };
+        #[cfg(feature = "cpu-profile")]
+        if let Ok(output) = &result {
+            profile_operation(&self.operation, output, started.elapsed());
+        }
         result.with_context(|| format!("execute {} ({:?})", self.name, self.operation))
+    }
+}
+
+#[cfg(feature = "cpu-profile")]
+fn profile_operation(operation: &Operation, output: &Tensor, elapsed: std::time::Duration) {
+    eprintln!(
+        "cpu-profile operation={} output={:?} elapsed_ms={:.6}",
+        operation_name(operation),
+        output.shape(),
+        elapsed.as_secs_f64() * 1_000.0
+    );
+}
+
+#[cfg(feature = "cpu-profile")]
+const fn operation_name(operation: &Operation) -> &'static str {
+    match operation {
+        Operation::Add => "Add",
+        Operation::AveragePool(_) => "AveragePool",
+        Operation::BatchNormalization { .. } => "BatchNormalization",
+        Operation::BiasSoftmax { .. } => "BiasSoftmax",
+        Operation::Concat { .. } => "Concat",
+        Operation::Conv(_) => "Conv",
+        Operation::ConvGelu(_) => "ConvGelu",
+        Operation::ConvRelu(_) => "ConvRelu",
+        Operation::ConvSilu(_) => "ConvSilu",
+        Operation::ConvTranspose(_) => "ConvTranspose",
+        Operation::Div => "Div",
+        Operation::Erf => "Erf",
+        Operation::Gelu => "Gelu",
+        Operation::GlobalAveragePool => "GlobalAveragePool",
+        Operation::HardSigmoid { .. } => "HardSigmoid",
+        Operation::HardSwish => "HardSwish",
+        Operation::MatMul => "MatMul",
+        Operation::MatMulBiasSoftmax { .. } => "MatMulBiasSoftmax",
+        Operation::MaxPool(_) => "MaxPool",
+        Operation::Mul => "Mul",
+        Operation::Pow => "Pow",
+        Operation::ReduceMean { .. } => "ReduceMean",
+        Operation::Relu => "Relu",
+        Operation::Reshape => "Reshape",
+        Operation::Resize => "Resize",
+        Operation::Shape => "Shape",
+        Operation::Sigmoid => "Sigmoid",
+        Operation::Silu => "Silu",
+        Operation::Slice => "Slice",
+        Operation::Softmax { .. } => "Softmax",
+        Operation::Sqrt => "Sqrt",
+        Operation::Squeeze { .. } => "Squeeze",
+        Operation::Sub => "Sub",
+        Operation::Transpose { .. } => "Transpose",
+        Operation::Unsqueeze { .. } => "Unsqueeze",
     }
 }
 
@@ -402,6 +462,17 @@ fn conv(
                 );
             } else if options.system_dense_pointwise {
                 kernels::gemm_system_dense(
+                    output,
+                    weight,
+                    input,
+                    output_channels,
+                    input_channels,
+                    output_plane,
+                    bias,
+                    activation,
+                );
+            } else if options.blocked_pointwise {
+                kernels::gemm_packed_left_blocked_6(
                     output,
                     weight,
                     input,

@@ -50,7 +50,9 @@ The Rust API is available under `ppocr_rs::cpu`.
 
 The native CPU path evaluates every nonzero model weight. On macOS, large pointwise convolutions
 use Accelerate SGEMM; the custom sparse kernels skip only exact-zero blocks and support arbitrary
-recognizer widths without a packed-layout fallback.
+recognizer widths without a packed-layout fallback. Windows MSVC builds use the `x86-64-v3`
+AVX2/FMA baseline configured in `.cargo/config.toml`; use four workers to reproduce the target
+latencies in `BENCHMARK.md`.
 
 ## Converted ONNX CPU Backend
 

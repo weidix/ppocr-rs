@@ -87,6 +87,7 @@ fn main() -> Result<()> {
             final_output = Some(output);
         }
     }
+    let average_ms = samples.iter().sum::<f64>() / samples.len() as f64;
     samples.sort_by(f64::total_cmp);
     let output = final_output.expect("positive run count");
     let values = output.as_f32()?;
@@ -96,6 +97,9 @@ fn main() -> Result<()> {
     println!("input: {shape:?}");
     println!("output: {:?}", output.shape());
     println!("output_sum: {output_sum:.9}");
+    println!("average_ms: {average_ms:.3}");
+    println!("p95_ms: {:.3}", percentile(&samples, 0.95));
+    println!("fps: {:.2}", 1_000.0 / average_ms);
     println!("p50_ms: {:.3}", percentile(&samples, 0.50));
     println!("p90_ms: {:.3}", percentile(&samples, 0.90));
 

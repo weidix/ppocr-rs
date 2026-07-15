@@ -16,6 +16,18 @@ fn has_avx2_fma() -> bool {
 }
 
 #[inline]
+pub(crate) fn supports_pointwise_pair_fusion() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        has_avx2_fma()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[inline]
 pub(crate) fn supports_exact_sparse_gemm() -> bool {
     #[cfg(target_arch = "aarch64")]
     {
@@ -85,9 +97,9 @@ pub(crate) fn spatial_conv2d_direct(
     pads: [usize; 4],
     activation: Option<UnaryOperation>,
 ) {
-    const BLOCK_ROWS: usize = 4;
+    const BLOCK_ROWS: usize = 6;
     assert!(supports_direct_spatial_conv());
-    assert!(output_channels.is_multiple_of(BLOCK_ROWS));
+    assert!(output_channels.is_multiple_of(4));
     assert_eq!(input.len(), input_channels * input_height * input_width);
     assert_eq!(output.len(), output_channels * output_height * output_width);
     let patch_size = input_channels * kernel_height * kernel_width;
@@ -95,36 +107,341 @@ pub(crate) fn spatial_conv2d_direct(
     assert!(bias.is_none_or(|bias| bias.len() == output_channels));
     let output_plane = output_height * output_width;
 
+    #[cfg(target_arch = "x86_64")]
+    if rayon::current_num_threads() == 1
+        && output_channels >= 16
+        && spatial_panel_working_set_fits(weight.len(), patch_size, output_channels)
+    {
+        // SAFETY: The runtime AVX2/FMA check is covered by
+        // supports_direct_spatial_conv(), and all tensor dimensions were
+        // validated above.
+        unsafe {
+            spatial_conv2d_micro_panels(
+                output,
+                input,
+                weight,
+                bias,
+                input_channels,
+                input_height,
+                input_width,
+                output_channels,
+                output_height,
+                output_width,
+                kernel_height,
+                kernel_width,
+                strides,
+                pads,
+                activation,
+            )
+        };
+        return;
+    }
+
     output
         .par_chunks_mut(BLOCK_ROWS * output_plane)
         .enumerate()
         .for_each(|(block, output)| {
             let row_start = block * BLOCK_ROWS;
-            let weight_start = block * BLOCK_ROWS * patch_size;
-            let weight = &weight[weight_start..weight_start + BLOCK_ROWS * patch_size];
-            let bias = bias.map(|bias| &bias[row_start..row_start + BLOCK_ROWS]);
+            let block_rows = output.len() / output_plane;
+            let weight_start = row_start * patch_size;
+            let weight = &weight[weight_start..weight_start + block_rows * patch_size];
+            let bias = bias.map(|bias| &bias[row_start..row_start + block_rows]);
             #[cfg(target_arch = "x86_64")]
             // SAFETY: Runtime AVX2/FMA support and all matrix/image dimensions
             // are validated above. The kernel handles borders without OOB loads.
             unsafe {
-                x86::spatial_conv2d_packed_4(
-                    output,
-                    input,
-                    weight,
-                    input_channels,
-                    input_height,
-                    input_width,
-                    output_height,
-                    output_width,
-                    kernel_height,
-                    kernel_width,
-                    strides,
-                    pads,
-                    bias,
-                    activation,
-                )
+                macro_rules! run {
+                    ($rows:literal) => {
+                        x86::spatial_conv2d_packed::<$rows>(
+                            output,
+                            input,
+                            weight,
+                            input_channels,
+                            input_height,
+                            input_width,
+                            output_height,
+                            output_width,
+                            kernel_height,
+                            kernel_width,
+                            strides,
+                            pads,
+                            bias,
+                            activation,
+                        )
+                    };
+                }
+                match block_rows {
+                    2 => run!(2),
+                    4 => run!(4),
+                    6 => run!(6),
+                    _ => unreachable!("direct spatial output-channel tail"),
+                }
             };
         });
+}
+
+#[cfg(target_arch = "x86_64")]
+fn spatial_panel_working_set_fits(
+    weight_elements: usize,
+    patch_size: usize,
+    output_channels: usize,
+) -> bool {
+    const PANEL_COLUMNS: usize = 16;
+    const MAX_WORKING_SET_BYTES: usize = 1024 * 1024;
+
+    patch_size
+        .checked_mul(PANEL_COLUMNS)
+        .and_then(|scratch| scratch.checked_add(weight_elements))
+        .and_then(|elements| {
+            output_channels
+                .checked_mul(PANEL_COLUMNS)
+                .and_then(|output| elements.checked_add(output))
+        })
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+        .is_some_and(|bytes| bytes <= MAX_WORKING_SET_BYTES)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn spatial_conv2d_micro_panels(
+    output: &mut [f32],
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    input_channels: usize,
+    input_height: usize,
+    input_width: usize,
+    output_channels: usize,
+    output_height: usize,
+    output_width: usize,
+    kernel_height: usize,
+    kernel_width: usize,
+    strides: [usize; 2],
+    pads: [usize; 4],
+    activation: Option<UnaryOperation>,
+) {
+    const PANEL_COLUMNS: usize = 16;
+    const BLOCK_ROWS: usize = 6;
+
+    let patch_size = input_channels * kernel_height * kernel_width;
+    let output_plane = output_height * output_width;
+    let mut panel = vec![0.0; patch_size * PANEL_COLUMNS];
+    let tail_rows = output_channels % BLOCK_ROWS;
+    let panel_rows = if tail_rows == 2 {
+        output_channels - tail_rows
+    } else {
+        output_channels
+    };
+
+    for output_y in 0..output_height {
+        for output_x in (0..output_width).step_by(PANEL_COLUMNS) {
+            let columns = (output_width - output_x).min(PANEL_COLUMNS);
+            pack_spatial_panel(
+                &mut panel,
+                input,
+                input_channels,
+                input_height,
+                input_width,
+                kernel_height,
+                kernel_width,
+                output_y,
+                output_x,
+                columns,
+                strides,
+                pads,
+            );
+
+            let mut output_channel = 0usize;
+            while output_channel < panel_rows {
+                let block_rows = (panel_rows - output_channel).min(BLOCK_ROWS);
+                let weight_start = output_channel * patch_size;
+                let output_start =
+                    output_channel * output_plane + output_y * output_width + output_x;
+                let block_bias =
+                    bias.map(|bias| &bias[output_channel..output_channel + block_rows]);
+                match block_rows {
+                    6 => {
+                        // SAFETY: The packed weight block is [K][6], the RHS
+                        // panel is [K][16], and every output row has
+                        // output_plane elements.
+                        unsafe {
+                            x86::gemm_6x16_packed::<false>(
+                                &mut output[output_start..],
+                                &weight[weight_start..weight_start + patch_size * 6],
+                                &panel,
+                                patch_size,
+                                columns,
+                                output_plane,
+                                PANEL_COLUMNS,
+                                block_bias,
+                                false,
+                                activation,
+                            )
+                        };
+                    }
+                    4 => {
+                        // SAFETY: Same layout and bounds argument as the
+                        // six-row block, with the final packed [K][4] tail.
+                        unsafe {
+                            x86::gemm_4x16_packed(
+                                &mut output[output_start..],
+                                &weight[weight_start..weight_start + patch_size * 4],
+                                &panel,
+                                patch_size,
+                                columns,
+                                output_plane,
+                                PANEL_COLUMNS,
+                                block_bias,
+                                false,
+                                activation,
+                            )
+                        };
+                    }
+                    _ => unreachable!("micro-panel output-channel block"),
+                }
+                output_channel += block_rows;
+            }
+        }
+    }
+
+    if panel_rows < output_channels {
+        let output_channel = panel_rows;
+        let weight_start = output_channel * patch_size;
+        // SAFETY: A two-row tail remains in the original direct-spatial layout
+        // and is evaluated by the existing kernel.
+        unsafe {
+            x86::spatial_conv2d_packed::<2>(
+                &mut output[output_channel * output_plane..],
+                input,
+                &weight[weight_start..],
+                input_channels,
+                input_height,
+                input_width,
+                output_height,
+                output_width,
+                kernel_height,
+                kernel_width,
+                strides,
+                pads,
+                bias.map(|bias| &bias[output_channel..]),
+                activation,
+            )
+        };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+fn pack_spatial_panel(
+    panel: &mut [f32],
+    input: &[f32],
+    input_channels: usize,
+    input_height: usize,
+    input_width: usize,
+    kernel_height: usize,
+    kernel_width: usize,
+    output_y: usize,
+    output_x: usize,
+    columns: usize,
+    strides: [usize; 2],
+    pads: [usize; 4],
+) {
+    const PANEL_COLUMNS: usize = 16;
+
+    let input_plane = input_height * input_width;
+    if columns == PANEL_COLUMNS {
+        let padded_y = output_y * strides[0];
+        let padded_x = output_x * strides[1];
+        if padded_y >= pads[0] && padded_x >= pads[1] {
+            let input_y = padded_y - pads[0];
+            let input_x = padded_x - pads[1];
+            let input_span = (PANEL_COLUMNS - 1) * strides[1] + kernel_width;
+            if input_y + kernel_height <= input_height && input_x + input_span <= input_width {
+                for input_channel in 0..input_channels {
+                    let channel =
+                        &input[input_channel * input_plane..(input_channel + 1) * input_plane];
+                    for kernel_y in 0..kernel_height {
+                        let source_row = (input_y + kernel_y) * input_width + input_x;
+                        for kernel_x in 0..kernel_width {
+                            let patch_index = (input_channel * kernel_height + kernel_y)
+                                * kernel_width
+                                + kernel_x;
+                            let destination = &mut panel
+                                [patch_index * PANEL_COLUMNS..(patch_index + 1) * PANEL_COLUMNS];
+                            let source = source_row + kernel_x;
+                            if strides[1] == 1 {
+                                destination
+                                    .copy_from_slice(&channel[source..source + PANEL_COLUMNS]);
+                            } else {
+                                // SAFETY: The full-window check above includes
+                                // every stride-two source offset through lane 15.
+                                unsafe {
+                                    copy_stride2_16(
+                                        destination.as_mut_ptr(),
+                                        channel.as_ptr().add(source),
+                                    )
+                                };
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    for input_channel in 0..input_channels {
+        let channel = &input[input_channel * input_plane..(input_channel + 1) * input_plane];
+        for kernel_y in 0..kernel_height {
+            let padded_input_y = output_y * strides[0] + kernel_y;
+            let valid_y = padded_input_y >= pads[0] && padded_input_y - pads[0] < input_height;
+            let input_y = padded_input_y.saturating_sub(pads[0]);
+            for kernel_x in 0..kernel_width {
+                let patch_index =
+                    (input_channel * kernel_height + kernel_y) * kernel_width + kernel_x;
+                let destination =
+                    &mut panel[patch_index * PANEL_COLUMNS..(patch_index + 1) * PANEL_COLUMNS];
+                if !valid_y {
+                    destination.fill(0.0);
+                    continue;
+                }
+
+                let padded_input_x = output_x * strides[1] + kernel_x;
+                if columns == PANEL_COLUMNS
+                    && strides[1] == 1
+                    && padded_input_x >= pads[1]
+                    && padded_input_x - pads[1] + PANEL_COLUMNS <= input_width
+                {
+                    let input_x = padded_input_x - pads[1];
+                    let source = input_y * input_width + input_x;
+                    destination.copy_from_slice(&channel[source..source + PANEL_COLUMNS]);
+                    continue;
+                }
+                if columns == PANEL_COLUMNS
+                    && strides[1] == 2
+                    && padded_input_x >= pads[1]
+                    && padded_input_x - pads[1] + 31 <= input_width
+                {
+                    let input_x = padded_input_x - pads[1];
+                    let source = input_y * input_width + input_x;
+                    // SAFETY: The source contains offsets 0 through 30 and the
+                    // destination is one complete sixteen-value panel row.
+                    unsafe {
+                        copy_stride2_16(destination.as_mut_ptr(), channel.as_ptr().add(source))
+                    };
+                    continue;
+                }
+
+                destination.fill(0.0);
+                for (lane, destination) in destination[..columns].iter_mut().enumerate() {
+                    let input_x = (output_x + lane) * strides[1] + kernel_x;
+                    if input_x >= pads[1] && input_x - pads[1] < input_width {
+                        *destination = channel[input_y * input_width + input_x - pads[1]];
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[inline]
@@ -212,6 +529,80 @@ pub(crate) fn depthwise_conv2d_same(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn depthwise_conv2d_same_strip(
+    output: &mut [f32],
+    input: &[f32],
+    weights: &[f32],
+    bias: Option<&[f32]>,
+    channels: usize,
+    height: usize,
+    width: usize,
+    kernel: usize,
+    y_start: usize,
+    rows: usize,
+) {
+    assert!(channels > 0 && height > 0 && width > 0 && rows > 0);
+    assert!(matches!(kernel, 3 | 5 | 7 | 9));
+    assert!(y_start <= height && rows <= height - y_start);
+    assert_eq!(output.len(), channels * rows * width);
+    assert_eq!(input.len(), channels * height * width);
+    assert_eq!(weights.len(), channels * kernel * kernel);
+    assert!(bias.is_none_or(|bias| bias.len() == channels));
+
+    macro_rules! dispatch {
+        ($kernel:literal) => {{
+            #[cfg(target_arch = "x86_64")]
+            if has_avx2_fma() {
+                for channel in 0..channels {
+                    let output_start = channel * rows * width;
+                    let input_start = channel * height * width;
+                    let weight_start = channel * $kernel * $kernel;
+                    // SAFETY: Runtime AVX2/FMA support and every per-channel
+                    // strip, input plane, and weight extent are checked above.
+                    unsafe {
+                        x86::depthwise_conv2d_same_rows::<$kernel>(
+                            &mut output[output_start..output_start + rows * width],
+                            &input[input_start..input_start + height * width],
+                            &weights[weight_start..weight_start + $kernel * $kernel],
+                            height,
+                            width,
+                            y_start,
+                            rows,
+                            bias.map_or(0.0, |bias| bias[channel]),
+                        )
+                    };
+                }
+                return;
+            }
+
+            for channel in 0..channels {
+                let output_start = channel * rows * width;
+                let input_start = channel * height * width;
+                let weight_start = channel * $kernel * $kernel;
+                depthwise_conv2d_same_rows_scalar::<$kernel>(
+                    &mut output[output_start..output_start + rows * width],
+                    &input[input_start..input_start + height * width],
+                    &weights[weight_start..weight_start + $kernel * $kernel],
+                    height,
+                    width,
+                    y_start,
+                    rows,
+                    bias.map_or(0.0, |bias| bias[channel]),
+                );
+            }
+        }};
+    }
+
+    match kernel {
+        3 => dispatch!(3),
+        5 => dispatch!(5),
+        7 => dispatch!(7),
+        9 => dispatch!(9),
+        _ => unreachable!(),
+    }
+}
+
 pub(crate) fn depthwise_conv2d_same_3x3_stride2(
     output: &mut [f32],
     input: &[f32],
@@ -274,8 +665,23 @@ fn depthwise_conv2d_same_scalar<const K: usize>(
     width: usize,
     bias: f32,
 ) {
+    depthwise_conv2d_same_rows_scalar::<K>(output, input, weights, height, width, 0, height, bias);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn depthwise_conv2d_same_rows_scalar<const K: usize>(
+    output: &mut [f32],
+    input: &[f32],
+    weights: &[f32],
+    height: usize,
+    width: usize,
+    y_start: usize,
+    rows: usize,
+    bias: f32,
+) {
     let padding = K / 2;
-    for y in 0..height {
+    for local_y in 0..rows {
+        let y = y_start + local_y;
         let kernel_y_start = padding.saturating_sub(y);
         let kernel_y_end = K.min(height + padding - y);
         for x in 0..width {
@@ -290,7 +696,7 @@ fn depthwise_conv2d_same_scalar<const K: usize>(
                         .mul_add(weights[kernel_y * K + kernel_x], sum);
                 }
             }
-            output[y * width + x] = sum;
+            output[local_y * width + x] = sum;
         }
     }
 }
@@ -432,6 +838,196 @@ pub(crate) fn gemm_packed_left_with_activation(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_packed_left_blocked_6(
+    output: &mut [f32],
+    left: &[f32],
+    right: &[f32],
+    rows: usize,
+    inner: usize,
+    columns: usize,
+    bias: Option<&[f32]>,
+    activation: Option<UnaryOperation>,
+) {
+    const BLOCK_ROWS: usize = 6;
+
+    assert!(rows > 0 && inner > 0 && columns > 0);
+    assert_eq!(output.len(), rows * columns);
+    assert_eq!(left.len(), rows * inner);
+    assert_eq!(right.len(), inner * columns);
+    assert!(bias.is_none_or(|bias| bias.len() == rows));
+
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2_fma() {
+        const COLUMN_BLOCK: usize = 16;
+        const TARGET_LEFT_ELEMENTS: usize = 224 * 1024;
+        let depth_block = (TARGET_LEFT_ELEMENTS / rows).clamp(64, 256) / 64 * 64;
+        let full_rows = rows / BLOCK_ROWS * BLOCK_ROWS;
+
+        if full_rows > 0 {
+            for depth_start in (0..inner).step_by(depth_block) {
+                let depth = (inner - depth_start).min(depth_block);
+                let final_activation = (depth_start + depth == inner)
+                    .then_some(activation)
+                    .flatten();
+                for column_start in (0..columns).step_by(COLUMN_BLOCK) {
+                    let block_columns = (columns - column_start).min(COLUMN_BLOCK);
+                    let right_start = depth_start * columns + column_start;
+                    let right = &right[right_start..];
+                    for row_start in (0..full_rows).step_by(BLOCK_ROWS) {
+                        let output_start = row_start * columns + column_start;
+                        let output = &mut output[output_start..];
+                        let left_start = row_start * inner + depth_start * BLOCK_ROWS;
+                        let left = &left[left_start..left_start + depth * BLOCK_ROWS];
+                        let bias = bias.map(|bias| &bias[row_start..row_start + BLOCK_ROWS]);
+                        // SAFETY: AVX2/FMA were detected above. The slices
+                        // describe one packed six-row by at-most-sixteen-column
+                        // tile with independent source and destination strides.
+                        unsafe {
+                            x86::gemm_6x16_packed::<true>(
+                                output,
+                                left,
+                                right,
+                                depth,
+                                block_columns,
+                                columns,
+                                columns,
+                                bias,
+                                depth_start != 0,
+                                final_activation,
+                            )
+                        };
+                    }
+                }
+            }
+        }
+
+        let tail_rows = rows - full_rows;
+        if tail_rows > 0 {
+            let output = &mut output[full_rows * columns..];
+            let left = &left[full_rows * inner..];
+            let bias = bias.map(|bias| &bias[full_rows..]);
+            macro_rules! tail {
+                ($rows:literal) => {
+                    // SAFETY: The final packed block stores exactly this many
+                    // interleaved rows for every K index.
+                    unsafe {
+                        x86::gemm_rows_8::<$rows, true>(
+                            output, left, right, inner, columns, columns, bias, None, activation,
+                        )
+                    }
+                };
+            }
+            match tail_rows {
+                1 => tail!(1),
+                2 => tail!(2),
+                3 => tail!(3),
+                4 => tail!(4),
+                5 => tail!(5),
+                _ => unreachable!(),
+            }
+        }
+        return;
+    }
+
+    for row_start in (0..rows).step_by(BLOCK_ROWS) {
+        let block_rows = (rows - row_start).min(BLOCK_ROWS);
+        let left = &left[row_start * inner..(row_start + block_rows) * inner];
+        for row in 0..block_rows {
+            for column in 0..columns {
+                let mut sum = bias.map_or(0.0, |bias| bias[row_start + row]);
+                for index in 0..inner {
+                    sum = left[index * block_rows + row]
+                        .mul_add(right[index * columns + column], sum);
+                }
+                output[(row_start + row) * columns + column] =
+                    activation.map_or(sum, |activation| activation.apply(sum));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_packed_left_tile(
+    output: &mut [f32],
+    left: &[f32],
+    right: &[f32],
+    rows: usize,
+    inner: usize,
+    columns: usize,
+    right_stride: usize,
+    bias: Option<&[f32]>,
+    activation: Option<UnaryOperation>,
+    block_rows: usize,
+) {
+    assert!(rows > 0 && inner > 0 && columns > 0);
+    assert!(columns <= 16);
+    assert!(matches!(block_rows, 6 | 12));
+    assert_eq!(output.len(), rows * columns);
+    assert_eq!(left.len(), rows * inner);
+    assert!(right_stride >= columns);
+    assert!(right.len() >= (inner - 1) * right_stride + columns);
+    assert!(bias.is_none_or(|bias| bias.len() == rows));
+
+    for row_start in (0..rows).step_by(block_rows) {
+        let tile_rows = (rows - row_start).min(block_rows);
+        let output = &mut output[row_start * columns..(row_start + tile_rows) * columns];
+        let left = &left[row_start * inner..(row_start + tile_rows) * inner];
+        let bias = bias.map(|bias| &bias[row_start..row_start + tile_rows]);
+
+        #[cfg(target_arch = "x86_64")]
+        if block_rows == 6 && tile_rows == 6 && has_avx2_fma() {
+            // SAFETY: AVX2/FMA support and all matrix extents are checked above.
+            // The packed block contains six weights per K position, while the
+            // right-hand tile uses the owning NCHW plane as its row stride.
+            unsafe {
+                if right_stride == columns {
+                    x86::gemm_6x16_packed::<false>(
+                        output,
+                        left,
+                        right,
+                        inner,
+                        columns,
+                        columns,
+                        right_stride,
+                        bias,
+                        false,
+                        activation,
+                    )
+                } else {
+                    x86::gemm_6x16_packed::<true>(
+                        output,
+                        left,
+                        right,
+                        inner,
+                        columns,
+                        columns,
+                        right_stride,
+                        bias,
+                        false,
+                        activation,
+                    )
+                }
+            };
+            continue;
+        }
+
+        gemm_rows(
+            output,
+            left,
+            right,
+            tile_rows,
+            inner,
+            columns,
+            right_stride,
+            bias,
+            None,
+            true,
+            activation,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn gemm_system_dense(
     output: &mut [f32],
     left: &[f32],
@@ -500,6 +1096,7 @@ pub(crate) fn linear_right_transposed(
     rows: usize,
     inner: usize,
     columns: usize,
+    #[cfg(target_arch = "x86_64")] weight_block_columns: usize,
     bias: Option<&[f32]>,
     activation: Option<UnaryOperation>,
     softmax: bool,
@@ -510,6 +1107,17 @@ pub(crate) fn linear_right_transposed(
     assert_eq!(weight.len(), columns * inner);
     assert!(bias.is_none_or(|bias| bias.len() == columns));
     assert!(!softmax || activation.is_none());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert!(matches!(weight_block_columns, 8 | 16));
+        if weight_block_columns == 16 {
+            linear_right_transposed_6x16(
+                output, input, weight, rows, inner, columns, bias, activation, softmax,
+            );
+            return;
+        }
+    }
 
     const MICRO_ROWS: usize = 8;
     let row_blocks = rows.div_ceil(MICRO_ROWS);
@@ -567,6 +1175,141 @@ pub(crate) fn linear_right_transposed(
                 }
             }
         });
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+fn linear_right_transposed_6x16(
+    output: &mut [f32],
+    input: &[f32],
+    weight: &[f32],
+    rows: usize,
+    inner: usize,
+    columns: usize,
+    bias: Option<&[f32]>,
+    activation: Option<UnaryOperation>,
+    softmax: bool,
+) {
+    const MICRO_ROWS: usize = 6;
+    let row_blocks = rows.div_ceil(MICRO_ROWS);
+    let blocks_per_task = row_blocks.div_ceil(rayon::current_num_threads()).max(1);
+    let task_rows = blocks_per_task * MICRO_ROWS;
+    output
+        .par_chunks_mut(task_rows * columns)
+        .enumerate()
+        .for_each(|(task, output)| {
+            let row_start = task * task_rows;
+            let task_row_count = (rows - row_start).min(task_rows);
+
+            if has_avx2_fma() {
+                let task_input_start = row_start * inner;
+                let task_input =
+                    &input[task_input_start..task_input_start + task_row_count * inner];
+                let mut packed_input = vec![0.0; task_row_count * inner];
+                for local_row in (0..task_row_count).step_by(MICRO_ROWS) {
+                    let block_rows = (task_row_count - local_row).min(MICRO_ROWS);
+                    let packed_start = local_row * inner;
+                    for index in 0..inner {
+                        for row in 0..block_rows {
+                            packed_input[packed_start + index * block_rows + row] =
+                                task_input[(local_row + row) * inner + index];
+                        }
+                    }
+                }
+
+                for column_start in (0..columns).step_by(16) {
+                    let block_columns = (columns - column_start).min(16);
+                    let weight_start = column_start * inner;
+                    let weight = &weight[weight_start..weight_start + block_columns * inner];
+                    let bias = bias.map(|bias| &bias[column_start..column_start + block_columns]);
+
+                    for local_row in (0..task_row_count).step_by(MICRO_ROWS) {
+                        let block_rows = (task_row_count - local_row).min(MICRO_ROWS);
+                        let packed_start = local_row * inner;
+                        let packed_input =
+                            &packed_input[packed_start..packed_start + block_rows * inner];
+                        let output_start = local_row * columns + column_start;
+                        let output = &mut output[output_start..];
+                        macro_rules! dispatch_rows {
+                            ($rows:literal) => {
+                                // SAFETY: AVX2/FMA were detected above. Input
+                                // and weights use the exact packed block widths.
+                                unsafe {
+                                    x86::linear_6x16_packed::<$rows>(
+                                        output,
+                                        columns,
+                                        packed_input,
+                                        weight,
+                                        inner,
+                                        block_columns,
+                                        bias,
+                                        activation,
+                                    )
+                                }
+                            };
+                        }
+                        match block_rows {
+                            1 => dispatch_rows!(1),
+                            2 => dispatch_rows!(2),
+                            3 => dispatch_rows!(3),
+                            4 => dispatch_rows!(4),
+                            5 => dispatch_rows!(5),
+                            6 => dispatch_rows!(6),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+
+                if softmax {
+                    output.chunks_mut(columns).for_each(softmax_in_place);
+                }
+                return;
+            }
+
+            for local_row in (0..task_row_count).step_by(MICRO_ROWS) {
+                let block_rows = (task_row_count - local_row).min(MICRO_ROWS);
+                let input_start = (row_start + local_row) * inner;
+                let input = &input[input_start..input_start + block_rows * inner];
+                let output = &mut output[local_row * columns..(local_row + block_rows) * columns];
+                linear_rows_scalar_x86_packed(
+                    output, input, weight, block_rows, inner, columns, 16, bias, activation,
+                );
+                if softmax {
+                    output.chunks_mut(columns).for_each(softmax_in_place);
+                }
+            }
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+fn linear_rows_scalar_x86_packed(
+    output: &mut [f32],
+    input: &[f32],
+    weight: &[f32],
+    rows: usize,
+    inner: usize,
+    columns: usize,
+    weight_block_columns: usize,
+    bias: Option<&[f32]>,
+    activation: Option<UnaryOperation>,
+) {
+    assert!(weight_block_columns > 0);
+    for column_start in (0..columns).step_by(weight_block_columns) {
+        let block_columns = (columns - column_start).min(weight_block_columns);
+        let weight = &weight[column_start * inner..(column_start + block_columns) * inner];
+        for row in 0..rows {
+            for column in 0..block_columns {
+                let mut sum = bias.map_or(0.0, |bias| bias[column_start + column]);
+                for index in 0..inner {
+                    sum = input[row * inner + index]
+                        .mul_add(weight[index * block_columns + column], sum);
+                }
+                output[row * columns + column_start + column] =
+                    activation.map_or(sum, |activation| activation.apply(sum));
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -972,6 +1715,7 @@ fn gemm_packed_panels_blocked(
                             depth,
                             PANEL_COLUMNS,
                             PANEL_COLUMNS,
+                            PANEL_COLUMNS,
                             bias,
                             depth_start != 0,
                             (depth_start + depth == inner)
@@ -1226,6 +1970,14 @@ pub(crate) fn max_pool_2x2_same_upper(output: &mut [f32], input: &[f32], width: 
             // right edge without reading past either row.
             unsafe { neon::max_pool_2x2_row(output, current, next) };
         }
+        #[cfg(target_arch = "x86_64")]
+        if has_avx2_fma() {
+            // SAFETY: AVX2/FMA were detected at runtime. Both source rows and
+            // the destination have the same width, and the kernel handles the
+            // right edge without an out-of-bounds shifted load.
+            unsafe { x86::max_pool_2x2_row(output, current, next) };
+            continue;
+        }
         #[cfg(not(target_arch = "aarch64"))]
         for x in 0..width {
             let mut maximum = current[x];
@@ -1421,6 +2173,11 @@ fn unary_chunk(values: &mut [f32], operation: UnaryOperation) {
                 unsafe { x86::silu(values) };
                 return;
             }
+            UnaryOperation::Sigmoid => {
+                // SAFETY: Same feature and slice-bounds argument as ReLU.
+                unsafe { x86::sigmoid(values) };
+                return;
+            }
             _ => {}
         }
     }
@@ -1549,6 +2306,299 @@ mod tests {
             .map(|(expected, actual)| (expected - actual).abs())
             .fold(0.0f32, f32::max);
         assert!(maximum_error < 2e-6, "maximum error: {maximum_error}");
+    }
+
+    #[test]
+    fn blocked_6x16_gemm_matches_scalar_across_row_depth_and_column_tails() {
+        let rows = 10;
+        let inner = 319;
+        let columns = 25;
+        let left = (0..rows * inner)
+            .map(|index| ((index * 19 % 59) as f32 - 29.0) / 31.0)
+            .collect::<Vec<_>>();
+        let right = (0..inner * columns)
+            .map(|index| ((index * 11 % 43) as f32 - 21.0) / 29.0)
+            .collect::<Vec<_>>();
+        let bias = (0..rows)
+            .map(|row| (row as f32 - 4.0) / 13.0)
+            .collect::<Vec<_>>();
+        let mut packed = Vec::with_capacity(left.len());
+        for row_start in (0..rows).step_by(6) {
+            let block_rows = (rows - row_start).min(6);
+            for index in 0..inner {
+                for row in 0..block_rows {
+                    packed.push(left[(row_start + row) * inner + index]);
+                }
+            }
+        }
+
+        let mut expected = vec![0.0; rows * columns];
+        for row in 0..rows {
+            for column in 0..columns {
+                let mut sum = bias[row];
+                for index in 0..inner {
+                    sum = left[row * inner + index].mul_add(right[index * columns + column], sum);
+                }
+                expected[row * columns + column] = UnaryOperation::Silu.apply(sum);
+            }
+        }
+        let mut actual = vec![0.0; rows * columns];
+        gemm_packed_left_blocked_6(
+            &mut actual,
+            &packed,
+            &right,
+            rows,
+            inner,
+            columns,
+            Some(&bias),
+            Some(UnaryOperation::Silu),
+        );
+        let maximum_error = expected
+            .iter()
+            .zip(&actual)
+            .map(|(expected, actual)| (expected - actual).abs())
+            .fold(0.0f32, f32::max);
+        assert!(maximum_error < 3e-5, "maximum error: {maximum_error}");
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+    #[test]
+    fn linear_scalar_fallback_decodes_packed_sixteen_column_weights() {
+        let rows = 13;
+        let inner = 9;
+        let columns = 22;
+        let input = (0..rows * inner)
+            .map(|index| ((index * 17 % 41) as f32 - 20.0) / 23.0)
+            .collect::<Vec<_>>();
+        let row_major_weight = (0..columns * inner)
+            .map(|index| ((index * 11 % 43) as f32 - 21.0) / 29.0)
+            .collect::<Vec<_>>();
+        let bias = (0..columns)
+            .map(|column| (column as f32 - 10.0) / 31.0)
+            .collect::<Vec<_>>();
+        let mut packed_weight = Vec::with_capacity(row_major_weight.len());
+        for column_start in (0..columns).step_by(16) {
+            let block_columns = (columns - column_start).min(16);
+            for index in 0..inner {
+                for column in 0..block_columns {
+                    packed_weight.push(row_major_weight[(column_start + column) * inner + index]);
+                }
+            }
+        }
+
+        let mut expected = vec![0.0; rows * columns];
+        for row in 0..rows {
+            for column in 0..columns {
+                let mut sum = bias[column];
+                for index in 0..inner {
+                    sum = input[row * inner + index]
+                        .mul_add(row_major_weight[column * inner + index], sum);
+                }
+                expected[row * columns + column] = UnaryOperation::Silu.apply(sum);
+            }
+        }
+        let mut actual = vec![0.0; expected.len()];
+        linear_rows_scalar_x86_packed(
+            &mut actual,
+            &input,
+            &packed_weight,
+            rows,
+            inner,
+            columns,
+            16,
+            Some(&bias),
+            Some(UnaryOperation::Silu),
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+    #[test]
+    fn conditional_linear_6x16_matches_large_layout_with_full_row_softmax() {
+        let rows = 40;
+        let inner = 192;
+        let columns = 6_906;
+        let input = (0..rows * inner)
+            .map(|index| ((index * 17 % 47) as f32 - 23.0) / 41.0)
+            .collect::<Vec<_>>();
+        let row_major_weight = (0..columns * inner)
+            .map(|index| ((index * 11 % 53) as f32 - 26.0) / 97.0)
+            .collect::<Vec<_>>();
+        let bias = (0..columns)
+            .map(|column| ((column * 7 % 37) as f32 - 18.0) / 89.0)
+            .collect::<Vec<_>>();
+        let mut packed_weight = Vec::with_capacity(row_major_weight.len());
+        for column_start in (0..columns).step_by(16) {
+            let block_columns = (columns - column_start).min(16);
+            for index in 0..inner {
+                for column in 0..block_columns {
+                    packed_weight.push(row_major_weight[(column_start + column) * inner + index]);
+                }
+            }
+        }
+
+        let mut expected = vec![0.0; rows * columns];
+        for row in 0..rows {
+            for column in 0..columns {
+                let mut sum = bias[column];
+                for index in 0..inner {
+                    sum = input[row * inner + index]
+                        .mul_add(row_major_weight[column * inner + index], sum);
+                }
+                expected[row * columns + column] = sum;
+            }
+            softmax_in_place(&mut expected[row * columns..(row + 1) * columns]);
+        }
+
+        let mut actual = vec![0.0; expected.len()];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("single-thread test pool");
+        pool.install(|| {
+            linear_right_transposed(
+                &mut actual,
+                &input,
+                &packed_weight,
+                rows,
+                inner,
+                columns,
+                16,
+                Some(&bias),
+                None,
+                true,
+            );
+        });
+        let maximum_error = expected
+            .iter()
+            .zip(&actual)
+            .map(|(expected, actual)| (expected - actual).abs())
+            .fold(0.0f32, f32::max);
+        assert!(maximum_error < 2e-7, "maximum error: {maximum_error}");
+        for row in actual.chunks_exact(columns) {
+            assert!((row.iter().sum::<f32>() - 1.0).abs() < 2e-5);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn direct_spatial_micro_panels_match_s1_s2_padding_and_column_tails() {
+        if !has_avx2_fma() {
+            return;
+        }
+
+        let cases = [
+            (5usize, 16usize, [1, 1], [1, 1, 1, 1], 16usize),
+            (7, 15, [2, 2], [1, 1, 1, 1], 8),
+            (6, 14, [1, 1], [1, 1, 1, 1], 14),
+        ];
+        let input_channels = 3;
+        let output_channels = 16;
+        let kernel_height = 3;
+        let kernel_width = 3;
+        let patch_size = input_channels * kernel_height * kernel_width;
+        let dense_weight = (0..output_channels * patch_size)
+            .map(|index| ((index * 17 % 47) as f32 - 23.0) / 29.0)
+            .collect::<Vec<_>>();
+        let bias = (0..output_channels)
+            .map(|channel| (channel as f32 - 7.0) / 19.0)
+            .collect::<Vec<_>>();
+        let mut packed_weight = Vec::with_capacity(dense_weight.len());
+        for row_start in (0..output_channels).step_by(6) {
+            let block_rows = (output_channels - row_start).min(6);
+            for index in 0..patch_size {
+                for row in 0..block_rows {
+                    packed_weight.push(dense_weight[(row_start + row) * patch_size + index]);
+                }
+            }
+        }
+        assert!(spatial_panel_working_set_fits(
+            packed_weight.len(),
+            patch_size,
+            output_channels
+        ));
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("single-thread test pool");
+        for (input_height, input_width, strides, pads, expected_width) in cases {
+            let output_height = (input_height + pads[0] + pads[2] - kernel_height) / strides[0] + 1;
+            let output_width = (input_width + pads[1] + pads[3] - kernel_width) / strides[1] + 1;
+            assert_eq!(output_width, expected_width);
+            let input = (0..input_channels * input_height * input_width)
+                .map(|index| ((index * 13 % 41) as f32 - 20.0) / 23.0)
+                .collect::<Vec<_>>();
+            let output_plane = output_height * output_width;
+            let mut expected = vec![0.0; output_channels * output_plane];
+            for output_channel in 0..output_channels {
+                for output_y in 0..output_height {
+                    for output_x in 0..output_width {
+                        let mut sum = bias[output_channel];
+                        for input_channel in 0..input_channels {
+                            for kernel_y in 0..kernel_height {
+                                let padded_y = output_y * strides[0] + kernel_y;
+                                if padded_y < pads[0] || padded_y - pads[0] >= input_height {
+                                    continue;
+                                }
+                                let input_y = padded_y - pads[0];
+                                for kernel_x in 0..kernel_width {
+                                    let padded_x = output_x * strides[1] + kernel_x;
+                                    if padded_x < pads[1] || padded_x - pads[1] >= input_width {
+                                        continue;
+                                    }
+                                    let input_x = padded_x - pads[1];
+                                    let input_value =
+                                        input[input_channel * input_height * input_width
+                                            + input_y * input_width
+                                            + input_x];
+                                    let patch_index = (input_channel * kernel_height + kernel_y)
+                                        * kernel_width
+                                        + kernel_x;
+                                    sum = input_value.mul_add(
+                                        dense_weight[output_channel * patch_size + patch_index],
+                                        sum,
+                                    );
+                                }
+                            }
+                        }
+                        expected
+                            [output_channel * output_plane + output_y * output_width + output_x] =
+                            UnaryOperation::Relu.apply(sum);
+                    }
+                }
+            }
+
+            let mut actual = vec![0.0; expected.len()];
+            pool.install(|| {
+                spatial_conv2d_direct(
+                    &mut actual,
+                    &input,
+                    &packed_weight,
+                    Some(&bias),
+                    input_channels,
+                    input_height,
+                    input_width,
+                    output_channels,
+                    output_height,
+                    output_width,
+                    kernel_height,
+                    kernel_width,
+                    strides,
+                    pads,
+                    Some(UnaryOperation::Relu),
+                );
+            });
+            let maximum_error = expected
+                .iter()
+                .zip(&actual)
+                .map(|(expected, actual)| (expected - actual).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                maximum_error < 3e-5,
+                "shape {input_height}x{input_width}, stride {strides:?}, output width {output_width}, maximum error {maximum_error}"
+            );
+        }
     }
 
     #[test]

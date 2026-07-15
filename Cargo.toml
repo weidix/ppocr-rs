@@ -11,6 +11,9 @@ default = ["candle-metal"]
 
 # Direct PP-OCRv6 Safetensors inference through native CPU kernels or WGPU.
 cpu = ["dep:rayon", "dep:safetensors"]
+# Compile-time operator timing for the native CPU backend. Normal inference
+# contains no profiling branch or logging.
+cpu-profile = ["cpu"]
 gpu = ["dep:safetensors", "dep:wgpu"]
 
 # Self-contained CPU inference. ONNX decoding is isolated to the offline

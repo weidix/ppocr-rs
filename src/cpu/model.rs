@@ -65,12 +65,36 @@ impl Default for CpuOptions {
 
 fn thread_pool(options: CpuOptions) -> Result<ThreadPool> {
     ensure!(options.threads > 0, "CPU thread count must be positive");
+    #[cfg(target_os = "windows")]
+    let cpu_sets = super::windows::preferred_performance_cpu_sets();
     ThreadPoolBuilder::new()
         .num_threads(options.threads)
         .thread_name(|index| format!("ppocr-cpu-{index}"))
+        .start_handler(move |_| {
+            enable_fast_denormals();
+            #[cfg(target_os = "windows")]
+            super::windows::configure_thread(&cpu_sets);
+        })
         .build()
         .context("create CPU inference thread pool")
 }
+
+#[cfg(target_arch = "x86_64")]
+#[allow(deprecated)]
+fn enable_fast_denormals() {
+    // The pool is private to one model, so this only changes floating-point
+    // handling for native CPU inference workers. FTZ and DAZ avoid the very
+    // slow x86 subnormal path while affecting only values below F32 normal range.
+    const DENORMALS_ARE_ZERO: u32 = 1 << 6;
+    const FLUSH_TO_ZERO: u32 = 1 << 15;
+    unsafe {
+        use core::arch::x86_64::{_mm_getcsr, _mm_setcsr};
+        _mm_setcsr(_mm_getcsr() | DENORMALS_ARE_ZERO | FLUSH_TO_ZERO);
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn enable_fast_denormals() {}
 
 #[derive(Clone, Copy)]
 enum Activation {
@@ -158,6 +182,21 @@ impl Conv2d {
     fn forward_gelu(&self, input: &Tensor) -> Result<Tensor> {
         self.convolution.forward_gelu(input)
     }
+
+    fn forward_pointwise_pair_gelu(
+        &self,
+        second: &Self,
+        input: Tensor,
+        residual: bool,
+    ) -> Result<Tensor> {
+        self.convolution
+            .forward_pointwise_pair_gelu(&second.convolution, input, residual)
+    }
+
+    fn forward_depthwise_pointwise(&self, pointwise: &Self, input: &Tensor) -> Result<Tensor> {
+        self.convolution
+            .forward_depthwise_pointwise(&pointwise.convolution, input)
+    }
 }
 
 struct RankOneConv2d {
@@ -211,7 +250,8 @@ impl RankOneConv2d {
     }
 
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        self.pointwise.forward(&self.depthwise.forward(input)?)
+        self.depthwise
+            .forward_depthwise_pointwise(&self.pointwise, input)
     }
 }
 
@@ -591,14 +631,11 @@ impl LcNetBlock {
             Some(se) => se.forward(output)?,
             None => output,
         };
-        let shortcut = output;
-        let output = self.channel_conv1.conv.forward_gelu(&shortcut)?;
-        let output = self.channel_conv2.forward(&output)?;
-        if self.residual {
-            shortcut.into_add(&output)
-        } else {
-            Ok(output)
-        }
+        self.channel_conv1.conv.forward_pointwise_pair_gelu(
+            &self.channel_conv2.conv,
+            output,
+            self.residual,
+        )
     }
 }
 
@@ -1029,7 +1066,7 @@ impl DetectorNeck {
         let mut top_down = Vec::with_capacity(4);
         for feature in adjusted.into_iter().rev() {
             let feature = match top_down.last() {
-                Some(upper) => feature.into_add(&upsample(upper, 2)?)?,
+                Some(upper) => upsample_add_nchw(feature, upper, 2)?,
                 None => feature,
             };
             top_down.push(feature);
@@ -1055,19 +1092,14 @@ impl DetectorNeck {
             .zip(&bottom_up)
             .map(|(conv, feature)| conv.forward(feature))
             .collect::<Result<Vec<_>>>()?;
-        let refined = self
+        let mut refined = self
             .intraclass
             .iter()
             .zip(lateral)
             .map(|(block, feature)| block.forward(feature))
             .collect::<Result<Vec<_>>>()?;
-        let mut features = refined
-            .iter()
-            .zip([1, 2, 4, 8])
-            .map(|(feature, scale)| upsample(feature, scale))
-            .collect::<Result<Vec<_>>>()?;
-        features.reverse();
-        Tensor::cat(&features.iter().collect::<Vec<_>>(), 1)
+        refined.reverse();
+        upsample_and_cat_nchw(&refined, &[8, 4, 2, 1])
     }
 }
 
@@ -1191,7 +1223,9 @@ impl DepthwiseSeparableConv {
     }
 
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        let hidden = self.pointwise.forward(&self.depthwise.forward(input)?)?;
+        let hidden = self
+            .depthwise
+            .forward_depthwise_pointwise(&self.pointwise, input)?;
         let attention = self.squeeze_excitation.attention(&hidden)?;
         hidden.into_residual_mul(&attention)
     }
@@ -1242,9 +1276,8 @@ impl RepLkFpn {
             .map(|(conv, feature)| conv.forward(feature))
             .collect::<Result<Vec<_>>>()?;
         for index in (0..3).rev() {
-            let upper = upsample(&fused[index + 1], 2)?;
             let current = fused.remove(index);
-            fused.insert(index, current.into_add(&upper)?);
+            fused.insert(index, upsample_add_nchw(current, &fused[index], 2)?);
         }
         let mut features = self
             .input
@@ -1252,20 +1285,172 @@ impl RepLkFpn {
             .zip(&fused)
             .map(|(conv, feature)| conv.forward(feature))
             .collect::<Result<Vec<_>>>()?;
-        for (feature, scale) in features.iter_mut().zip([1, 2, 4, 8]) {
-            *feature = upsample(feature, scale)?;
-        }
         features.reverse();
-        Tensor::cat(&features.iter().collect::<Vec<_>>(), 1)
+        upsample_and_cat_nchw(&features, &[8, 4, 2, 1])
     }
 }
 
+#[cfg(test)]
 fn upsample(input: &Tensor, scale: usize) -> Result<Tensor> {
     if scale == 1 {
         return Ok(input.clone());
     }
     let (_, _, height, width) = input.dims4()?;
     input.resize_nearest2d([height * scale, width * scale])
+}
+
+fn upsample_add_nchw(mut feature: Tensor, upper: &Tensor, scale: usize) -> Result<Tensor> {
+    ensure!(scale > 0, "nearest-neighbor scale must be positive");
+    let (batch, channels, height, width) = feature.dims4()?;
+    let (upper_batch, upper_channels, upper_height, upper_width) = upper.dims4()?;
+    ensure!(
+        batch == upper_batch && channels == upper_channels,
+        "upsample-add batch/channel mismatch: feature {:?}, upper {:?}",
+        feature.shape(),
+        upper.shape()
+    );
+    let expected_height = upper_height
+        .checked_mul(scale)
+        .context("upsample-add height overflow")?;
+    let expected_width = upper_width
+        .checked_mul(scale)
+        .context("upsample-add width overflow")?;
+    ensure!(
+        height == expected_height && width == expected_width,
+        "upsample-add spatial mismatch: feature {:?}, upper {:?}, scale {scale}",
+        feature.shape(),
+        upper.shape()
+    );
+    ensure!(
+        height > 0 && width > 0,
+        "upsample-add output dimensions must be positive"
+    );
+
+    let upper_plane = upper_height
+        .checked_mul(upper_width)
+        .context("upsample-add upper plane overflow")?;
+    let feature_plane = height
+        .checked_mul(width)
+        .context("upsample-add feature plane overflow")?;
+    let planes = batch
+        .checked_mul(channels)
+        .context("upsample-add plane count overflow")?;
+    let upper_values = upper.as_f32()?;
+    let feature_values = feature.f32_mut()?;
+    for plane in 0..planes {
+        let upper_plane = &upper_values[plane * upper_plane..(plane + 1) * upper_plane];
+        let feature_plane = &mut feature_values[plane * feature_plane..(plane + 1) * feature_plane];
+        for (upper_row, feature_rows) in upper_plane
+            .chunks_exact(upper_width)
+            .zip(feature_plane.chunks_exact_mut(width * scale))
+        {
+            for feature_row in feature_rows.chunks_exact_mut(width) {
+                for (&addend, values) in upper_row.iter().zip(feature_row.chunks_exact_mut(scale)) {
+                    for value in values {
+                        *value += addend;
+                    }
+                }
+            }
+        }
+    }
+    Ok(feature)
+}
+
+fn upsample_and_cat_nchw(features: &[Tensor], scales: &[usize]) -> Result<Tensor> {
+    ensure!(!features.is_empty(), "cannot fuse an empty feature list");
+    ensure!(
+        features.len() == scales.len(),
+        "feature and scale counts differ: {} and {}",
+        features.len(),
+        scales.len()
+    );
+
+    let (batch, _, first_height, first_width) = features[0].dims4()?;
+    let first_scale = scales[0];
+    ensure!(first_scale > 0, "nearest-neighbor scale must be positive");
+    let output_height = first_height
+        .checked_mul(first_scale)
+        .context("upsample-cat height overflow")?;
+    let output_width = first_width
+        .checked_mul(first_scale)
+        .context("upsample-cat width overflow")?;
+    ensure!(
+        output_height > 0 && output_width > 0,
+        "upsample-cat output dimensions must be positive"
+    );
+
+    let mut output_channels = 0usize;
+    for (index, (feature, &scale)) in features.iter().zip(scales).enumerate() {
+        ensure!(scale > 0, "nearest-neighbor scale {index} must be positive");
+        let (feature_batch, channels, height, width) = feature.dims4()?;
+        ensure!(
+            feature_batch == batch,
+            "upsample-cat batch mismatch at feature {index}: expected {batch}, found {feature_batch}"
+        );
+        let scaled_height = height
+            .checked_mul(scale)
+            .context("upsample-cat height overflow")?;
+        let scaled_width = width
+            .checked_mul(scale)
+            .context("upsample-cat width overflow")?;
+        ensure!(
+            scaled_height == output_height && scaled_width == output_width,
+            "upsample-cat spatial mismatch at feature {index}: shape {:?}, scale {scale}, target [{output_height}, {output_width}]",
+            feature.shape()
+        );
+        feature.as_f32()?;
+        output_channels = output_channels
+            .checked_add(channels)
+            .context("upsample-cat channel count overflow")?;
+    }
+
+    let output_plane = output_height
+        .checked_mul(output_width)
+        .context("upsample-cat output plane overflow")?;
+    let output_batch = output_channels
+        .checked_mul(output_plane)
+        .context("upsample-cat output batch overflow")?;
+    let output_len = batch
+        .checked_mul(output_batch)
+        .context("upsample-cat output length overflow")?;
+    let mut output = vec![0.0; output_len];
+
+    for batch_index in 0..batch {
+        let mut output_channel = 0usize;
+        for (feature, &scale) in features.iter().zip(scales) {
+            let (_, channels, height, width) = feature.dims4()?;
+            let input_plane = height
+                .checked_mul(width)
+                .context("upsample-cat input plane overflow")?;
+            let input = feature.as_f32()?;
+            for channel in 0..channels {
+                let input_plane_index = batch_index * channels + channel;
+                let input_plane =
+                    &input[input_plane_index * input_plane..(input_plane_index + 1) * input_plane];
+                let output_plane_index = batch_index * output_channels + output_channel + channel;
+                let output_plane = &mut output
+                    [output_plane_index * output_plane..(output_plane_index + 1) * output_plane];
+                for (input_row, output_rows) in input_plane
+                    .chunks_exact(width)
+                    .zip(output_plane.chunks_exact_mut(output_width * scale))
+                {
+                    for output_row in output_rows.chunks_exact_mut(output_width) {
+                        for (&value, pixels) in
+                            input_row.iter().zip(output_row.chunks_exact_mut(scale))
+                        {
+                            pixels.fill(value);
+                        }
+                    }
+                }
+            }
+            output_channel += channels;
+        }
+    }
+
+    Ok(Tensor::new_f32(
+        vec![batch, output_channels, output_height, output_width],
+        output,
+    ))
 }
 
 struct TransposeConvBnRelu {
@@ -1972,6 +2157,79 @@ mod tests {
         assert!(validate_input(&input(32, 31), true).is_err());
         assert!(validate_input(&input(48, 5), false).is_ok());
         assert!(validate_input(&input(48, 4), false).is_err());
+    }
+
+    #[test]
+    fn fused_upsample_add_matches_resize_then_add_for_multiple_batches() -> Result<()> {
+        let upper = Tensor::new_f32(
+            vec![2, 2, 2, 3],
+            (0..2 * 2 * 2 * 3)
+                .map(|index| (index as f32 - 9.0) * 0.125)
+                .collect(),
+        );
+        let feature = Tensor::new_f32(
+            vec![2, 2, 4, 6],
+            (0..2 * 2 * 4 * 6)
+                .map(|index| (index as f32 - 31.0) * 0.0625)
+                .collect(),
+        );
+
+        let expected = feature.clone().into_add(&upsample(&upper, 2)?)?;
+        let actual = upsample_add_nchw(feature, &upper, 2)?;
+
+        assert_eq!(actual.shape(), expected.shape());
+        assert_eq!(actual.as_f32()?, expected.as_f32()?);
+        Ok(())
+    }
+
+    #[test]
+    fn fused_upsample_cat_matches_reversed_neck_layout() -> Result<()> {
+        let make_feature = |shape: [usize; 4], offset: f32| {
+            let length: usize = shape.into_iter().product();
+            Tensor::new_f32(
+                shape.to_vec(),
+                (0..length)
+                    .map(|index| offset + index as f32 * 0.25)
+                    .collect(),
+            )
+        };
+        // DetectorNeck concatenates deepest-to-shallowest after reversing refined features.
+        let features = vec![
+            make_feature([2, 1, 1, 2], 100.0),
+            make_feature([2, 2, 2, 4], 10.0),
+            make_feature([2, 1, 4, 8], -20.0),
+        ];
+        let scales = [4, 2, 1];
+        let expanded = features
+            .iter()
+            .zip(scales)
+            .map(|(feature, scale)| upsample(feature, scale))
+            .collect::<Result<Vec<_>>>()?;
+        let expected = Tensor::cat(&expanded.iter().collect::<Vec<_>>(), 1)?;
+
+        let actual = upsample_and_cat_nchw(&features, &scales)?;
+
+        assert_eq!(actual.shape(), [2, 4, 4, 8]);
+        assert_eq!(actual.shape(), expected.shape());
+        assert_eq!(actual.as_f32()?, expected.as_f32()?);
+        Ok(())
+    }
+
+    #[test]
+    fn fused_upsample_rejects_incompatible_shapes() {
+        let upper = Tensor::new_f32(vec![1, 2, 2, 3], vec![0.0; 12]);
+        let wrong_batch = Tensor::new_f32(vec![2, 2, 4, 6], vec![0.0; 96]);
+        let wrong_channels = Tensor::new_f32(vec![1, 3, 4, 6], vec![0.0; 72]);
+        let wrong_spatial = Tensor::new_f32(vec![1, 2, 4, 5], vec![0.0; 40]);
+        assert!(upsample_add_nchw(wrong_batch, &upper, 2).is_err());
+        assert!(upsample_add_nchw(wrong_channels, &upper, 2).is_err());
+        assert!(upsample_add_nchw(wrong_spatial, &upper, 2).is_err());
+
+        let first = Tensor::new_f32(vec![2, 1, 1, 2], vec![0.0; 4]);
+        let wrong_batch = Tensor::new_f32(vec![1, 1, 2, 4], vec![0.0; 8]);
+        let wrong_spatial = Tensor::new_f32(vec![2, 1, 3, 4], vec![0.0; 24]);
+        assert!(upsample_and_cat_nchw(&[first.clone(), wrong_batch], &[2, 1]).is_err());
+        assert!(upsample_and_cat_nchw(&[first, wrong_spatial], &[2, 1]).is_err());
     }
 
     #[test]

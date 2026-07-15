@@ -5,6 +5,8 @@ use super::{
 };
 use anyhow::{Context, Result, ensure};
 use rayon::prelude::*;
+#[cfg(feature = "cpu-profile")]
+use std::time::Instant;
 
 fn run(operation: Operation, inputs: Vec<Tensor>) -> Result<Tensor> {
     Node {
@@ -12,6 +14,15 @@ fn run(operation: Operation, inputs: Vec<Tensor>) -> Result<Tensor> {
         operation,
     }
     .run(inputs)
+}
+
+#[cfg(feature = "cpu-profile")]
+fn profile_direct(operation: &str, output: &Tensor, started: Instant) {
+    eprintln!(
+        "cpu-profile operation={operation} output={:?} elapsed_ms={:.6}",
+        output.shape(),
+        started.elapsed().as_secs_f64() * 1_000.0
+    );
 }
 
 impl Tensor {
@@ -263,6 +274,7 @@ impl Tensor {
         run(Operation::GlobalAveragePool, vec![self.clone()])
     }
 
+    #[cfg(test)]
     pub(crate) fn resize_nearest2d(&self, size: [usize; 2]) -> Result<Self> {
         let (batch, channels, _, _) = self.dims4()?;
         let shape = [batch, channels, size[0], size[1]]
@@ -354,6 +366,18 @@ impl Conv2d {
             && output_channels.is_multiple_of(4)
             && exact_sparse_weights.is_none()
             && kernels::supports_direct_spatial_conv();
+        // Six output rows by sixteen contiguous spatial columns keeps the
+        // same accumulator count as the twelve-by-eight kernel while making
+        // better use of the wide NCHW feature planes used by these models.
+        let blocked_pointwise = cfg!(target_arch = "x86_64")
+            && groups == 1
+            && output_channels >= 128
+            && inner >= 96
+            && kernel_height == 1
+            && kernel_width == 1
+            && strides == [1, 1]
+            && pads == [0; 4]
+            && exact_sparse_weights.is_none();
         let packed_pointwise = groups == 1
             && ((kernel_height == 1 && kernel_width == 1)
                 || (strides != [1, 1] && output_channels >= 48)
@@ -362,10 +386,12 @@ impl Conv2d {
             && !system_dense_spatial
             && !direct_spatial;
         let weight = if direct_spatial {
-            pack_conv_rows(weight, output_channels, 4)?
+            pack_conv_rows(weight, output_channels, 6)?
         } else if packed_pointwise {
             if tiled_spatial || exact_sparse_weights.is_some() {
                 pack_conv_rows(weight, output_channels, 4)?
+            } else if blocked_pointwise {
+                pack_conv_rows(weight, output_channels, 6)?
             } else {
                 pack_conv_rows(weight, output_channels, 12)?
             }
@@ -381,6 +407,7 @@ impl Conv2d {
                 groups,
                 direct_spatial,
                 packed_pointwise,
+                blocked_pointwise,
                 system_dense_pointwise,
                 system_dense_spatial,
                 exact_sparse_weights,
@@ -402,6 +429,342 @@ impl Conv2d {
 
     pub(crate) fn forward_gelu(&self, input: &Tensor) -> Result<Tensor> {
         self.run(input, Some(kernels::UnaryOperation::Gelu))
+    }
+
+    pub(crate) fn forward_pointwise_pair_gelu(
+        &self,
+        second: &Self,
+        input: Tensor,
+        residual: bool,
+    ) -> Result<Tensor> {
+        let first_shape: Option<[usize; 4]> = self.weight.shape.as_slice().try_into().ok();
+        let second_shape: Option<[usize; 4]> = second.weight.shape.as_slice().try_into().ok();
+        let first_block_rows = self.packed_pointwise_block_rows();
+        let second_block_rows = second.packed_pointwise_block_rows();
+        let input_shape = input.dims4().ok();
+        let compatible = match (first_shape, second_shape, input_shape) {
+            (
+                Some([hidden_channels, input_channels, 1, 1]),
+                Some([output_channels, second_input_channels, 1, 1]),
+                Some((batch, actual_input_channels, height, width)),
+            ) => {
+                batch > 0
+                    && height > 0
+                    && width > 0
+                    && actual_input_channels == input_channels
+                    && second_input_channels == hidden_channels
+                    && (!residual || output_channels == input_channels)
+            }
+            _ => false,
+        };
+
+        if !compatible || first_block_rows.is_none() || second_block_rows.is_none() {
+            let hidden = self.forward_gelu(&input)?;
+            let output = second.forward(&hidden)?;
+            return if residual {
+                input.into_add(&output)
+            } else {
+                Ok(output)
+            };
+        }
+
+        #[cfg(feature = "cpu-profile")]
+        let started = Instant::now();
+        let [hidden_channels, input_channels, _, _] = first_shape.expect("compatible shape");
+        let [output_channels, _, _, _] = second_shape.expect("compatible shape");
+        let (batch, _, height, width) = input_shape.expect("compatible input");
+        let plane = height
+            .checked_mul(width)
+            .context("pointwise pair feature plane overflow")?;
+        let input_batch = input_channels
+            .checked_mul(plane)
+            .context("pointwise pair input batch overflow")?;
+        let output_batch = output_channels
+            .checked_mul(plane)
+            .context("pointwise pair output batch overflow")?;
+        let output_len = batch
+            .checked_mul(output_batch)
+            .context("pointwise pair output length overflow")?;
+        let first_block_rows = first_block_rows.expect("compatible packing");
+        let second_block_rows = second_block_rows.expect("compatible packing");
+
+        const TILE_COLUMNS: usize = 16;
+        // Small NCHW planes are already cache-resident and can be consumed
+        // directly. Larger planes benefit from a compact tile before GEMM.
+        const PACK_INPUT_MIN_ELEMENTS: usize = 128 * 1024;
+        let pack_input = input_batch >= PACK_INPUT_MIN_ELEMENTS;
+        let mut input_tile = if pack_input {
+            vec![0.0; input_channels * TILE_COLUMNS]
+        } else {
+            Vec::new()
+        };
+        let mut hidden_tile = vec![0.0; hidden_channels * TILE_COLUMNS];
+        let mut output_tile = vec![0.0; output_channels * TILE_COLUMNS];
+
+        if residual {
+            let mut output = input;
+            let values = output.f32_mut()?;
+            for batch_index in 0..batch {
+                let batch_start = batch_index * input_batch;
+                for column_start in (0..plane).step_by(TILE_COLUMNS) {
+                    let columns = (plane - column_start).min(TILE_COLUMNS);
+                    let (first_input, first_stride) = if pack_input {
+                        for input_channel in 0..input_channels {
+                            let source = batch_start + input_channel * plane + column_start;
+                            let destination = input_channel * columns;
+                            input_tile[destination..destination + columns]
+                                .copy_from_slice(&values[source..source + columns]);
+                        }
+                        (&input_tile[..input_channels * columns], columns)
+                    } else {
+                        (&values[batch_start + column_start..], plane)
+                    };
+                    self.run_packed_pointwise_tile(
+                        &mut hidden_tile[..hidden_channels * columns],
+                        first_input,
+                        input_channels,
+                        columns,
+                        first_stride,
+                        first_block_rows,
+                        Some(kernels::UnaryOperation::Gelu),
+                    )?;
+                    second.run_packed_pointwise_tile(
+                        &mut output_tile[..output_channels * columns],
+                        &hidden_tile[..hidden_channels * columns],
+                        hidden_channels,
+                        columns,
+                        columns,
+                        second_block_rows,
+                        None,
+                    )?;
+                    for output_channel in 0..output_channels {
+                        let output_start = batch_start + output_channel * plane + column_start;
+                        let tile_start = output_channel * columns;
+                        kernels::add_in_place(
+                            &mut values[output_start..output_start + columns],
+                            &output_tile[tile_start..tile_start + columns],
+                        );
+                    }
+                }
+            }
+            #[cfg(feature = "cpu-profile")]
+            profile_direct("PointwisePairGelu", &output, started);
+            Ok(output)
+        } else {
+            let input_values = input.as_f32()?;
+            let mut output_values = vec![0.0; output_len];
+            for batch_index in 0..batch {
+                let input_start = batch_index * input_batch;
+                let output_start = batch_index * output_batch;
+                for column_start in (0..plane).step_by(TILE_COLUMNS) {
+                    let columns = (plane - column_start).min(TILE_COLUMNS);
+                    let (first_input, first_stride) = if pack_input {
+                        for input_channel in 0..input_channels {
+                            let source = input_start + input_channel * plane + column_start;
+                            let destination = input_channel * columns;
+                            input_tile[destination..destination + columns]
+                                .copy_from_slice(&input_values[source..source + columns]);
+                        }
+                        (&input_tile[..input_channels * columns], columns)
+                    } else {
+                        (&input_values[input_start + column_start..], plane)
+                    };
+                    self.run_packed_pointwise_tile(
+                        &mut hidden_tile[..hidden_channels * columns],
+                        first_input,
+                        input_channels,
+                        columns,
+                        first_stride,
+                        first_block_rows,
+                        Some(kernels::UnaryOperation::Gelu),
+                    )?;
+                    second.run_packed_pointwise_tile(
+                        &mut output_tile[..output_channels * columns],
+                        &hidden_tile[..hidden_channels * columns],
+                        hidden_channels,
+                        columns,
+                        columns,
+                        second_block_rows,
+                        None,
+                    )?;
+                    for output_channel in 0..output_channels {
+                        let destination = output_start + output_channel * plane + column_start;
+                        let tile_start = output_channel * columns;
+                        output_values[destination..destination + columns]
+                            .copy_from_slice(&output_tile[tile_start..tile_start + columns]);
+                    }
+                }
+            }
+            let output =
+                Tensor::new_f32(vec![batch, output_channels, height, width], output_values);
+            #[cfg(feature = "cpu-profile")]
+            profile_direct("PointwisePairGelu", &output, started);
+            Ok(output)
+        }
+    }
+
+    pub(crate) fn forward_depthwise_pointwise(
+        &self,
+        pointwise: &Self,
+        input: &Tensor,
+    ) -> Result<Tensor> {
+        let depthwise_shape: Option<[usize; 4]> = self.weight.shape.as_slice().try_into().ok();
+        let pointwise_shape: Option<[usize; 4]> = pointwise.weight.shape.as_slice().try_into().ok();
+        let pointwise_block_rows = pointwise.packed_pointwise_block_rows();
+        let input_shape = input.dims4().ok();
+        let compatible = match (depthwise_shape, pointwise_shape, input_shape) {
+            (
+                Some([channels, 1, kernel_height, kernel_width]),
+                Some([_, pointwise_input_channels, 1, 1]),
+                Some((batch, input_channels, height, width)),
+            ) => {
+                let padding = kernel_height / 2;
+                batch > 0
+                    && height > 0
+                    && width > 0
+                    && channels == input_channels
+                    && pointwise_input_channels == channels
+                    && kernel_height == kernel_width
+                    && matches!(kernel_height, 3 | 5 | 7 | 9)
+                    && self.options.groups == channels
+                    && self.options.strides == [1, 1]
+                    && self.options.pads == [padding; 4]
+            }
+            _ => false,
+        };
+
+        if !compatible || pointwise_block_rows.is_none() {
+            return pointwise.forward(&self.forward(input)?);
+        }
+
+        #[cfg(feature = "cpu-profile")]
+        let started = Instant::now();
+        let [channels, _, kernel, _] = depthwise_shape.expect("compatible depthwise shape");
+        let [output_channels, _, _, _] = pointwise_shape.expect("compatible pointwise shape");
+        let (batch, _, height, width) = input_shape.expect("compatible input");
+        let plane = height
+            .checked_mul(width)
+            .context("depthwise-pointwise feature plane overflow")?;
+        let input_batch = channels
+            .checked_mul(plane)
+            .context("depthwise-pointwise input batch overflow")?;
+        let output_batch = output_channels
+            .checked_mul(plane)
+            .context("depthwise-pointwise output batch overflow")?;
+        let output_len = batch
+            .checked_mul(output_batch)
+            .context("depthwise-pointwise output length overflow")?;
+        let pointwise_block_rows = pointwise_block_rows.expect("compatible pointwise packing");
+        let depthwise_weight = self.weight.as_f32()?;
+        let depthwise_bias = self.bias.as_ref().map(Tensor::as_f32).transpose()?;
+        let input_values = input.as_f32()?;
+
+        const STRIP_ROWS: usize = 4;
+        const TILE_COLUMNS: usize = 16;
+        let maximum_strip_rows = height.min(STRIP_ROWS);
+        let maximum_strip_plane = maximum_strip_rows
+            .checked_mul(width)
+            .context("depthwise-pointwise strip plane overflow")?;
+        let strip_len = channels
+            .checked_mul(maximum_strip_plane)
+            .context("depthwise-pointwise strip length overflow")?;
+        let tile_len = output_channels
+            .checked_mul(TILE_COLUMNS)
+            .context("depthwise-pointwise tile length overflow")?;
+        let mut depthwise_strip = vec![0.0; strip_len];
+        let mut output_tile = vec![0.0; tile_len];
+        let mut output_values = vec![0.0; output_len];
+
+        for batch_index in 0..batch {
+            let input_start = batch_index * input_batch;
+            let output_start = batch_index * output_batch;
+            let batch_input = &input_values[input_start..input_start + input_batch];
+            for y_start in (0..height).step_by(STRIP_ROWS) {
+                let rows = (height - y_start).min(STRIP_ROWS);
+                let strip_plane = rows * width;
+                let strip = &mut depthwise_strip[..channels * strip_plane];
+                kernels::depthwise_conv2d_same_strip(
+                    strip,
+                    batch_input,
+                    depthwise_weight,
+                    depthwise_bias,
+                    channels,
+                    height,
+                    width,
+                    kernel,
+                    y_start,
+                    rows,
+                );
+
+                for column_start in (0..strip_plane).step_by(TILE_COLUMNS) {
+                    let columns = (strip_plane - column_start).min(TILE_COLUMNS);
+                    pointwise.run_packed_pointwise_tile(
+                        &mut output_tile[..output_channels * columns],
+                        &strip[column_start..],
+                        channels,
+                        columns,
+                        strip_plane,
+                        pointwise_block_rows,
+                        None,
+                    )?;
+                    let output_column = y_start * width + column_start;
+                    for output_channel in 0..output_channels {
+                        let destination = output_start + output_channel * plane + output_column;
+                        let tile_start = output_channel * columns;
+                        output_values[destination..destination + columns]
+                            .copy_from_slice(&output_tile[tile_start..tile_start + columns]);
+                    }
+                }
+            }
+        }
+
+        let output = Tensor::new_f32(vec![batch, output_channels, height, width], output_values);
+        #[cfg(feature = "cpu-profile")]
+        profile_direct("DepthwisePointwise", &output, started);
+        Ok(output)
+    }
+
+    fn packed_pointwise_block_rows(&self) -> Option<usize> {
+        (kernels::supports_pointwise_pair_fusion()
+            && self.options.groups == 1
+            && self.options.strides == [1, 1]
+            && self.options.pads == [0; 4]
+            && self.options.packed_pointwise
+            && !self.options.system_dense_pointwise
+            && self.options.exact_sparse_weights.is_none())
+        .then_some(if self.options.blocked_pointwise {
+            6
+        } else {
+            12
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_packed_pointwise_tile(
+        &self,
+        output: &mut [f32],
+        input: &[f32],
+        input_channels: usize,
+        columns: usize,
+        input_stride: usize,
+        block_rows: usize,
+        activation: Option<kernels::UnaryOperation>,
+    ) -> Result<()> {
+        let output_channels = self.weight.shape[0];
+        let bias = self.bias.as_ref().map(Tensor::as_f32).transpose()?;
+        kernels::gemm_packed_left_tile(
+            output,
+            self.weight.as_f32()?,
+            input,
+            output_channels,
+            input_channels,
+            columns,
+            input_stride,
+            bias,
+            activation,
+            block_rows,
+        );
+        Ok(())
     }
 
     fn run(&self, input: &Tensor, activation: Option<kernels::UnaryOperation>) -> Result<Tensor> {
@@ -489,6 +852,7 @@ impl ConvTranspose2d {
                 groups,
                 direct_spatial: false,
                 packed_pointwise: false,
+                blocked_pointwise: false,
                 system_dense_pointwise: false,
                 system_dense_spatial: false,
                 exact_sparse_weights: None,
@@ -547,12 +911,19 @@ impl LayerNorm {
 
 #[derive(Clone)]
 pub(crate) struct Linear {
-    // x86 kernels consume weights packed in eight-row blocks. Other targets
-    // consume the native [out, in] layout directly.
+    // x86 kernels normally consume eight-column blocks. Large classifiers use
+    // sixteen-column blocks; other targets keep native [out, in] weights.
     weight: Tensor,
     input_features: usize,
     output_features: usize,
     bias: Option<Tensor>,
+    #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+    weight_block_columns: usize,
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+const fn use_linear_6x16(input_features: usize, output_features: usize) -> bool {
+    input_features >= 192 && output_features >= 4_096
 }
 
 impl Linear {
@@ -574,12 +945,20 @@ impl Linear {
             );
         }
         #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
-        let weight = pack_conv_rows(weight, output_features, 8)?;
+        let weight_block_columns = if use_linear_6x16(input_features, output_features) {
+            16
+        } else {
+            8
+        };
+        #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+        let weight = pack_conv_rows(weight, output_features, weight_block_columns)?;
         Ok(Self {
             weight,
             input_features,
             output_features,
             bias,
+            #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+            weight_block_columns,
         })
     }
 
@@ -621,6 +1000,8 @@ impl Linear {
             return Ok(Tensor::new_f32(output_shape, Vec::new()));
         }
 
+        #[cfg(feature = "cpu-profile")]
+        let started = Instant::now();
         let input = input.as_f32()?;
         let weight = self.weight.as_f32()?;
         let bias = self.bias.as_ref().map(Tensor::as_f32).transpose()?;
@@ -640,7 +1021,20 @@ impl Linear {
         if let Some(activation) = activation {
             kernels::unary_in_place(&mut output, activation);
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+        kernels::linear_right_transposed(
+            &mut output,
+            input,
+            weight,
+            rows,
+            self.input_features,
+            self.output_features,
+            self.weight_block_columns,
+            bias,
+            activation,
+            apply_softmax,
+        );
+        #[cfg(all(not(target_os = "macos"), not(target_arch = "x86_64")))]
         kernels::linear_right_transposed(
             &mut output,
             input,
@@ -651,6 +1045,11 @@ impl Linear {
             bias,
             activation,
             apply_softmax,
+        );
+        #[cfg(feature = "cpu-profile")]
+        eprintln!(
+            "cpu-profile operation=Linear output={output_shape:?} elapsed_ms={:.6}",
+            started.elapsed().as_secs_f64() * 1_000.0
         );
         Ok(Tensor::new_f32(output_shape, output))
     }
@@ -724,6 +1123,24 @@ mod tests {
         let expected_softmax = expected.clone().into_softmax(-1).unwrap();
         let actual = linear.forward_softmax(&input).unwrap();
         assert_tensors_close(&actual, &expected_softmax);
+
+        let empty = Tensor::new_f32(vec![2, 0, 3], Vec::new());
+        let actual = linear.forward(&empty).unwrap();
+        assert_eq!(actual.shape(), [2, 0, 4]);
+        assert!(actual.as_f32().unwrap().is_empty());
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+    #[test]
+    fn linear_6x16_packing_is_limited_to_large_classifiers() {
+        assert!(!use_linear_6x16(80, 6_906));
+        assert!(!use_linear_6x16(120, 18_710));
+        assert!(use_linear_6x16(192, 18_710));
+        assert!(!use_linear_6x16(191, 18_710));
+        assert!(!use_linear_6x16(192, 4_095));
+        assert!(!use_linear_6x16(768, 192));
+        assert!(use_linear_6x16(192, 4_096));
+        assert!(use_linear_6x16(768, 18_710));
     }
 
     fn assert_tensors_close(actual: &Tensor, expected: &Tensor) {
@@ -769,6 +1186,307 @@ mod tests {
             .unwrap();
         assert_eq!(output.shape(), [1, 2, 1, 2]);
         assert_eq!(output.as_f32().unwrap(), &[21.5, 42.5, 42.5, 85.5]);
+    }
+
+    #[test]
+    fn pointwise_pair_tile_matches_separate_packed_12_convolutions() {
+        let (batch, input_channels, hidden_channels, output_channels, height, width) =
+            (2, 5, 13, 7, 2, 9);
+        let values = |length: usize, multiplier: usize, divisor: f32| {
+            (0..length)
+                .map(|index| ((index * multiplier % 29) as f32 - 14.0) / divisor)
+                .collect::<Vec<_>>()
+        };
+        let first = Conv2d::new(
+            Tensor::new_f32(
+                vec![hidden_channels, input_channels, 1, 1],
+                values(hidden_channels * input_channels, 11, 19.0),
+            ),
+            Some(Tensor::new_f32(
+                vec![hidden_channels],
+                values(hidden_channels, 7, 23.0),
+            )),
+            [1, 1],
+            [0; 4],
+            1,
+        )
+        .unwrap();
+        let second = Conv2d::new(
+            Tensor::new_f32(
+                vec![output_channels, hidden_channels, 1, 1],
+                values(output_channels * hidden_channels, 13, 17.0),
+            ),
+            Some(Tensor::new_f32(
+                vec![output_channels],
+                values(output_channels, 5, 31.0),
+            )),
+            [1, 1],
+            [0; 4],
+            1,
+        )
+        .unwrap();
+        let input = Tensor::new_f32(
+            vec![batch, input_channels, height, width],
+            values(batch * input_channels * height * width, 17, 13.0),
+        );
+
+        let expected = second
+            .forward(&first.forward_gelu(&input).unwrap())
+            .unwrap();
+        let actual = first
+            .forward_pointwise_pair_gelu(&second, input, false)
+            .unwrap();
+        assert_tensors_close(&actual, &expected);
+    }
+
+    #[test]
+    fn pointwise_pair_tile_matches_blocked_6_residual_path() {
+        let (channels, hidden_channels, width) = (128, 256, 17);
+        let values = |length: usize, multiplier: usize, divisor: f32| {
+            (0..length)
+                .map(|index| ((index * multiplier % 37) as f32 - 18.0) / divisor)
+                .collect::<Vec<_>>()
+        };
+        let first = Conv2d::new(
+            Tensor::new_f32(
+                vec![hidden_channels, channels, 1, 1],
+                values(hidden_channels * channels, 19, 41.0),
+            ),
+            Some(Tensor::new_f32(
+                vec![hidden_channels],
+                values(hidden_channels, 7, 43.0),
+            )),
+            [1, 1],
+            [0; 4],
+            1,
+        )
+        .unwrap();
+        let second = Conv2d::new(
+            Tensor::new_f32(
+                vec![channels, hidden_channels, 1, 1],
+                values(channels * hidden_channels, 23, 47.0),
+            ),
+            Some(Tensor::new_f32(vec![channels], values(channels, 11, 53.0))),
+            [1, 1],
+            [0; 4],
+            1,
+        )
+        .unwrap();
+        let input = Tensor::new_f32(
+            vec![1, channels, 1, width],
+            values(channels * width, 29, 31.0),
+        );
+
+        let expected = input
+            .clone()
+            .into_add(
+                &second
+                    .forward(&first.forward_gelu(&input).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        let actual = first
+            .forward_pointwise_pair_gelu(&second, input, true)
+            .unwrap();
+        assert_tensors_close(&actual, &expected);
+    }
+
+    #[test]
+    fn depthwise_pointwise_strips_match_separate_kernels() {
+        let values = |length: usize, multiplier: usize, modulus: usize, divisor: f32| {
+            (0..length)
+                .map(|index| {
+                    ((index * multiplier % modulus) as f32 - (modulus / 2) as f32) / divisor
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (kernel, channels, output_channels, batch, depthwise_has_bias, pointwise_has_bias) in [
+            (3, 128, 128, 1, true, true),
+            (5, 64, 16, 2, true, false),
+            (7, 96, 24, 1, true, false),
+            (9, 256, 64, 1, false, true),
+        ] {
+            let height = 5;
+            let width = 19;
+            let padding = kernel / 2;
+            let depthwise = Conv2d::new(
+                Tensor::new_f32(
+                    vec![channels, 1, kernel, kernel],
+                    values(channels * kernel * kernel, 17, 43, 29.0),
+                ),
+                depthwise_has_bias
+                    .then(|| Tensor::new_f32(vec![channels], values(channels, 11, 37, 31.0))),
+                [1, 1],
+                [padding; 4],
+                channels,
+            )
+            .unwrap();
+            let pointwise = Conv2d::new(
+                Tensor::new_f32(
+                    vec![output_channels, channels, 1, 1],
+                    values(output_channels * channels, 23, 47, 41.0),
+                ),
+                pointwise_has_bias.then(|| {
+                    Tensor::new_f32(vec![output_channels], values(output_channels, 13, 31, 37.0))
+                }),
+                [1, 1],
+                [0; 4],
+                1,
+            )
+            .unwrap();
+            let input = Tensor::new_f32(
+                vec![batch, channels, height, width],
+                values(batch * channels * height * width, 29, 53, 43.0),
+            );
+
+            let expected = pointwise
+                .forward(&depthwise.forward(&input).unwrap())
+                .unwrap();
+            let actual = depthwise
+                .forward_depthwise_pointwise(&pointwise, &input)
+                .unwrap();
+            assert_tensors_close(&actual, &expected);
+        }
+    }
+
+    #[test]
+    fn depthwise_pointwise_falls_back_for_stride_two() {
+        let channels = 4;
+        let output_channels = 3;
+        let depthwise = Conv2d::new(
+            Tensor::new_f32(
+                vec![channels, 1, 3, 3],
+                (0..channels * 9)
+                    .map(|index| (index as f32 - 17.0) / 23.0)
+                    .collect(),
+            ),
+            Some(Tensor::new_f32(vec![channels], vec![0.125; channels])),
+            [2, 2],
+            [1; 4],
+            channels,
+        )
+        .unwrap();
+        let pointwise = Conv2d::new(
+            Tensor::new_f32(
+                vec![output_channels, channels, 1, 1],
+                (0..output_channels * channels)
+                    .map(|index| (index as f32 - 5.0) / 17.0)
+                    .collect(),
+            ),
+            None,
+            [1, 1],
+            [0; 4],
+            1,
+        )
+        .unwrap();
+        let input = Tensor::new_f32(
+            vec![1, channels, 7, 9],
+            (0..channels * 7 * 9)
+                .map(|index| ((index * 7 % 41) as f32 - 20.0) / 29.0)
+                .collect(),
+        );
+
+        let expected = pointwise
+            .forward(&depthwise.forward(&input).unwrap())
+            .unwrap();
+        let actual = depthwise
+            .forward_depthwise_pointwise(&pointwise, &input)
+            .unwrap();
+        assert_tensors_close(&actual, &expected);
+    }
+
+    #[test]
+    fn direct_spatial_six_row_blocks_match_scalar_with_two_and_four_row_tails() {
+        if !kernels::supports_direct_spatial_conv() {
+            return;
+        }
+
+        let input_channels = 2;
+        let input_height = 7;
+        let input_width = 35;
+        let kernel = 3;
+        let strides = [2, 2];
+        let pads = [1, 1, 1, 1];
+        let output_height = 4;
+        let output_width = 18;
+        let input_values = (0..input_channels * input_height * input_width)
+            .map(|index| ((index * 17 % 47) as f32 - 23.0) / 29.0)
+            .collect::<Vec<_>>();
+
+        for output_channels in [8, 16] {
+            let weights = (0..output_channels * input_channels * kernel * kernel)
+                .map(|index| ((index * 13 % 41) as f32 - 20.0) / 31.0)
+                .collect::<Vec<_>>();
+            let bias = (0..output_channels)
+                .map(|channel| (channel as f32 - 5.0) / 17.0)
+                .collect::<Vec<_>>();
+            let convolution = Conv2d::new(
+                Tensor::new_f32(
+                    vec![output_channels, input_channels, kernel, kernel],
+                    weights.clone(),
+                ),
+                Some(Tensor::new_f32(vec![output_channels], bias.clone())),
+                strides,
+                pads,
+                1,
+            )
+            .unwrap();
+            assert!(convolution.options.direct_spatial);
+            let actual = convolution
+                .forward_relu(&Tensor::new_f32(
+                    vec![1, input_channels, input_height, input_width],
+                    input_values.clone(),
+                ))
+                .unwrap();
+
+            let output_plane = output_height * output_width;
+            let input_plane = input_height * input_width;
+            let mut expected = vec![0.0; output_channels * output_plane];
+            for output_channel in 0..output_channels {
+                for output_y in 0..output_height {
+                    for output_x in 0..output_width {
+                        let mut sum = bias[output_channel];
+                        for input_channel in 0..input_channels {
+                            for kernel_y in 0..kernel {
+                                let padded_y = output_y * strides[0] + kernel_y;
+                                if padded_y < pads[0] || padded_y - pads[0] >= input_height {
+                                    continue;
+                                }
+                                let input_y = padded_y - pads[0];
+                                for kernel_x in 0..kernel {
+                                    let padded_x = output_x * strides[1] + kernel_x;
+                                    if padded_x < pads[1] || padded_x - pads[1] >= input_width {
+                                        continue;
+                                    }
+                                    let input_x = padded_x - pads[1];
+                                    let input_value = input_values[input_channel * input_plane
+                                        + input_y * input_width
+                                        + input_x];
+                                    let weight_index = ((output_channel * input_channels
+                                        + input_channel)
+                                        * kernel
+                                        + kernel_y)
+                                        * kernel
+                                        + kernel_x;
+                                    sum = input_value.mul_add(weights[weight_index], sum);
+                                }
+                            }
+                        }
+                        expected
+                            [output_channel * output_plane + output_y * output_width + output_x] =
+                            sum.max(0.0);
+                    }
+                }
+            }
+            assert_tensors_close(
+                &actual,
+                &Tensor::new_f32(
+                    vec![1, output_channels, output_height, output_width],
+                    expected,
+                ),
+            );
+        }
     }
 
     #[test]

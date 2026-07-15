@@ -23,7 +23,9 @@ cargo run --release -- \
   --device metal --output /tmp/candle-ocr.json
 ```
 
-Use `--device cpu` for the CPU path. To run a smaller model, add matching size flags:
+Use `--device cpu` for Candle's CPU path. The native Safetensors CPU runtime measured below is
+built separately with `--no-default-features --features cpu`. To run a smaller Candle model, add
+matching size flags:
 
 ```sh
 cargo run --release -- \
@@ -226,19 +228,83 @@ The CPU runtime evaluates every nonzero convolution weight. Its sparse represent
 blocks that are exactly zero. On macOS, dense pointwise and tiled spatial convolutions use
 Accelerate SGEMM, and Linear consumes `[out,in]` weights directly through a transposed SGEMM instead
 of materializing two matrix transposes. AArch64 also has a dedicated exact-order 3x3 stride-two
-depthwise kernel. Sparse kernels handle dynamic-width tail columns directly, so they never
-reinterpret four-row packed weights as the twelve-row dense layout.
-
-The optimized runtime was compared with the preceding exact-weight implementation using the same
-fixed deterministic inputs. Medium/small/tiny detector maximum absolute differences were
-`2.271e-6`, `3.185e-6`, and `1.26e-7`, with zero output-mask changes at threshold `0.5`.
-Recognizer maximum absolute differences were `4.8101e-5`, `2.6226e-5`, and `1.02043e-4`; all three
-matched the preceding implementation at all `40/40` argmax time steps. No weights are pruned,
-quantized, or approximated.
+depthwise kernel. Windows x86-64 uses in-tree AVX2/FMA kernels, fused pointwise/depthwise and neck
+operations, FTZ/DAZ for subnormal values, and soft CPU Set selection restricted to performance
+cores. Windows MSVC release builds target the portable AVX2/FMA `x86-64-v3` ISA level through
+`.cargo/config.toml`. The runtime does not call ORT or a system BLAS. No weights are pruned,
+quantized, or skipped unless they are exactly zero.
 
 The real validation crops containing `98tang.net` and `shtfab@gmail.com` were also run at their
 dynamic widths of 1,596 and 2,052 pixels. Thirty consecutive native CPU runs matched the Candle
 text exactly; steady-state p50 latency was `79.626 ms` and `101.398 ms`, respectively.
+
+### Windows x86-64 Native CPU Single-Thread Probe
+
+Hardware: Intel Core i5-12600K, Windows build 26100, Rust 1.97.0
+(`x86_64-pc-windows-msvc`). Each model used exactly one worker, five warmups, and 30 timed runs.
+Detector input was `[1,3,416,736]`; recognizer input was `[1,3,48,320]`. Model loading,
+deterministic input generation, output validation, and reference comparison were outside the timed
+loop. Average is the arithmetic mean, P95 uses the benchmark's rounded sample index, and FPS is
+`1000 / average_ms`. Recognizer FPS means fixed-width crop inferences per second.
+
+| Model | Average latency | P95 | FPS |
+| --- | ---: | ---: | ---: |
+| tiny detector | 54.386 ms | 58.855 ms | 18.39 |
+| small detector | 121.699 ms | 133.223 ms | 8.22 |
+| medium detector | 709.232 ms | 751.713 ms | 1.41 |
+| tiny recognizer | 6.664 ms | 7.516 ms | 150.05 |
+| small recognizer | 30.345 ms | 34.174 ms | 32.95 |
+| medium recognizer | 121.375 ms | 132.975 ms | 8.24 |
+
+#### Windows Four-Worker Target Run
+
+The optimized native backend was also measured on the same i5-12600K with four workers, 20
+warmups, and 50 timed runs. This is a separate multicore acceptance run; it does not replace or
+relabel the single-thread baseline above. The input tensors and timed interval are identical.
+
+| Model | Average latency | P95 | FPS |
+| --- | ---: | ---: | ---: |
+| tiny detector | 37.025 ms | 39.240 ms | 27.01 |
+| small detector | 86.485 ms | 91.517 ms | 11.56 |
+| medium detector | 508.864 ms | 532.813 ms | 1.97 |
+| tiny recognizer | 4.683 ms | 5.395 ms | 213.56 |
+| small recognizer | 24.176 ms | 27.648 ms | 41.36 |
+| medium recognizer | 100.158 ms | 104.133 ms | 9.98 |
+
+All six runs beat their requested average, P95, and FPS targets. Comparison against the saved F32
+references produced zero detector threshold-mask changes and zero recognizer timestep argmax
+changes.
+
+The saved local F32 references produced zero detector mask changes at threshold `0.5` and zero
+recognizer timestep argmax changes for all six models. Detector maximum absolute errors were
+`5e-9`, `5.6e-8`, and `1.02e-7` for tiny, small, and medium. Recognizer maximum absolute errors
+were `5.782e-6`, `0`, and `0`. The reference files live under ignored `target/cpu-reference/` and
+are local validation artifacts, not clean-checkout inputs.
+
+```powershell
+cargo build --release --no-default-features --features cpu --bin ppocr-cpu-bench
+
+foreach ($size in "tiny", "small", "medium") {
+  .\target\release\ppocr-cpu-bench.exe `
+    --model "models/${size}-det/model.safetensors" `
+    --kind det --size $size --height 416 --width 736 `
+    --threads 1 --warmup 5 --runs 30
+}
+
+foreach ($size in "tiny", "small", "medium") {
+  .\target\release\ppocr-cpu-bench.exe `
+    --model "models/${size}-rec/model.safetensors" `
+    --kind rec --size $size --height 48 --width 320 `
+    --threads 1 --warmup 5 --runs 30
+}
+```
+
+For the local accuracy check, append the matching
+`--compare target/cpu-reference/<size>-<kind>.f32` argument.
+
+To reproduce the four-worker acceptance run, use `--threads 4 --warmup 20 --runs 50` in the loops
+above. The optional `cpu-profile` feature prints per-operation native CPU timings to stderr and is
+compiled out of normal `cpu` builds.
 
 ## RTen CPU ONNX Control
 
@@ -317,14 +383,14 @@ The medium detector is roughly 451 GMAC at the validation-frame input size. Cand
 | Direct WGPU | Requested Safetensors | No | Metal/Vulkan | Fixed-shape medium/small/tiny detector and recognizer graphs. WGPU beats the ORT GPU baseline for all six; small/tiny beat Burn, while medium is within 8%. |
 | Candle 0.10.2 | Requested Safetensors | Yes | Metal/CUDA | End-to-end OCR is implemented for medium/small/tiny. Tiny is usable for reduced-resolution local inference; medium needs custom fused/grouped convolution kernels for a materially higher ceiling. |
 | cpu_onnx | Converted fixed-shape ONNX | Yes | No | Single-thread p50 detector/recognizer latency (ms): medium 972.947/107.621, small 126.527/25.390, tiny 52.462/4.858. |
-| cpu | Requested Safetensors | Yes | No | Exact-weight single-thread p50 detector/recognizer latency (ms): medium 178.041/18.754, small 44.782/7.038, tiny 24.944/1.943. |
+| cpu | Requested Safetensors | Yes | No | Platform-specific single-thread native CPU results are reported above; Windows x86-64 uses in-tree AVX2/FMA kernels, while macOS uses Accelerate where applicable. |
 | Burn 0.21 with WGPU/CubeCL | Official ONNX imported at build time | Yes | Metal/WGPU/CUDA backends | Fresh guarded-path p50 detector/recognizer latency (ms): medium 166.927/17.634, small 47.855/10.278, tiny 28.606/3.918. |
 | RTen 0.24 | Official matching ONNX | Yes | No | Single-thread p50 detector/recognizer latency (ms): medium 650.640/110.970, small 107.970/24.570, tiny 45.460/4.630. It does not read the supplied Safetensors directly. |
 | ONNX Runtime (ORT) | ONNX | Yes | GPU/ANE | Fixed-shape p50 detector/recognizer latency (ms): single-thread CPU medium 286.663/21.208, small 52.489/8.184, tiny 26.704/1.941; GPU medium 184.75/34.35, small 55.58/13.35, tiny 29.65/4.34; ANE medium 180.73/31.87, small 52.87/11.91, tiny 27.40/4.52. |
 | Wonnx 0.5 | Official ONNX | No practical result | WGPU/Metal | Current model preparation fails on unsupported HardSigmoid; detector also needs ConvTranspose support. |
 | Tract 0.23 | Official ONNX | Yes | No | Current dynamic PP-OCRv6 ONNX optimization fails at the first convolution. |
 
-Neither path invokes a separate system ML runtime.
+Neither the native `cpu` nor `cpu_onnx` path invokes a separate system ML runtime.
 
 ## Compatibility Notes
 

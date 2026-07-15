@@ -303,12 +303,10 @@ pub fn decode_ctc_greedy_for_input(
         bail!("recognizer output contains non-finite values");
     }
 
-    let valid_steps = (content_width
+    let valid_steps = content_width
         .checked_mul(time_steps)
         .context("recognizer time-step calculation overflow")?
-        + input_width
-        - 1)
-        / input_width;
+        .div_ceil(input_width);
     let valid_steps = valid_steps.clamp(1, time_steps);
     let mut text = String::new();
     let mut log_score = 0.0f64;
