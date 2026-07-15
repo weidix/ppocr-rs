@@ -42,6 +42,10 @@ var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1)
 var<storage, read> weights: array<f32>;
 
+fn load_weight(index: u32) -> f32 {
+    return weights[index];
+}
+
 var<immediate> params: DeconvParams;
 
 @compute @workgroup_size(256, 1, 1)
@@ -71,10 +75,10 @@ fn deconv_final(
     var accum = 0.0;
     for (var input_channel = 0u; input_channel < params.input_channels; input_channel += 1u) {
         accum += arena[input_base + input_channel]
-            * weights[weight_base + input_channel * params.weight_k_stride];
+            * load_weight(weight_base + input_channel * params.weight_k_stride);
     }
     if (params.flags & 1u) != 0u {
-        accum += weights[params.bias_offset];
+        accum += load_weight(params.bias_offset);
     }
     arena[params.output_offset + output_row * params.output_channel_stride] =
         1.0 / (1.0 + exp(-accum));

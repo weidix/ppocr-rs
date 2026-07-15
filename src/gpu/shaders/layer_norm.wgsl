@@ -41,6 +41,10 @@ var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1)
 var<storage, read> weights: array<f32>;
 
+fn load_weight(index: u32) -> f32 {
+    return weights[index];
+}
+
 var<immediate> params: LayerNormParams;
 
 var<workgroup> partial_mean: array<f32, 256>;
@@ -101,8 +105,8 @@ fn layer_norm(
     let output_base = params.output_offset + row * params.output_stride;
     for (var channel = local_id.x; channel < params.channels; channel += 256u) {
         let normalized = (arena[input_base + channel] - partial_mean[0]) * inverse_std;
-        arena[output_base + channel] = normalized * weights[params.weight_offset + channel]
-            + weights[params.bias_offset + channel];
+        arena[output_base + channel] = normalized * load_weight(params.weight_offset + channel)
+            + load_weight(params.bias_offset + channel);
     }
     for (var channel = params.channels + local_id.x; channel < params.output_stride; channel += 256u) {
         arena[output_base + channel] = 0.0;

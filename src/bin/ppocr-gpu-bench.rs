@@ -99,12 +99,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     samples.sort_unstable();
     let p50 = percentile(&samples, 50);
     let p90 = percentile(&samples, 90);
+    let p95 = percentile(&samples, 95);
     println!(
-        "warmup={} runs={} p50_ms={:.3} p90_ms={:.3} throughput_per_s={:.2}",
+        "warmup={} runs={} p50_ms={:.3} p90_ms={:.3} p95_ms={:.3} throughput_per_s={:.2}",
         args.warmup,
         args.runs,
         p50.as_secs_f64() * 1_000.0,
         p90.as_secs_f64() * 1_000.0,
+        p95.as_secs_f64() * 1_000.0,
         1.0 / p50.as_secs_f64()
     );
     Ok(())

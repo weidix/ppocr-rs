@@ -42,6 +42,10 @@ var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1)
 var<storage, read> weights: array<f32>;
 
+fn load_weight(index: u32) -> f32 {
+    return weights[index];
+}
+
 var<immediate> params: ConvParams;
 
 // The padded K stride avoids same-bank reads across output rows.
@@ -79,7 +83,7 @@ fn write_output(output_row: u32, channel: u32, value: f32) {
     if channel < params.output_channels {
         var result = value;
         if (params.flags & 1u) != 0u {
-            result += weights[params.bias_offset + channel];
+            result += load_weight(params.bias_offset + channel);
         }
         if (params.flags & 2u) != 0u {
             result += arena[params.add_offset + output_row * params.output_channel_stride + channel];
@@ -173,10 +177,10 @@ fn conv_spatial_m32(
             var value = vec4<f32>(0.0);
             if global_k < k_size && global_channel < params.output_channels {
                 value = vec4<f32>(
-                    weights[source],
-                    weights[source + 1u],
-                    weights[source + 2u],
-                    weights[source + 3u],
+                    load_weight(source),
+                    load_weight(source + 1u),
+                    load_weight(source + 2u),
+                    load_weight(source + 3u),
                 );
             }
             weight_tile[weight_index] = value;

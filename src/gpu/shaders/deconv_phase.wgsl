@@ -42,6 +42,10 @@ var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1)
 var<storage, read> weights: array<f32>;
 
+fn load_weight(index: u32) -> f32 {
+    return weights[index];
+}
+
 var<immediate> params: DeconvParams;
 
 var<workgroup> input_tile: array<f32, 544>;
@@ -88,7 +92,7 @@ fn output_row(input_row: u32, phase: u32) -> u32 {
 fn write_output(row: u32, channel: u32, value: f32) {
     var result = value;
     if (params.flags & 1u) != 0u {
-        result += weights[params.bias_offset + channel];
+        result += load_weight(params.bias_offset + channel);
     }
     if (params.flags & 2u) != 0u {
         result += arena[params.add_offset + row * params.output_channel_stride + channel];
@@ -141,10 +145,10 @@ fn deconv_phase(
             + workgroup_id.y * 32u
             + channel4 * 4u;
         weight_tile[local_linear] = vec4<f32>(
-            weights[source],
-            weights[source + 1u],
-            weights[source + 2u],
-            weights[source + 3u],
+            load_weight(source),
+            load_weight(source + 1u),
+            load_weight(source + 2u),
+            load_weight(source + 3u),
         );
 
         workgroupBarrier();

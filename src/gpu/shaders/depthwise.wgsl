@@ -42,6 +42,10 @@ var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1)
 var<storage, read> weights: array<f32>;
 
+fn load_weight(index: u32) -> f32 {
+    return weights[index];
+}
+
 var<immediate> params: DepthwiseParams;
 
 fn sigmoid_scalar(value: f32) -> f32 {
@@ -108,7 +112,7 @@ fn depthwise(
             for (var lane = 0u; lane < 4u; lane += 1u) {
                 let channel = output_channel + lane;
                 if channel < params.input_channels && channel < params.output_channels {
-                    accum[lane] += arena[input_base + lane] * weights[weight_base + lane];
+                    accum[lane] += arena[input_base + lane] * load_weight(weight_base + lane);
                 }
             }
         }
@@ -120,7 +124,7 @@ fn depthwise(
         if channel < params.output_channels {
             var value = accum[lane];
             if (params.flags & 1u) != 0u {
-                value += weights[params.bias_offset + channel];
+                value += load_weight(params.bias_offset + channel);
             }
             if (params.flags & 2u) != 0u {
                 value += arena[params.add_offset + output_row * params.output_channel_stride + channel];

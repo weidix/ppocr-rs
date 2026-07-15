@@ -42,6 +42,10 @@ var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1)
 var<storage, read> weights: array<f32>;
 
+fn load_weight(index: u32) -> f32 {
+    return weights[index];
+}
+
 var<immediate> params: DeconvParams;
 
 var<workgroup> input_tile: array<f32, 128>;
@@ -145,7 +149,7 @@ fn deconv2x2(
                     var weight_value = vec4<f32>(0.0);
                     for (var lane = 0u; lane < 4u; lane += 1u) {
                         if output_channel + lane < params.output_channels {
-                            weight_value[lane] = weights[weight_base + lane];
+                            weight_value[lane] = load_weight(weight_base + lane);
                         }
                     }
                     accum += input_tile[local_id.x * 16u + tile_channel] * weight_value;
@@ -164,7 +168,7 @@ fn deconv2x2(
         if channel < params.output_channels {
             var value = accum[lane];
             if (params.flags & 1u) != 0u {
-                value += weights[params.bias_offset + channel];
+                value += load_weight(params.bias_offset + channel);
             }
             if (params.flags & 2u) != 0u {
                 value += arena[params.add_offset + output_row * params.output_channel_stride + channel];

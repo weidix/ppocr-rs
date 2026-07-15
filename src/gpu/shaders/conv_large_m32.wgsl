@@ -37,10 +37,10 @@ struct ConvParams {
 }
 
 @group(0) @binding(0)
-var<storage, read_write> arena: array<f32>;
+var<storage, read_write> arena: array<vec4<f32>>;
 
 @group(0) @binding(1)
-var<storage, read> weights: array<f32>;
+var<storage, read> weights: array<vec4<f32>>;
 
 var<immediate> params: ConvParams;
 
@@ -49,42 +49,44 @@ var<immediate> params: ConvParams;
 var<workgroup> input_tile: array<f32, 1056>;
 var<workgroup> weight_tile: array<vec4<f32>, 512>;
 
-fn sigmoid_scalar(value: f32) -> f32 {
+fn sigmoid_value(value: vec4<f32>) -> vec4<f32> {
     return 1.0 / (1.0 + exp(-value));
 }
 
-fn activate_scalar(value: f32, code: u32) -> f32 {
+fn activate_value(value: vec4<f32>, code: u32) -> vec4<f32> {
     switch code {
-        case 1u: { return max(value, 0.0); }
-        case 2u: { return value * sigmoid_scalar(value); }
-        case 3u: { return clamp(value / 6.0 + 0.5, 0.0, 1.0); }
-        case 4u: { return clamp(value / 5.0 + 0.5, 0.0, 1.0); }
+        case 1u: { return max(value, vec4<f32>(0.0)); }
+        case 2u: { return value * sigmoid_value(value); }
+        case 3u: { return clamp(value / 6.0 + 0.5, vec4<f32>(0.0), vec4<f32>(1.0)); }
+        case 4u: { return clamp(value / 5.0 + 0.5, vec4<f32>(0.0), vec4<f32>(1.0)); }
         case 5u: {
             let scaled = value * 0.7071067811865476;
             let magnitude = abs(scaled);
             let t = 1.0 / (1.0 + 0.3275911 * magnitude);
             let polynomial = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
                 - 0.284496736) * t + 0.254829592) * t;
-            let erf = select(-1.0, 1.0, scaled >= 0.0)
+            let erf = select(vec4<f32>(-1.0), vec4<f32>(1.0), scaled >= vec4<f32>(0.0))
                 * (1.0 - polynomial * exp(-magnitude * magnitude));
             return 0.5 * value * (1.0 + erf);
         }
-        case 6u: { return value * clamp(value / 6.0 + 0.5, 0.0, 1.0); }
-        case 7u: { return sigmoid_scalar(value); }
+        case 6u: {
+            return value * clamp(value / 6.0 + 0.5, vec4<f32>(0.0), vec4<f32>(1.0));
+        }
+        case 7u: { return sigmoid_value(value); }
         default: { return value; }
     }
 }
 
-fn write_output(output_row: u32, channel: u32, value: f32) {
+fn write_output(output_row: u32, channel: u32, value: vec4<f32>) {
     var result = value;
     if (params.flags & 1u) != 0u {
-        result += weights[params.bias_offset + channel];
+        result += weights[(params.bias_offset + channel) / 4u];
     }
     if (params.flags & 2u) != 0u {
-        result += arena[params.add_offset + output_row * params.output_channel_stride + channel];
+        result += arena[(params.add_offset + output_row * params.output_channel_stride + channel) / 4u];
     }
-    arena[params.output_offset + output_row * params.output_channel_stride + channel] =
-        activate_scalar(result, params.activation);
+    arena[(params.output_offset + output_row * params.output_channel_stride + channel) / 4u] =
+        activate_value(result, params.activation);
 }
 
 @compute @workgroup_size(16, 8, 1)
@@ -116,13 +118,13 @@ fn conv_large_m32(
     for (var kernel_y = 0u; kernel_y < 9u; kernel_y += 1u) {
         for (var kernel_x = 0u; kernel_x < 9u; kernel_x += 1u) {
             for (var channel_base = 0u; channel_base < params.input_channels; channel_base += 32u) {
-                let tile_k = local_linear & 31u;
-                let input_channel = channel_base + tile_k;
-                var tile_row = local_linear / 32u;
+                var load_index = local_linear;
                 loop {
-                    if tile_row >= 32u { break; }
+                    if load_index >= 256u { break; }
+                    let tile_row = load_index / 8u;
+                    let channel4 = load_index - tile_row * 8u;
                     let output_x = tile_x * 32u + tile_row;
-                    var value = 0.0;
+                    var value = vec4<f32>(0.0);
                     if output_x < params.output_width {
                         let input_y = i32(output_y + kernel_y) - 4;
                         let input_x = i32(output_x + kernel_x) - 4;
@@ -132,12 +134,16 @@ fn conv_large_m32(
                             let input_index = params.input_offset
                                 + (((batch_index * params.input_height + u32(input_y)) * params.input_width
                                 + u32(input_x)) * params.input_channel_stride)
-                                + input_channel;
-                            value = arena[input_index];
+                                + channel_base + channel4 * 4u;
+                            value = arena[input_index / 4u];
                         }
                     }
-                    input_tile[tile_row * 33u + tile_k] = value;
-                    tile_row += 4u;
+                    let destination = tile_row * 33u + channel4 * 4u;
+                    input_tile[destination] = value.x;
+                    input_tile[destination + 1u] = value.y;
+                    input_tile[destination + 2u] = value.z;
+                    input_tile[destination + 3u] = value.w;
+                    load_index += 128u;
                 }
 
                 let weight_k_base = (kernel_y * 9u + kernel_x) * params.input_channels
@@ -150,12 +156,7 @@ fn conv_large_m32(
                     let source = params.weight_offset
                         + (weight_k_base + tile_weight_k) * params.weight_k_stride
                         + channel4 * 4u;
-                    weight_tile[weight_index] = vec4<f32>(
-                        weights[source],
-                        weights[source + 1u],
-                        weights[source + 2u],
-                        weights[source + 3u],
-                    );
+                    weight_tile[weight_index] = weights[source / 4u];
                     weight_index += 128u;
                 }
 
@@ -164,17 +165,25 @@ fn conv_large_m32(
                 let input_base0 = local_id.x * 33u;
                 let input_base1 = (local_id.x + 16u) * 33u;
                 let weight_lane = local_id.y * 2u;
+                var partial00 = vec4<f32>(0.0);
+                var partial01 = vec4<f32>(0.0);
+                var partial10 = vec4<f32>(0.0);
+                var partial11 = vec4<f32>(0.0);
                 for (var k = 0u; k < 32u; k += 1u) {
                     let weight_base = k * 16u + weight_lane;
                     let weight0 = weight_tile[weight_base];
                     let weight1 = weight_tile[weight_base + 1u];
                     let input0 = input_tile[input_base0 + k];
                     let input1 = input_tile[input_base1 + k];
-                    accum00 += input0 * weight0;
-                    accum01 += input0 * weight1;
-                    accum10 += input1 * weight0;
-                    accum11 += input1 * weight1;
+                    partial00 += input0 * weight0;
+                    partial01 += input0 * weight1;
+                    partial10 += input1 * weight0;
+                    partial11 += input1 * weight1;
                 }
+                accum00 += partial00;
+                accum01 += partial01;
+                accum10 += partial10;
+                accum11 += partial11;
 
                 workgroupBarrier();
             }
@@ -182,15 +191,11 @@ fn conv_large_m32(
     }
 
     if output_x0 < params.output_width {
-        for (var lane = 0u; lane < 4u; lane += 1u) {
-            write_output(output_row0, output_channel + lane, accum00[lane]);
-            write_output(output_row0, output_channel + lane + 4u, accum01[lane]);
-        }
+        write_output(output_row0, output_channel, accum00);
+        write_output(output_row0, output_channel + 4u, accum01);
     }
     if output_x1 < params.output_width {
-        for (var lane = 0u; lane < 4u; lane += 1u) {
-            write_output(output_row1, output_channel + lane, accum10[lane]);
-            write_output(output_row1, output_channel + lane + 4u, accum11[lane]);
-        }
+        write_output(output_row1, output_channel, accum10);
+        write_output(output_row1, output_channel + 4u, accum11);
     }
 }

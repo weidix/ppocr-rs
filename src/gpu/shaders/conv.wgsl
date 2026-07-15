@@ -43,6 +43,10 @@ var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1)
 var<storage, read> weights: array<f32>;
 
+fn load_weight(index: u32) -> f32 {
+    return weights[index];
+}
+
 var<immediate> params: ConvParams;
 
 // The common path uses an 8x32 output tile. Very wide projections use a
@@ -105,7 +109,7 @@ fn write_conv_output(output_row: u32, channel: u32, value: f32) {
     if channel < params.output_channels {
         var result = value;
         if (params.flags & 1u) != 0u {
-            result += weights[params.bias_offset + channel];
+            result += load_weight(params.bias_offset + channel);
         }
         if (params.flags & 2u) != 0u {
             result += arena[params.add_offset + output_row * params.output_channel_stride + channel];
@@ -166,7 +170,7 @@ fn conv_wide(
             let global_channel = workgroup_id.y * 64u + tile_channel;
             var value = 0.0;
             if global_k < k_size && global_channel < params.output_channels {
-                value = weights[params.weight_offset + global_k * params.weight_k_stride + global_channel];
+                value = load_weight(params.weight_offset + global_k * params.weight_k_stride + global_channel);
             }
             weight_tile[tile_index] = value;
             tile_index += 64u;
@@ -177,6 +181,10 @@ fn conv_wide(
         let input_base0 = local_id.x * 16u;
         let input_base1 = (local_id.x + 8u) * 16u;
         let weight_lane = local_id.y * 8u;
+        var partial00 = vec4<f32>(0.0);
+        var partial01 = vec4<f32>(0.0);
+        var partial10 = vec4<f32>(0.0);
+        var partial11 = vec4<f32>(0.0);
         for (var tile_k = 0u; tile_k < 16u; tile_k += 1u) {
             let weight_base = tile_k * 64u + weight_lane;
             let weight0 = vec4<f32>(
@@ -193,11 +201,15 @@ fn conv_wide(
             );
             let input0 = input_tile[input_base0 + tile_k];
             let input1 = input_tile[input_base1 + tile_k];
-            accum00 += input0 * weight0;
-            accum01 += input0 * weight1;
-            accum10 += input1 * weight0;
-            accum11 += input1 * weight1;
+            partial00 += input0 * weight0;
+            partial01 += input0 * weight1;
+            partial10 += input1 * weight0;
+            partial11 += input1 * weight1;
         }
+        accum00 += partial00;
+        accum01 += partial01;
+        accum10 += partial10;
+        accum11 += partial11;
 
         workgroupBarrier();
         k_base += 16u;
@@ -269,7 +281,7 @@ fn conv_1x1_m32(
             let global_channel = workgroup_id.y * 32u + tile_channel;
             var value = 0.0;
             if global_k < params.input_channels && global_channel < params.output_channels {
-                value = weights[params.weight_offset + global_k * params.weight_k_stride + global_channel];
+                value = load_weight(params.weight_offset + global_k * params.weight_k_stride + global_channel);
             }
             weight_tile[tile_index] = value;
             tile_index += 64u;
@@ -282,6 +294,10 @@ fn conv_1x1_m32(
         let input_base1 = (local_id.x + 8u) * 16u;
         let input_base2 = (local_id.x + 16u) * 16u;
         let input_base3 = (local_id.x + 24u) * 16u;
+        var partial0 = vec4<f32>(0.0);
+        var partial1 = vec4<f32>(0.0);
+        var partial2 = vec4<f32>(0.0);
+        var partial3 = vec4<f32>(0.0);
         for (var tile_k = 0u; tile_k < 16u; tile_k += 1u) {
             let weight_base = tile_k * 32u + weight_lane;
             let weight_value = vec4<f32>(
@@ -290,11 +306,15 @@ fn conv_1x1_m32(
                 weight_tile[weight_base + 2u],
                 weight_tile[weight_base + 3u],
             );
-            accum0 += input_tile[input_base0 + tile_k] * weight_value;
-            accum1 += input_tile[input_base1 + tile_k] * weight_value;
-            accum2 += input_tile[input_base2 + tile_k] * weight_value;
-            accum3 += input_tile[input_base3 + tile_k] * weight_value;
+            partial0 += input_tile[input_base0 + tile_k] * weight_value;
+            partial1 += input_tile[input_base1 + tile_k] * weight_value;
+            partial2 += input_tile[input_base2 + tile_k] * weight_value;
+            partial3 += input_tile[input_base3 + tile_k] * weight_value;
         }
+        accum0 += partial0;
+        accum1 += partial1;
+        accum2 += partial2;
+        accum3 += partial3;
 
         workgroupBarrier();
         k_base += 16u;
@@ -375,7 +395,7 @@ fn conv(
             let global_channel = workgroup_id.y * 32u + tile_channel;
             var value = 0.0;
             if global_k < k_size && global_channel < params.output_channels {
-                value = weights[params.weight_offset + global_k * params.weight_k_stride + global_channel];
+                value = load_weight(params.weight_offset + global_k * params.weight_k_stride + global_channel);
             }
             weight_tile[tile_index] = value;
             tile_index += 64u;
@@ -385,6 +405,7 @@ fn conv(
 
         let input_base = local_id.x * 16u;
         let weight_base = local_id.y * 4u;
+        var partial = vec4<f32>(0.0);
         for (var tile_k = 0u; tile_k < 16u; tile_k += 1u) {
             let weight_index = tile_k * 32u + weight_base;
             let weight_value = vec4<f32>(
@@ -393,8 +414,9 @@ fn conv(
                 weight_tile[weight_index + 2u],
                 weight_tile[weight_index + 3u],
             );
-            accum += input_tile[input_base + tile_k] * weight_value;
+            partial += input_tile[input_base + tile_k] * weight_value;
         }
+        accum += partial;
 
         workgroupBarrier();
         k_base += 16u;
@@ -407,7 +429,7 @@ fn conv(
         if channel < params.output_channels {
             var value = accum[lane];
             if (params.flags & 1u) != 0u {
-                value += weights[params.bias_offset + channel];
+                value += load_weight(params.bias_offset + channel);
             }
             if (params.flags & 2u) != 0u {
                 value += arena[params.add_offset + output_row * params.output_channel_stride + channel];

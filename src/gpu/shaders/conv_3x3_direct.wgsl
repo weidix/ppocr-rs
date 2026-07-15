@@ -42,6 +42,10 @@ var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1)
 var<storage, read> weights: array<f32>;
 
+fn load_weight(index: u32) -> f32 {
+    return weights[index];
+}
+
 var<immediate> params: ConvParams;
 
 // 10x10 input patch with eight channels, plus 3x3x8x32 weights.
@@ -58,7 +62,7 @@ fn activate(value: f32) -> f32 {
 fn write_output(output_row: u32, channel: u32, value: f32) {
     var result = value;
     if (params.flags & 1u) != 0u {
-        result += weights[params.bias_offset + channel];
+        result += load_weight(params.bias_offset + channel);
     }
     if (params.flags & 2u) != 0u {
         result += arena[params.add_offset + output_row * params.output_channel_stride + channel];
@@ -132,10 +136,10 @@ fn conv_3x3_direct(
                 + workgroup_id.y * 32u
                 + channel4 * 4u;
             weight_tile[weight_index] = vec4<f32>(
-                weights[source],
-                weights[source + 1u],
-                weights[source + 2u],
-                weights[source + 3u],
+                load_weight(source),
+                load_weight(source + 1u),
+                load_weight(source + 2u),
+                load_weight(source + 3u),
             );
             weight_index += 128u;
         }

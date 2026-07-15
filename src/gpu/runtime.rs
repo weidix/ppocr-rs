@@ -30,6 +30,7 @@ struct GpuInner {
     queue: wgpu::Queue,
     kernels: Kernels,
     info: GpuInfo,
+    timestamp_profiling: bool,
 }
 
 impl Gpu {
@@ -68,8 +69,12 @@ impl Gpu {
         }
 
         let mut required_features = wgpu::Features::IMMEDIATES;
-        if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
-            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        let timestamp_profiling = adapter_features.contains(
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES,
+        );
+        if timestamp_profiling {
+            required_features |=
+                wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
         }
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("ppocr-gpu"),
@@ -91,6 +96,7 @@ impl Gpu {
                     backend: adapter_info.backend,
                     device_type: adapter_info.device_type,
                 },
+                timestamp_profiling,
             }),
         })
     }
@@ -172,6 +178,8 @@ pub(crate) struct ConvDesc {
     pub padding: [usize; 2],
     pub has_bias: bool,
     pub depthwise: bool,
+    pub sparse_channels_offset: u32,
+    pub sparse_channel_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -313,8 +321,10 @@ enum Kernel {
     Conv3x3Direct,
     Conv3x3Stride2Direct,
     ConvLarge,
+    ConvSparse9,
     ConvSpatialM32,
     ConvMediumLinear,
+    ConvSingleRow,
     Depthwise,
     Add,
     MulChannel,
@@ -326,6 +336,7 @@ enum Kernel {
     Deconv,
     DeconvFinal,
     DeconvPhase,
+    FusedDetectorHead,
     Softmax,
     LayerNorm,
     AttentionScores,
@@ -477,6 +488,8 @@ impl GraphBuilder {
         params[22] = to_u32(output_shape.cs, "weight K stride")?;
         params[23] = activation as u32;
         params[24] = u32::from(desc.has_bias) | (u32::from(add.is_some()) << 1);
+        params[27] = desc.sparse_channels_offset;
+        params[28] = to_u32(desc.sparse_channel_count, "sparse channel count")?;
         let rows = input
             .shape
             .n
@@ -485,6 +498,14 @@ impl GraphBuilder {
             .ok_or_else(|| Error::InvalidModel("convolution output rows overflow".into()))?;
         let (kernel, rows_per_workgroup, channels_per_workgroup) = if desc.depthwise {
             (Kernel::Depthwise, 8, 32)
+        } else if desc.kernel == [9, 9]
+            && desc.stride == [1, 1]
+            && desc.padding == [4, 4]
+            && output_shape.c == 64
+            && input.shape.c.is_multiple_of(32)
+            && desc.sparse_channel_count != 0
+        {
+            (Kernel::ConvSparse9, 32, 64)
         } else if desc.kernel == [9, 9]
             && desc.stride == [1, 1]
             && desc.padding == [4, 4]
@@ -555,11 +576,20 @@ impl GraphBuilder {
         } else if desc.kernel == [1, 1]
             && desc.stride == [1, 1]
             && desc.padding == [0, 0]
-            && rows >= 64
-            && input.shape.c.is_multiple_of(256)
-            && output_shape.c.is_multiple_of(256)
+            && rows == 1
+            && input.shape.c.is_multiple_of(4)
+            && input.shape.c <= 768
+            && output_shape.c >= 32
         {
-            (Kernel::ConvMediumLinear, 16, 128)
+            (Kernel::ConvSingleRow, 1, 32)
+        } else if desc.kernel == [1, 1]
+            && desc.stride == [1, 1]
+            && desc.padding == [0, 0]
+            && rows >= 32
+            && output_shape.c >= 64
+            && input.shape.c.is_multiple_of(4)
+        {
+            (Kernel::ConvMediumLinear, 64, 64)
         } else if output_shape.c > 1_024 {
             (Kernel::Conv, 16, 64)
         } else if desc.kernel == [1, 1] && rows >= 64 {
@@ -568,7 +598,7 @@ impl GraphBuilder {
             (Kernel::Conv, 8, 32)
         };
         let row_workgroups = match kernel {
-            Kernel::ConvLarge | Kernel::ConvSpatialM32 => {
+            Kernel::ConvLarge | Kernel::ConvSparse9 | Kernel::ConvSpatialM32 => {
                 let tiles_per_row = output_shape.w.div_ceil(32);
                 params[26] = to_u32(tiles_per_row, "spatial convolution tiles per row")?;
                 let groups = output_shape
@@ -773,6 +803,81 @@ impl GraphBuilder {
                 div_ceil_u32(output_shape.cs / 4, 8)?,
                 1,
             ],
+        });
+        Ok(output)
+    }
+
+    pub fn fused_detector_head(
+        &mut self,
+        input: Value,
+        conv: &ConvDesc,
+        up: &ConvDesc,
+        final_conv: &ConvDesc,
+    ) -> Result<Value> {
+        let hidden_channels = conv.output_channels;
+        if conv.input_channels != input.shape.c
+            || conv.kernel != [3, 3]
+            || conv.stride != [1, 1]
+            || conv.padding != [1, 1]
+            || up.input_channels != hidden_channels
+            || up.output_channels != hidden_channels
+            || final_conv.input_channels != hidden_channels
+            || final_conv.output_channels != 1
+            || up.kernel != [2, 2]
+            || up.stride != [2, 2]
+            || final_conv.kernel != [2, 2]
+            || final_conv.stride != [2, 2]
+            || hidden_channels > 64
+        {
+            return Err(Error::InvalidModel(
+                "unsupported fused detector head configuration".into(),
+            ));
+        }
+        let output_h = input
+            .shape
+            .h
+            .checked_mul(4)
+            .ok_or_else(|| Error::InvalidModel("detector head height overflow".into()))?;
+        let output_w = input
+            .shape
+            .w
+            .checked_mul(4)
+            .ok_or_else(|| Error::InvalidModel("detector head width overflow".into()))?;
+        let output_shape = Shape4::new(input.shape.n, output_h, output_w, 1)?;
+        let output = allocate_value(&self.allocator, output_shape)?;
+        let mut params = [0u32; IMMEDIATE_WORDS];
+        params[0] = input.offset();
+        params[1] = output.offset();
+        params[2] = conv.weight_offset;
+        params[3] = conv.bias_offset;
+        params[4] = up.weight_offset;
+        params[5] = up.bias_offset;
+        params[6] = final_conv.weight_offset;
+        params[7] = final_conv.bias_offset;
+        params[8] = to_u32(input.shape.n, "detector head batch")?;
+        params[9] = to_u32(input.shape.h, "detector head input height")?;
+        params[10] = to_u32(input.shape.w, "detector head input width")?;
+        params[11] = to_u32(input.shape.c, "detector head input channels")?;
+        params[12] = to_u32(input.shape.cs, "detector head input stride")?;
+        params[13] = to_u32(hidden_channels, "detector head hidden channels")?;
+        params[14] = to_u32(output_h, "detector head output height")?;
+        params[15] = to_u32(output_w, "detector head output width")?;
+        params[16] = u32::from(conv.has_bias)
+            | (u32::from(up.has_bias) << 1)
+            | (u32::from(final_conv.has_bias) << 2);
+        let samples_per_group = 256 / hidden_channels;
+        params[18] = to_u32(samples_per_group, "detector head samples per group")?;
+        let rows = input
+            .shape
+            .n
+            .checked_mul(input.shape.h)
+            .and_then(|value| value.checked_mul(input.shape.w))
+            .ok_or_else(|| Error::InvalidModel("detector head rows overflow".into()))?;
+        let groups = rows.div_ceil(samples_per_group);
+        self.dispatches.push(Dispatch {
+            kernel: Kernel::FusedDetectorHead,
+            params,
+            workgroups: [to_u32(groups, "detector head workgroups")?, 1, 1],
         });
         Ok(output)
     }
@@ -1270,6 +1375,9 @@ impl Session {
             return Err(Error::InvalidInput("benchmark runs must be nonzero".into()));
         }
         self.upload_nchw(input)?;
+        if std::env::var_os("PPOCR_GPU_PROFILE").is_some() {
+            self.profile_dispatches()?;
+        }
         for _ in 0..warmup {
             let submission = self.submit(false)?;
             self.wait(submission)?;
@@ -1282,6 +1390,109 @@ impl Session {
             samples.push(start.elapsed());
         }
         Ok(samples)
+    }
+
+    fn profile_dispatches(&self) -> Result<()> {
+        if !self.gpu.inner.timestamp_profiling {
+            return Err(Error::Gpu(
+                "the selected adapter does not support timestamps inside compute passes".into(),
+            ));
+        }
+        let query_count = u32::try_from(self.plan.dispatches.len())
+            .ok()
+            .and_then(|count| count.checked_mul(2))
+            .ok_or_else(|| Error::Gpu("too many dispatches to profile".into()))?;
+        let query_bytes = u64::from(query_count) * u64::from(wgpu::QUERY_SIZE);
+        let device = &self.gpu.inner.device;
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("ppocr dispatch timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count: query_count,
+        });
+        let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ppocr timestamp resolve"),
+            size: query_bytes,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ppocr timestamp readback"),
+            size: query_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("ppocr profiled inference"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ppocr profiled graph"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            for (index, dispatch) in self.plan.dispatches.iter().enumerate() {
+                let start_query = u32::try_from(index * 2)
+                    .map_err(|_| Error::Gpu("profile query index overflow".into()))?;
+                pass.write_timestamp(&query_set, start_query);
+                pass.set_pipeline(self.gpu.inner.kernels.pipeline(dispatch.kernel));
+                pass.set_immediates(0, &words_bytes(&dispatch.params));
+                pass.dispatch_workgroups(
+                    dispatch.workgroups[0],
+                    dispatch.workgroups[1],
+                    dispatch.workgroups[2],
+                );
+                pass.write_timestamp(&query_set, start_query + 1);
+            }
+        }
+        encoder.resolve_query_set(&query_set, 0..query_count, &resolve, 0);
+        encoder.copy_buffer_to_buffer(&resolve, 0, &readback, 0, Some(query_bytes));
+        let submission = self.gpu.inner.queue.submit([encoder.finish()]);
+        self.wait(submission)?;
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        readback.map_async(wgpu::MapMode::Read, .., move |result| {
+            let _ = sender.send(result);
+        });
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|error| Error::Gpu(format!("poll timestamp mapping: {error}")))?;
+        receiver
+            .recv()
+            .map_err(|_| Error::Gpu("timestamp mapping callback was dropped".into()))?
+            .map_err(|error| Error::Gpu(format!("map timestamps: {error}")))?;
+        let view = readback.slice(..).get_mapped_range();
+        let timestamps = view
+            .chunks_exact(size_of::<u64>())
+            .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("u64 timestamp bytes")))
+            .collect::<Vec<_>>();
+        let period_ns = f64::from(self.gpu.inner.queue.get_timestamp_period());
+        let mut total_ms = 0.0;
+        eprintln!("gpu_profile dispatches={}", self.plan.dispatches.len());
+        for (index, dispatch) in self.plan.dispatches.iter().enumerate() {
+            let elapsed_ms = timestamps[index * 2 + 1].wrapping_sub(timestamps[index * 2]) as f64
+                * period_ns
+                / 1_000_000.0;
+            total_ms += elapsed_ms;
+            eprintln!(
+                "gpu_profile index={index} kernel={:?} workgroups={:?} input={}x{}x{} output={}x{}x{} kernel_shape={}x{} stride={}x{} ms={elapsed_ms:.6}",
+                dispatch.kernel,
+                dispatch.workgroups,
+                dispatch.params[6],
+                dispatch.params[7],
+                dispatch.params[8],
+                dispatch.params[10],
+                dispatch.params[11],
+                dispatch.params[12],
+                dispatch.params[14],
+                dispatch.params[15],
+                dispatch.params[16],
+                dispatch.params[17],
+            );
+        }
+        eprintln!("gpu_profile total_dispatch_ms={total_ms:.6}");
+        drop(view);
+        readback.unmap();
+        Ok(())
     }
 
     fn wait(&self, submission: wgpu::SubmissionIndex) -> Result<()> {
@@ -1468,12 +1679,15 @@ const fn dispatch_x_param(kernel: Kernel) -> usize {
         | Kernel::Conv3x3Direct
         | Kernel::Conv3x3Stride2Direct
         | Kernel::ConvLarge
+        | Kernel::ConvSparse9
         | Kernel::ConvSpatialM32
         | Kernel::ConvMediumLinear
+        | Kernel::ConvSingleRow
         | Kernel::Depthwise
         | Kernel::Deconv
         | Kernel::DeconvFinal
         | Kernel::DeconvPhase => 25,
+        Kernel::FusedDetectorHead => 17,
         Kernel::Add | Kernel::MulChannel | Kernel::ResizeNearest | Kernel::Concat => 19,
         Kernel::GlobalMean | Kernel::PoolMax | Kernel::PoolAvg => 21,
         Kernel::Softmax => 9,
@@ -1516,8 +1730,10 @@ struct Kernels {
     conv_3x3_direct: wgpu::ComputePipeline,
     conv_3x3_stride2_direct: wgpu::ComputePipeline,
     conv_large: wgpu::ComputePipeline,
+    conv_sparse9: wgpu::ComputePipeline,
     conv_spatial_m32: wgpu::ComputePipeline,
     conv_medium_linear: wgpu::ComputePipeline,
+    conv_single_row: wgpu::ComputePipeline,
     depthwise: wgpu::ComputePipeline,
     add: wgpu::ComputePipeline,
     mul_channel: wgpu::ComputePipeline,
@@ -1529,6 +1745,7 @@ struct Kernels {
     deconv: wgpu::ComputePipeline,
     deconv_final: wgpu::ComputePipeline,
     deconv_phase: wgpu::ComputePipeline,
+    fused_detector_head: wgpu::ComputePipeline,
     softmax: wgpu::ComputePipeline,
     layer_norm: wgpu::ComputePipeline,
     attention_scores: wgpu::ComputePipeline,
@@ -1616,6 +1833,11 @@ impl Kernels {
                 include_str!("shaders/conv_medium_linear.wgsl"),
                 "conv_medium_linear",
             ),
+            conv_single_row: create(
+                "ppocr single-row convolution",
+                include_str!("shaders/conv_single_row.wgsl"),
+                "conv_single_row",
+            ),
             depthwise: create(
                 "ppocr depthwise",
                 include_str!("shaders/depthwise.wgsl"),
@@ -1671,6 +1893,16 @@ impl Kernels {
                 include_str!("shaders/deconv_phase.wgsl"),
                 "deconv_phase",
             ),
+            conv_sparse9: create(
+                "ppocr sparse 9x9 convolution",
+                include_str!("shaders/conv_sparse_9x9.wgsl"),
+                "conv_sparse_9x9",
+            ),
+            fused_detector_head: create(
+                "ppocr fused detector head",
+                include_str!("shaders/detector_head.wgsl"),
+                "detector_head",
+            ),
             softmax: create(
                 "ppocr softmax",
                 include_str!("shaders/softmax.wgsl"),
@@ -1702,8 +1934,10 @@ impl Kernels {
             Kernel::Conv3x3Direct => &self.conv_3x3_direct,
             Kernel::Conv3x3Stride2Direct => &self.conv_3x3_stride2_direct,
             Kernel::ConvLarge => &self.conv_large,
+            Kernel::ConvSparse9 => &self.conv_sparse9,
             Kernel::ConvSpatialM32 => &self.conv_spatial_m32,
             Kernel::ConvMediumLinear => &self.conv_medium_linear,
+            Kernel::ConvSingleRow => &self.conv_single_row,
             Kernel::Depthwise => &self.depthwise,
             Kernel::Add => &self.add,
             Kernel::MulChannel => &self.mul_channel,
@@ -1715,6 +1949,7 @@ impl Kernels {
             Kernel::Deconv => &self.deconv,
             Kernel::DeconvFinal => &self.deconv_final,
             Kernel::DeconvPhase => &self.deconv_phase,
+            Kernel::FusedDetectorHead => &self.fused_detector_head,
             Kernel::Softmax => &self.softmax,
             Kernel::LayerNorm => &self.layer_norm,
             Kernel::AttentionScores => &self.attention_scores,
@@ -1824,8 +2059,10 @@ mod tests {
             (Kernel::Conv3x3Direct, 25),
             (Kernel::Conv3x3Stride2Direct, 25),
             (Kernel::ConvLarge, 25),
+            (Kernel::ConvSparse9, 25),
             (Kernel::ConvSpatialM32, 25),
             (Kernel::ConvMediumLinear, 25),
+            (Kernel::ConvSingleRow, 25),
             (Kernel::Depthwise, 25),
             (Kernel::Add, 19),
             (Kernel::MulChannel, 19),

@@ -514,6 +514,49 @@ impl<'a> ModelBuilder<'a> {
         self.graph.deconv(input, &desc, activation)
     }
 
+    fn detector_head(
+        &mut self,
+        input: Value,
+        input_channels: usize,
+        hidden_channels: usize,
+    ) -> Result<Value> {
+        let conv = self.pack_ungrouped(
+            "head.conv_down.convolution",
+            input_channels,
+            hidden_channels,
+            [3, 3],
+            [1, 1],
+            [1, 1],
+            false,
+            Some("head.conv_down.norm"),
+            SourceLayout::Oihw,
+        )?;
+        let up = self.pack_ungrouped(
+            "head.conv_up.convolution",
+            hidden_channels,
+            hidden_channels,
+            [2, 2],
+            [2, 2],
+            [0, 0],
+            true,
+            Some("head.conv_up.norm"),
+            SourceLayout::Iohw,
+        )?;
+        let final_conv = self.pack_ungrouped(
+            "head.conv_final",
+            hidden_channels,
+            1,
+            [2, 2],
+            [2, 2],
+            [0, 0],
+            true,
+            None,
+            SourceLayout::Iohw,
+        )?;
+        self.graph
+            .fused_detector_head(input, &conv, &up, &final_conv)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn pack_ungrouped(
         &mut self,
@@ -557,6 +600,20 @@ impl<'a> ModelBuilder<'a> {
                 }
             }
         }
+        let active_channels = if kernel == [9, 9] {
+            (0..input_channels)
+                .filter(|&input_channel| {
+                    (0..kernel[0] * kernel[1]).any(|spatial| {
+                        let base = (spatial * input_channels + input_channel) * output_stride;
+                        packed[base..base + output_channels]
+                            .iter()
+                            .any(|&weight| weight != 0.0)
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let weight_offset = self.packed.push(&packed)?;
         let has_bias = bias.is_some();
         let bias_offset = if let Some(mut bias) = bias {
@@ -564,6 +621,18 @@ impl<'a> ModelBuilder<'a> {
             self.packed.push(&bias)?
         } else {
             0
+        };
+        let use_sparse_channels = !active_channels.is_empty()
+            && active_channels.len() <= 16
+            && active_channels.len() * 4 <= input_channels;
+        let sparse_channels_offset = if use_sparse_channels {
+            let encoded = active_channels
+                .iter()
+                .map(|&channel| f32::from_bits(channel as u32))
+                .collect::<Vec<_>>();
+            self.packed.push(&encoded)?
+        } else {
+            u32::MAX
         };
         Ok(ConvDesc {
             weight_offset,
@@ -575,6 +644,8 @@ impl<'a> ModelBuilder<'a> {
             padding,
             has_bias,
             depthwise: false,
+            sparse_channels_offset,
+            sparse_channel_count: usize::from(use_sparse_channels) * active_channels.len(),
         })
     }
 
@@ -638,6 +709,8 @@ impl<'a> ModelBuilder<'a> {
             padding,
             has_bias,
             depthwise: true,
+            sparse_channels_offset: u32::MAX,
+            sparse_channel_count: 0,
         })
     }
 }
@@ -1377,6 +1450,9 @@ fn build_detector_head(
     input_channels: usize,
 ) -> Result<Value> {
     let hidden_channels = input_channels / 4;
+    if input_channels <= 96 {
+        return builder.detector_head(input, input_channels, hidden_channels);
+    }
     let hidden = builder.conv(
         input,
         "head.conv_down.convolution",
