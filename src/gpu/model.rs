@@ -66,7 +66,7 @@ impl Detector {
         let (graph, input) = GraphBuilder::new(input_shape)?;
         let mut builder = ModelBuilder::new(graph, &weights);
         let stages = build_detector_backbone(&mut builder, input, size)?;
-        let neck = build_detector_neck(&mut builder, &stages, size)?;
+        let neck = build_detector_neck(&mut builder, stages, size)?;
         let output = build_detector_head(&mut builder, neck, detector_neck_channels(size))?;
         let output_shape = [
             output.shape.n,
@@ -171,11 +171,11 @@ impl Recognizer {
 
         let (graph, input) = GraphBuilder::new(input_shape)?;
         let mut builder = ModelBuilder::new(graph, &weights);
-        let stages = build_recognizer_backbone(&mut builder, input, size)?;
+        let mut stages = build_recognizer_backbone(&mut builder, input, size)?;
         let feature = stages
-            .last()
-            .cloned()
+            .pop()
             .ok_or_else(|| Error::InvalidModel("recognizer backbone has no stages".into()))?;
+        drop(stages);
         let pooled = builder.graph.avg_pool(feature, [3, 2], [3, 2])?;
         let backbone_channels = recognizer_backbone_channels(size);
         if pooled.shape.h != 1 || pooled.shape.c != backbone_channels {
@@ -383,6 +383,35 @@ impl<'a> ModelBuilder<'a> {
             SourceLayout::Oihw,
         )?;
         self.graph.conv_output(input, &desc, activation, output_hw)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn conv_concat(
+        &mut self,
+        left: Value,
+        right: Value,
+        prefix: &str,
+        input_channels: usize,
+        output_channels: usize,
+        kernel: [usize; 2],
+        stride: [usize; 2],
+        padding: [usize; 2],
+        bias: bool,
+        norm: Option<&str>,
+        activation: Activation,
+    ) -> Result<Value> {
+        let desc = self.pack_ungrouped(
+            prefix,
+            input_channels,
+            output_channels,
+            kernel,
+            stride,
+            padding,
+            bias,
+            norm,
+            SourceLayout::Oihw,
+        )?;
+        self.graph.conv_concat(left, right, &desc, activation)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -922,9 +951,9 @@ fn build_large_stem(
     let pooled = builder
         .graph
         .max_pool(stem1, [2, 2], [1, 1], Some(branch_hw))?;
-    let merged = builder.graph.concat(pooled, branch)?;
-    let hidden = builder.conv(
-        merged,
+    let hidden = builder.conv_concat(
+        pooled,
+        branch,
         &format!("{base}.stem3.convolution"),
         mid_channels * 2,
         mid_channels,
@@ -1149,7 +1178,7 @@ fn build_variant_squeeze_excitation(
 
 fn build_detector_neck(
     builder: &mut ModelBuilder<'_>,
-    stages: &[Value],
+    stages: Vec<Value>,
     size: ModelSize,
 ) -> Result<Value> {
     match size {
@@ -1161,7 +1190,7 @@ fn build_detector_neck(
 
 fn build_replk_detector_neck(
     builder: &mut ModelBuilder<'_>,
-    stages: &[Value],
+    stages: Vec<Value>,
     stage_channels: [usize; 4],
     neck_channels: usize,
     kernel_size: usize,
@@ -1173,7 +1202,7 @@ fn build_replk_detector_neck(
         )));
     }
     let mut fused = Vec::with_capacity(4);
-    for (index, (stage, input_channels)) in stages.iter().cloned().zip(stage_channels).enumerate() {
+    for (index, (stage, input_channels)) in stages.into_iter().zip(stage_channels).enumerate() {
         let prefix = format!("model.neck.insert_conv.{index}");
         let hidden = builder.conv(
             stage,
@@ -1260,7 +1289,7 @@ fn build_replk_detector_neck(
     Ok(output)
 }
 
-fn build_medium_detector_neck(builder: &mut ModelBuilder<'_>, stages: &[Value]) -> Result<Value> {
+fn build_medium_detector_neck(builder: &mut ModelBuilder<'_>, stages: Vec<Value>) -> Result<Value> {
     if stages.len() != 4 {
         return Err(Error::InvalidModel(format!(
             "detector backbone returned {} stages; expected 4",
@@ -1269,7 +1298,7 @@ fn build_medium_detector_neck(builder: &mut ModelBuilder<'_>, stages: &[Value]) 
     }
     let stage_channels = [128, 256, 512, 896];
     let mut adjusted = Vec::with_capacity(4);
-    for (index, (stage, input_channels)) in stages.iter().cloned().zip(stage_channels).enumerate() {
+    for (index, (stage, input_channels)) in stages.into_iter().zip(stage_channels).enumerate() {
         adjusted.push(builder.conv(
             stage,
             &format!("model.neck.input_channel_adjustment_convolution.{index}"),
@@ -1284,7 +1313,7 @@ fn build_medium_detector_neck(builder: &mut ModelBuilder<'_>, stages: &[Value]) 
         )?);
     }
 
-    let mut top_down = adjusted.clone();
+    let mut top_down = adjusted;
     for index in (0..3).rev() {
         let output_hw = [top_down[index].shape.h, top_down[index].shape.w];
         let upper = builder

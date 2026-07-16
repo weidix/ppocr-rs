@@ -22,7 +22,7 @@ struct HeadParams {
     flags: u32,
     dispatch_x: u32,
     samples_per_group: u32,
-    reserved1: u32,
+    output_channel_stride: u32,
     reserved2: u32,
     reserved3: u32,
     reserved4: u32,
@@ -153,7 +153,7 @@ fn detector_head(
         let output_x = source_x * 4u + block_x;
         let output_index = params.output_offset
             + (((source_batch * params.output_height + output_y) * params.output_width + output_x)
-            * 4u);
+            * params.output_channel_stride);
         arena[output_index] = 1.0 / (1.0 + exp(-value));
     }
 }

@@ -32,9 +32,9 @@ struct ConvParams {
     reserved1: u32,
     reserved2: u32,
     reserved3: u32,
-    reserved4: u32,
-    reserved5: u32,
-    reserved6: u32,
+    concat_offset: u32,
+    input0_channels: u32,
+    concat_channel_stride: u32,
 }
 
 @group(0) @binding(0)
@@ -97,10 +97,13 @@ fn im2col_value(output_row: u32, k: u32) -> f32 {
         return 0.0;
     }
 
-    let input_index = params.input_offset
-        + (((batch_index * params.input_height + u32(input_y)) * params.input_width + u32(input_x))
-        * params.input_channel_stride)
-        + input_channel;
+    let input_row = (batch_index * params.input_height + u32(input_y)) * params.input_width
+        + u32(input_x);
+    var input_index = params.input_offset + input_row * params.input_channel_stride + input_channel;
+    if (params.flags & 4u) != 0u && input_channel >= params.input0_channels {
+        input_index = params.concat_offset + input_row * params.concat_channel_stride
+            + input_channel - params.input0_channels;
+    }
     return arena[input_index];
 }
 
@@ -360,7 +363,8 @@ fn conv(
     }
     if params.kernel_height == 1u
         && params.kernel_width == 1u
-        && output_rows >= 64u {
+        && output_rows >= 64u
+        && (params.flags & 4u) == 0u {
         conv_1x1_m32(local_id, workgroup_id, output_rows);
         return;
     }

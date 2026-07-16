@@ -297,15 +297,23 @@ pub(crate) struct Shape4 {
 
 impl Shape4 {
     fn new(n: usize, h: usize, w: usize, c: usize) -> Result<Self> {
-        if n == 0 || h == 0 || w == 0 || c == 0 {
-            return Err(Error::InvalidInput(format!(
-                "tensor dimensions must be nonzero, got [{n}, {h}, {w}, {c}]"
-            )));
-        }
         let cs = c
             .checked_add(3)
             .map(|value| value / 4 * 4)
             .ok_or_else(|| Error::InvalidInput("channel stride overflow".into()))?;
+        Self::with_channel_stride(n, h, w, c, cs)
+    }
+
+    fn compact(n: usize, h: usize, w: usize, c: usize) -> Result<Self> {
+        Self::with_channel_stride(n, h, w, c, c)
+    }
+
+    fn with_channel_stride(n: usize, h: usize, w: usize, c: usize, cs: usize) -> Result<Self> {
+        if n == 0 || h == 0 || w == 0 || c == 0 || cs < c {
+            return Err(Error::InvalidInput(format!(
+                "tensor dimensions and channel stride must be valid, got [{n}, {h}, {w}, {c}] stride {cs}"
+            )));
+        }
         let shape = Self { n, h, w, c, cs };
         shape.elements()?;
         Ok(shape)
@@ -362,13 +370,15 @@ struct Region {
 struct ArenaAllocator {
     end: u32,
     high_water: u32,
+    live: u32,
+    peak_live: u32,
     free: Vec<Region>,
 }
 
 impl ArenaAllocator {
     fn allocate(&mut self, length: usize) -> Result<(u32, u32)> {
         let length = align4(length)?;
-        if let Some((index, region)) = self
+        let allocation = if let Some((index, region)) = self
             .free
             .iter()
             .copied()
@@ -382,18 +392,26 @@ impl ArenaAllocator {
                     length: region.length - length,
                 });
             }
-            return Ok((region.offset, length));
-        }
-        let offset = self.end;
-        self.end = self
-            .end
+            (region.offset, length)
+        } else {
+            let offset = self.end;
+            self.end = self
+                .end
+                .checked_add(length)
+                .ok_or_else(|| Error::Gpu("activation arena exceeds u32 indexing".into()))?;
+            self.high_water = self.high_water.max(self.end);
+            (offset, length)
+        };
+        self.live = self
+            .live
             .checked_add(length)
-            .ok_or_else(|| Error::Gpu("activation arena exceeds u32 indexing".into()))?;
-        self.high_water = self.high_water.max(self.end);
-        Ok((offset, length))
+            .ok_or_else(|| Error::Gpu("live activation size overflow".into()))?;
+        self.peak_live = self.peak_live.max(self.live);
+        Ok(allocation)
     }
 
     fn release(&mut self, offset: u32, length: u32) {
+        self.live -= length;
         self.free.push(Region { offset, length });
         self.free.sort_unstable_by_key(|region| region.offset);
         let mut merged: Vec<Region> = Vec::with_capacity(self.free.len());
@@ -407,6 +425,16 @@ impl ArenaAllocator {
             merged.push(region);
         }
         self.free = merged;
+
+        // Return a free tail to the bump pointer. Without this, a later
+        // allocation that is slightly larger than the tail has to start at
+        // the old end, permanently turning the released tail into a hole.
+        if let Some(region) = self.free.last().copied()
+            && region.offset + region.length == self.end
+        {
+            self.end = region.offset;
+            self.free.pop();
+        }
     }
 }
 
@@ -465,7 +493,6 @@ pub(crate) struct Plan {
 
 pub(crate) struct GraphBuilder {
     allocator: Rc<RefCell<ArenaAllocator>>,
-    _input: Value,
     input_offset: u32,
     input_shape: Shape4,
     dispatches: Vec<Dispatch>,
@@ -481,7 +508,6 @@ impl GraphBuilder {
         Ok((
             Self {
                 allocator,
-                _input: input.clone(),
                 input_offset,
                 input_shape,
                 dispatches: Vec::new(),
@@ -491,7 +517,7 @@ impl GraphBuilder {
     }
 
     pub fn conv(&mut self, input: Value, desc: &ConvDesc, activation: Activation) -> Result<Value> {
-        self.conv_impl(input, desc, activation, None, None)
+        self.conv_impl(input, desc, activation, None, None, None)
     }
 
     pub fn conv_output(
@@ -501,7 +527,7 @@ impl GraphBuilder {
         activation: Activation,
         output_hw: [usize; 2],
     ) -> Result<Value> {
-        self.conv_impl(input, desc, activation, None, Some(output_hw))
+        self.conv_impl(input, desc, activation, None, None, Some(output_hw))
     }
 
     pub fn depthwise(
@@ -525,7 +551,17 @@ impl GraphBuilder {
         activation: Activation,
         add: Value,
     ) -> Result<Value> {
-        self.conv_impl(input, desc, activation, Some(add), None)
+        self.conv_impl(input, desc, activation, None, Some(add), None)
+    }
+
+    pub fn conv_concat(
+        &mut self,
+        left: Value,
+        right: Value,
+        desc: &ConvDesc,
+        activation: Activation,
+    ) -> Result<Value> {
+        self.conv_impl(left, desc, activation, Some(right), None, None)
     }
 
     fn conv_impl(
@@ -533,30 +569,47 @@ impl GraphBuilder {
         input: Value,
         desc: &ConvDesc,
         activation: Activation,
+        concat: Option<Value>,
         add: Option<Value>,
         output_hw: Option<[usize; 2]>,
     ) -> Result<Value> {
-        if input.shape.c != desc.input_channels {
+        let input_shape = if let Some(right) = &concat {
+            if (input.shape.n, input.shape.h, input.shape.w)
+                != (right.shape.n, right.shape.h, right.shape.w)
+            {
+                return Err(Error::InvalidModel(format!(
+                    "convolution concat spatial shapes differ: {:?} and {:?}",
+                    input.shape, right.shape
+                )));
+            }
+            let channels = input.shape.c.checked_add(right.shape.c).ok_or_else(|| {
+                Error::InvalidModel("convolution concat channels overflow".into())
+            })?;
+            Shape4::new(input.shape.n, input.shape.h, input.shape.w, channels)?
+        } else {
+            input.shape
+        };
+        if input_shape.c != desc.input_channels {
             return Err(Error::InvalidModel(format!(
                 "convolution expects {} channels, found {}",
-                desc.input_channels, input.shape.c
+                desc.input_channels, input_shape.c
             )));
         }
         let [output_h, output_w] = output_hw.unwrap_or([
             conv_output_dim(
-                input.shape.h,
+                input_shape.h,
                 desc.kernel[0],
                 desc.stride[0],
                 desc.padding[0],
             )?,
             conv_output_dim(
-                input.shape.w,
+                input_shape.w,
                 desc.kernel[1],
                 desc.stride[1],
                 desc.padding[1],
             )?,
         ]);
-        let output_shape = Shape4::new(input.shape.n, output_h, output_w, desc.output_channels)?;
+        let output_shape = Shape4::new(input_shape.n, output_h, output_w, desc.output_channels)?;
         if let Some(add) = &add
             && add.shape != output_shape
         {
@@ -565,17 +618,22 @@ impl GraphBuilder {
                 add.shape
             )));
         }
-        let output = allocate_value(&self.allocator, output_shape)?;
+        // A fused residual add reads and writes the same element, so a
+        // uniquely-owned residual can safely become the convolution output.
+        let output = add
+            .as_ref()
+            .and_then(|value| alias_if_unique(value, output_shape))
+            .map_or_else(|| allocate_value(&self.allocator, output_shape), Ok)?;
         let mut params = [0u32; IMMEDIATE_WORDS];
         params[0] = input.offset();
         params[1] = output.offset();
         params[2] = add.as_ref().map_or(INVALID_OFFSET, Value::offset);
         params[3] = desc.weight_offset;
         params[4] = desc.bias_offset;
-        params[5] = to_u32(input.shape.n, "batch")?;
-        params[6] = to_u32(input.shape.h, "input height")?;
-        params[7] = to_u32(input.shape.w, "input width")?;
-        params[8] = to_u32(input.shape.c, "input channels")?;
+        params[5] = to_u32(input_shape.n, "batch")?;
+        params[6] = to_u32(input_shape.h, "input height")?;
+        params[7] = to_u32(input_shape.w, "input width")?;
+        params[8] = to_u32(input_shape.c, "input channels")?;
         params[9] = to_u32(input.shape.cs, "input channel stride")?;
         params[10] = to_u32(output_shape.h, "output height")?;
         params[11] = to_u32(output_shape.w, "output width")?;
@@ -591,22 +649,31 @@ impl GraphBuilder {
         params[21] = to_u32(desc.padding[1], "padding x")?;
         params[22] = to_u32(output_shape.cs, "weight K stride")?;
         params[23] = activation as u32;
-        params[24] = u32::from(desc.has_bias) | (u32::from(add.is_some()) << 1);
+        params[24] = u32::from(desc.has_bias)
+            | (u32::from(add.is_some()) << 1)
+            | (u32::from(concat.is_some()) << 2);
         params[27] = desc.sparse_channels_offset;
         params[28] = to_u32(desc.sparse_channel_count, "sparse channel count")?;
+        params[29] = concat.as_ref().map_or(INVALID_OFFSET, Value::offset);
+        params[30] = to_u32(input.shape.c, "first concatenated input channels")?;
+        params[31] = concat.as_ref().map_or(Ok(0), |value| {
+            to_u32(value.shape.cs, "second concatenated input stride")
+        })?;
         let rows = input
             .shape
             .n
             .checked_mul(output_shape.h)
             .and_then(|value| value.checked_mul(output_shape.w))
             .ok_or_else(|| Error::InvalidModel("convolution output rows overflow".into()))?;
-        let (kernel, rows_per_workgroup, channels_per_workgroup) = if desc.depthwise {
+        let (kernel, rows_per_workgroup, channels_per_workgroup) = if concat.is_some() {
+            (Kernel::Conv, 8, 32)
+        } else if desc.depthwise {
             (Kernel::Depthwise, 8, 32)
         } else if desc.kernel == [9, 9]
             && desc.stride == [1, 1]
             && desc.padding == [4, 4]
             && output_shape.c == 64
-            && input.shape.c.is_multiple_of(32)
+            && input_shape.c.is_multiple_of(32)
             && desc.sparse_channel_count != 0
         {
             (Kernel::ConvSparse9, 32, 64)
@@ -614,13 +681,13 @@ impl GraphBuilder {
             && desc.stride == [1, 1]
             && desc.padding == [4, 4]
             && output_shape.c == 64
-            && input.shape.c.is_multiple_of(32)
+            && input_shape.c.is_multiple_of(32)
         {
             (Kernel::ConvLarge, 32, 64)
-        } else if input.shape.n == 1
-            && input.shape.h == 208
-            && input.shape.w == 368
-            && matches!([input.shape.c, output_shape.c], [64, 32] | [32, 64])
+        } else if input_shape.n == 1
+            && input_shape.h == 208
+            && input_shape.w == 368
+            && matches!([input_shape.c, output_shape.c], [64, 32] | [32, 64])
             && output_shape.h == 208
             && output_shape.w == 368
             && desc.kernel == [2, 2]
@@ -630,10 +697,10 @@ impl GraphBuilder {
             && add.is_none()
         {
             (Kernel::Conv2x2Direct, 64, 32)
-        } else if input.shape.n == 1
-            && input.shape.h == 208
-            && input.shape.w == 368
-            && input.shape.c == 128
+        } else if input_shape.n == 1
+            && input_shape.h == 208
+            && input_shape.w == 368
+            && input_shape.c == 128
             && output_shape.h == 104
             && output_shape.w == 184
             && output_shape.c == 64
@@ -644,10 +711,10 @@ impl GraphBuilder {
             && add.is_none()
         {
             (Kernel::Conv3x3Stride2Direct, 64, 32)
-        } else if input.shape.n == 1
-            && input.shape.h == 104
-            && input.shape.w == 184
-            && input.shape.c == 256
+        } else if input_shape.n == 1
+            && input_shape.h == 104
+            && input_shape.w == 184
+            && input_shape.c == 256
             && output_shape.h == 104
             && output_shape.w == 184
             && output_shape.c == 64
@@ -658,11 +725,11 @@ impl GraphBuilder {
             && add.is_none()
         {
             (Kernel::Conv3x3Direct, 64, 32)
-        } else if input.shape.n == 1
-            && input.shape.c == 32
+        } else if input_shape.n == 1
+            && input_shape.c == 32
             && output_shape.c == 32
-            && input.shape.h == output_shape.h
-            && input.shape.w == output_shape.w
+            && input_shape.h == output_shape.h
+            && input_shape.w == output_shape.w
             && matches!(
                 [output_shape.h, output_shape.w],
                 [104, 184] | [52, 92] | [26, 46] | [13, 23]
@@ -681,8 +748,8 @@ impl GraphBuilder {
             && desc.stride == [1, 1]
             && desc.padding == [0, 0]
             && rows == 1
-            && input.shape.c.is_multiple_of(4)
-            && input.shape.c <= 768
+            && input_shape.c.is_multiple_of(4)
+            && input_shape.c <= 768
             && output_shape.c >= 32
         {
             (Kernel::ConvSingleRow, 1, 32)
@@ -691,7 +758,7 @@ impl GraphBuilder {
             && desc.padding == [0, 0]
             && rows >= 32
             && output_shape.c >= 64
-            && input.shape.c.is_multiple_of(4)
+            && input_shape.c.is_multiple_of(4)
         {
             (Kernel::ConvMediumLinear, 64, 64)
         } else if output_shape.c > 1_024 {
@@ -773,7 +840,16 @@ impl GraphBuilder {
         activation: Activation,
     ) -> Result<Value> {
         let output_shape = left.shape;
-        let output = allocate_value(&self.allocator, output_shape)?;
+        // Elementwise kernels do not read neighboring elements. Reusing a
+        // uniquely-owned operand therefore preserves the exact operation
+        // while avoiding a full-size activation copy.
+        let output = alias_if_unique(&left, output_shape)
+            .or_else(|| {
+                matches!(kernel, Kernel::Add)
+                    .then(|| alias_if_unique(&right, output_shape))
+                    .flatten()
+            })
+            .map_or_else(|| allocate_value(&self.allocator, output_shape), Ok)?;
         let params = elementwise_params(&left, Some(&right), &output, activation, output_shape)?;
         self.dispatches.push(Dispatch {
             kernel,
@@ -947,7 +1023,9 @@ impl GraphBuilder {
             .w
             .checked_mul(4)
             .ok_or_else(|| Error::InvalidModel("detector head width overflow".into()))?;
-        let output_shape = Shape4::new(input.shape.n, output_h, output_w, 1)?;
+        // This is the terminal detector output, so it does not need the
+        // four-channel padding used by vectorized intermediate kernels.
+        let output_shape = Shape4::compact(input.shape.n, output_h, output_w, 1)?;
         let output = allocate_value(&self.allocator, output_shape)?;
         let mut params = [0u32; IMMEDIATE_WORDS];
         params[0] = input.offset();
@@ -971,6 +1049,7 @@ impl GraphBuilder {
             | (u32::from(final_conv.has_bias) << 2);
         let samples_per_group = 256 / hidden_channels;
         params[18] = to_u32(samples_per_group, "detector head samples per group")?;
+        params[19] = to_u32(output_shape.cs, "detector head output stride")?;
         let rows = input
             .shape
             .n
@@ -1012,7 +1091,13 @@ impl GraphBuilder {
             .w
             .checked_mul(2)
             .ok_or_else(|| Error::InvalidModel("deconv output width overflow".into()))?;
-        let output_shape = Shape4::new(input.shape.n, output_h, output_w, desc.output_channels)?;
+        let output_shape = if desc.output_channels == 1 && activation == Activation::Sigmoid {
+            // The sigmoid one-channel deconvolution is the terminal detector
+            // layer. Keep its output compact instead of padding every pixel.
+            Shape4::compact(input.shape.n, output_h, output_w, desc.output_channels)?
+        } else {
+            Shape4::new(input.shape.n, output_h, output_w, desc.output_channels)?
+        };
         let output = allocate_value(&self.allocator, output_shape)?;
         let mut params = [0u32; IMMEDIATE_WORDS];
         params[0] = input.offset();
@@ -1037,7 +1122,7 @@ impl GraphBuilder {
         params[19] = 1;
         params[20] = to_u32(desc.padding[0], "padding y")?;
         params[21] = to_u32(desc.padding[1], "padding x")?;
-        params[22] = to_u32(output_shape.cs, "weight K stride")?;
+        params[22] = align4(desc.output_channels)?;
         params[23] = activation as u32;
         params[24] = u32::from(desc.has_bias);
         let rows = output_shape
@@ -1217,7 +1302,14 @@ impl GraphBuilder {
     }
 
     pub fn finish(self, output: Value) -> Result<Plan> {
-        let arena_elements = self.allocator.borrow().high_water.max(4);
+        let allocator = self.allocator.borrow();
+        let arena_elements = allocator.high_water.max(4);
+        if std::env::var_os("PPOCR_GPU_MEMORY_REPORT").is_some() {
+            eprintln!(
+                "gpu_memory activation_peak_live_bytes={}",
+                u64::from(allocator.peak_live) * size_of::<f32>() as u64
+            );
+        }
         Ok(Plan {
             input_offset: self.input_offset,
             input_shape: self.input_shape,
@@ -1311,6 +1403,13 @@ fn allocate_value(allocator: &Rc<RefCell<ArenaAllocator>>, shape: Shape4) -> Res
             length,
             allocator: allocator.clone(),
         }),
+        shape,
+    })
+}
+
+fn alias_if_unique(value: &Value, shape: Shape4) -> Option<Value> {
+    (value.shape == shape && Rc::strong_count(&value.allocation) == 1).then(|| Value {
+        allocation: value.allocation.clone(),
         shape,
     })
 }
@@ -2306,11 +2405,31 @@ mod tests {
     }
 
     #[test]
+    fn arena_reclaims_a_free_tail_before_growing() {
+        let mut arena = ArenaAllocator::default();
+        let (_, first_len) = arena.allocate(8).unwrap();
+        let (tail, tail_len) = arena.allocate(8).unwrap();
+        arena.release(tail, tail_len);
+
+        let (larger, _) = arena.allocate(12).unwrap();
+        assert_eq!(larger, first_len);
+        assert_eq!(arena.high_water, 20);
+    }
+
+    #[test]
     fn shape_uses_four_channel_padding() {
         let shape = Shape4::new(1, 2, 3, 3).unwrap();
         assert_eq!(shape.cs, 4);
         assert_eq!(shape.elements().unwrap(), 24);
         assert_eq!(shape.logical_elements().unwrap(), 18);
+    }
+
+    #[test]
+    fn compact_shape_uses_logical_channel_stride() {
+        let shape = Shape4::compact(1, 2, 3, 1).unwrap();
+        assert_eq!(shape.cs, 1);
+        assert_eq!(shape.elements().unwrap(), 6);
+        assert_eq!(shape.logical_elements().unwrap(), 6);
     }
 
     #[test]
@@ -2564,6 +2683,59 @@ mod tests {
         for (&actual, expected) in output.values.iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
         }
+    }
+
+    #[test]
+    fn fused_concat_convolution_matches_materialized_concat() {
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        let desc = ConvDesc {
+            weight_offset: 0,
+            bias_offset: 0,
+            input_channels: 8,
+            output_channels: 4,
+            kernel: [1, 1],
+            stride: [1, 1],
+            padding: [0, 0],
+            has_bias: false,
+            depthwise: false,
+            sparse_channels_offset: INVALID_OFFSET,
+            sparse_channel_count: 0,
+        };
+        let weights = (0..32)
+            .map(|index| (index as f32 - 15.0) / 17.0)
+            .collect::<Vec<_>>();
+        let input = (0..16)
+            .map(|index| (index as f32 - 7.0) / 11.0)
+            .collect::<Vec<_>>();
+
+        let (mut fused_builder, fused_input) = GraphBuilder::new([1, 4, 2, 2]).unwrap();
+        let fused_output = fused_builder
+            .conv_concat(fused_input.clone(), fused_input, &desc, Activation::None)
+            .unwrap();
+        assert_eq!(fused_builder.dispatches.len(), 1);
+        assert_ne!(fused_builder.dispatches[0].params[24] & 4, 0);
+        let fused_session = gpu
+            .create_session(weights.clone(), fused_builder.finish(fused_output).unwrap())
+            .unwrap();
+
+        let (mut reference_builder, reference_input) = GraphBuilder::new([1, 4, 2, 2]).unwrap();
+        let concatenated = reference_builder
+            .concat(reference_input.clone(), reference_input)
+            .unwrap();
+        let reference_output = reference_builder
+            .conv(concatenated, &desc, Activation::None)
+            .unwrap();
+        assert_eq!(reference_builder.dispatches.len(), 2);
+        let reference_session = gpu
+            .create_session(weights, reference_builder.finish(reference_output).unwrap())
+            .unwrap();
+
+        let fused = fused_session.run_nchw(&input).unwrap();
+        let reference = reference_session.run_nchw(&input).unwrap();
+        assert_eq!(fused.shape, reference.shape);
+        assert_eq!(fused.values, reference.values);
     }
 
     #[test]
