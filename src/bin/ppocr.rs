@@ -44,8 +44,8 @@ struct Arguments {
     threads: usize,
 
     /// Resize the detector input so its longest side is no larger than this value.
-    #[arg(long)]
-    detector_max_side: Option<u32>,
+    #[arg(long, default_value_t = 736)]
+    detector_max_side: u32,
 
     /// Minimum detector probability used to form a text component.
     #[arg(long, default_value_t = 0.2)]
@@ -112,7 +112,7 @@ fn main() -> Result<()> {
             unclip_ratio: arguments.unclip_ratio,
             max_boxes: arguments.max_boxes,
         },
-        detector_max_side: arguments.detector_max_side,
+        detector_max_side: Some(arguments.detector_max_side),
     };
     options.validate()?;
     let (detector_model, recognizer_model, dictionary) = resolve_models(&arguments)?;

@@ -1,6 +1,7 @@
 use super::error::{Error, Result};
 use super::runtime::{
-    Activation, ConvDesc, Gpu, GpuImage, GraphBuilder, ImagePreprocess, Session, Value,
+    Activation, ConvDesc, Gpu, GpuImage, GraphBuilder, ImagePreprocess, Session, SharedWeights,
+    Value,
 };
 use super::weights::Weights;
 use crate::models::ModelSize;
@@ -158,6 +159,17 @@ impl Recognizer {
         size: ModelSize,
         input_shape: [usize; 4],
     ) -> Result<Self> {
+        Self::load_with_shared_weights(gpu, path, size, input_shape, None)
+            .map(|(recognizer, _)| recognizer)
+    }
+
+    pub(crate) fn load_with_shared_weights(
+        gpu: &Gpu,
+        path: impl AsRef<Path>,
+        size: ModelSize,
+        input_shape: [usize; 4],
+        shared_weights: Option<SharedWeights>,
+    ) -> Result<(Self, SharedWeights)> {
         validate_recognizer_shape(input_shape)?;
         let weights = Weights::load(path)?;
         let expected_tensors = size.recognizer_tensors();
@@ -196,11 +208,15 @@ impl Recognizer {
             )));
         }
         let (packed_weights, plan) = builder.finish(output)?;
-        let session = gpu.create_session(packed_weights, plan)?;
-        Ok(Self {
-            session,
-            output_shape,
-        })
+        let (session, shared_weights) =
+            gpu.create_session_shared_weights(packed_weights, plan, shared_weights)?;
+        Ok((
+            Self {
+                session,
+                output_shape,
+            },
+            shared_weights,
+        ))
     }
 
     pub fn forward(&self, input: &[f32]) -> Result<ModelOutput> {

@@ -72,9 +72,23 @@ struct GpuInner {
     device: wgpu::Device,
     queue: wgpu::Queue,
     kernels: Kernels,
+    workspace: Mutex<SharedWorkspace>,
     info: GpuInfo,
     timestamp_profiling: bool,
 }
+
+struct SharedWorkspace {
+    arena: wgpu::Buffer,
+    bytes: u64,
+}
+
+struct DeviceWeights {
+    buffer: wgpu::Buffer,
+    elements: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedWeights(Arc<DeviceWeights>);
 
 impl Gpu {
     pub fn new() -> Result<Self> {
@@ -132,11 +146,16 @@ impl Gpu {
         }))
         .map_err(|error| Error::Gpu(format!("create device: {error}")))?;
         let kernels = Kernels::new(&device)?;
+        let workspace = SharedWorkspace {
+            arena: create_activation_arena(&device, 4),
+            bytes: 4,
+        };
         Ok(Self {
             inner: Arc::new(GpuInner {
                 device,
                 queue,
                 kernels,
+                workspace: Mutex::new(workspace),
                 info: GpuInfo {
                     name: adapter_info.name,
                     backend: adapter_info.backend,
@@ -210,8 +229,28 @@ impl Gpu {
     }
 
     pub(crate) fn create_session(&self, weights: Vec<f32>, plan: Plan) -> Result<Session> {
-        Session::new(self.clone(), weights, plan)
+        Session::new(self.clone(), weights, plan, None).map(|(session, _)| session)
     }
+
+    pub(crate) fn create_session_shared_weights(
+        &self,
+        weights: Vec<f32>,
+        plan: Plan,
+        shared: Option<SharedWeights>,
+    ) -> Result<(Session, SharedWeights)> {
+        Session::new(self.clone(), weights, plan, shared)
+    }
+}
+
+fn create_activation_arena(device: &wgpu::Device, bytes: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ppocr shared activation arena"),
+        size: bytes.max(4),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -344,9 +383,14 @@ impl Value {
     fn offset(&self) -> u32 {
         self.allocation.offset
     }
+
+    fn allocation_id(&self) -> usize {
+        self.allocation.id
+    }
 }
 
 struct Allocation {
+    id: usize,
     offset: u32,
     length: u32,
     allocator: Rc<RefCell<ArenaAllocator>>,
@@ -356,7 +400,7 @@ impl Drop for Allocation {
     fn drop(&mut self) {
         self.allocator
             .borrow_mut()
-            .release(self.offset, self.length);
+            .release(self.id, self.offset, self.length);
     }
 }
 
@@ -373,17 +417,28 @@ struct ArenaAllocator {
     live: u32,
     peak_live: u32,
     free: Vec<Region>,
+    event: u32,
+    allocations: Vec<AllocationLifetime>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AllocationLifetime {
+    offset: u32,
+    length: u32,
+    start: u32,
+    end: Option<u32>,
 }
 
 impl ArenaAllocator {
-    fn allocate(&mut self, length: usize) -> Result<(u32, u32)> {
+    fn allocate(&mut self, length: usize) -> Result<(usize, u32, u32)> {
         let length = align4(length)?;
         let allocation = if let Some((index, region)) = self
             .free
             .iter()
             .copied()
             .enumerate()
-            .find(|(_, region)| region.length >= length)
+            .filter(|(_, region)| region.length >= length)
+            .min_by_key(|(_, region)| region.length)
         {
             self.free.remove(index);
             if region.length > length {
@@ -407,10 +462,25 @@ impl ArenaAllocator {
             .checked_add(length)
             .ok_or_else(|| Error::Gpu("live activation size overflow".into()))?;
         self.peak_live = self.peak_live.max(self.live);
-        Ok(allocation)
+        let id = self.allocations.len();
+        self.allocations.push(AllocationLifetime {
+            offset: allocation.0,
+            length,
+            start: self.event,
+            end: None,
+        });
+        self.event = self
+            .event
+            .checked_add(1)
+            .ok_or_else(|| Error::Gpu("activation lifetime event overflow".into()))?;
+        Ok((id, allocation.0, allocation.1))
     }
 
-    fn release(&mut self, offset: u32, length: u32) {
+    fn release(&mut self, id: usize, offset: u32, length: u32) {
+        if let Some(allocation) = self.allocations.get_mut(id) {
+            allocation.end = Some(self.event);
+        }
+        self.event = self.event.saturating_add(1);
         self.live -= length;
         self.free.push(Region { offset, length });
         self.free.sort_unstable_by_key(|region| region.offset);
@@ -435,6 +505,54 @@ impl ArenaAllocator {
             self.end = region.offset;
             self.free.pop();
         }
+    }
+
+    fn compact_layout(&self) -> Result<(Vec<u32>, u32)> {
+        let final_event = self.event.saturating_add(1);
+        let mut order = (0..self.allocations.len()).collect::<Vec<_>>();
+        order.sort_unstable_by_key(|&id| std::cmp::Reverse(self.allocations[id].length));
+        let mut offsets = vec![0u32; self.allocations.len()];
+        let mut placed = Vec::<usize>::with_capacity(self.allocations.len());
+        let mut high_water = 0u32;
+
+        for id in order {
+            let allocation = self.allocations[id];
+            let allocation_end = allocation.end.unwrap_or(final_event);
+            let mut conflicts = placed
+                .iter()
+                .copied()
+                .filter(|&other_id| {
+                    let other = self.allocations[other_id];
+                    let other_end = other.end.unwrap_or(final_event);
+                    allocation.start < other_end && other.start < allocation_end
+                })
+                .collect::<Vec<_>>();
+            conflicts.sort_unstable_by_key(|&other_id| offsets[other_id]);
+
+            let mut offset = 0u32;
+            for other_id in conflicts {
+                let other_offset = offsets[other_id];
+                if offset
+                    .checked_add(allocation.length)
+                    .is_some_and(|end| end <= other_offset)
+                {
+                    break;
+                }
+                offset = offset.max(
+                    other_offset
+                        .checked_add(self.allocations[other_id].length)
+                        .ok_or_else(|| Error::Gpu("compacted activation arena overflow".into()))?,
+                );
+            }
+            offsets[id] = offset;
+            high_water = high_water.max(
+                offset
+                    .checked_add(allocation.length)
+                    .ok_or_else(|| Error::Gpu("compacted activation arena overflow".into()))?,
+            );
+            placed.push(id);
+        }
+        Ok((offsets, high_water.max(4)))
     }
 }
 
@@ -480,6 +598,20 @@ struct Dispatch {
     kernel: Kernel,
     params: [u32; IMMEDIATE_WORDS],
     workgroups: [u32; 3],
+    arena_bindings: Vec<ArenaBinding>,
+}
+
+#[derive(Clone, Copy)]
+struct ArenaBinding {
+    parameter: usize,
+    allocation_id: usize,
+}
+
+fn arena_binding(parameter: usize, value: &Value) -> ArenaBinding {
+    ArenaBinding {
+        parameter,
+        allocation_id: value.allocation_id(),
+    }
 }
 
 pub(crate) struct Plan {
@@ -493,7 +625,7 @@ pub(crate) struct Plan {
 
 pub(crate) struct GraphBuilder {
     allocator: Rc<RefCell<ArenaAllocator>>,
-    input_offset: u32,
+    input_allocation_id: usize,
     input_shape: Shape4,
     dispatches: Vec<Dispatch>,
 }
@@ -504,11 +636,11 @@ impl GraphBuilder {
         let input_shape = Shape4::new(n, h, w, c)?;
         let allocator = Rc::new(RefCell::new(ArenaAllocator::default()));
         let input = allocate_value(&allocator, input_shape)?;
-        let input_offset = input.offset();
+        let input_allocation_id = input.allocation_id();
         Ok((
             Self {
                 allocator,
-                input_offset,
+                input_allocation_id,
                 input_shape,
                 dispatches: Vec::new(),
             },
@@ -796,6 +928,13 @@ impl GraphBuilder {
             }
             _ => div_ceil_u32(rows, rows_per_workgroup)?,
         };
+        let mut arena_bindings = vec![arena_binding(0, &input), arena_binding(1, &output)];
+        if let Some(add) = &add {
+            arena_bindings.push(arena_binding(2, add));
+        }
+        if let Some(concat) = &concat {
+            arena_bindings.push(arena_binding(29, concat));
+        }
         self.dispatches.push(Dispatch {
             kernel,
             params,
@@ -804,6 +943,7 @@ impl GraphBuilder {
                 div_ceil_u32(output_shape.c, channels_per_workgroup)?,
                 1,
             ],
+            arena_bindings,
         });
         Ok(output)
     }
@@ -855,6 +995,11 @@ impl GraphBuilder {
             kernel,
             params,
             workgroups: [elementwise_workgroups(output_shape)?, 1, 1],
+            arena_bindings: vec![
+                arena_binding(0, &left),
+                arena_binding(1, &right),
+                arena_binding(2, &output),
+            ],
         });
         Ok(output)
     }
@@ -867,6 +1012,7 @@ impl GraphBuilder {
             kernel: Kernel::ResizeNearest,
             params,
             workgroups: [elementwise_workgroups(output_shape)?, 1, 1],
+            arena_bindings: vec![arena_binding(0, &input), arena_binding(2, &output)],
         });
         Ok(output)
     }
@@ -893,6 +1039,11 @@ impl GraphBuilder {
             kernel: Kernel::Concat,
             params,
             workgroups: [elementwise_workgroups(output_shape)?, 1, 1],
+            arena_bindings: vec![
+                arena_binding(0, &left),
+                arena_binding(1, &right),
+                arena_binding(2, &output),
+            ],
         });
         Ok(output)
     }
@@ -917,6 +1068,7 @@ impl GraphBuilder {
                 to_u32(output_shape.n, "global mean batch")?,
                 1,
             ],
+            arena_bindings: vec![arena_binding(0, &input), arena_binding(1, &output)],
         });
         Ok(output)
     }
@@ -983,6 +1135,7 @@ impl GraphBuilder {
                 div_ceil_u32(output_shape.cs / 4, 8)?,
                 1,
             ],
+            arena_bindings: vec![arena_binding(0, &input), arena_binding(1, &output)],
         });
         Ok(output)
     }
@@ -1061,6 +1214,7 @@ impl GraphBuilder {
             kernel: Kernel::FusedDetectorHead,
             params,
             workgroups: [to_u32(groups, "detector head workgroups")?, 1, 1],
+            arena_bindings: vec![arena_binding(0, &input), arena_binding(1, &output)],
         });
         Ok(output)
     }
@@ -1166,6 +1320,7 @@ impl GraphBuilder {
             kernel,
             params,
             workgroups: [row_workgroups, div_ceil_u32(output_shape.c, 32)?, 1],
+            arena_bindings: vec![arena_binding(0, &input), arena_binding(1, &output)],
         });
         Ok(output)
     }
@@ -1191,6 +1346,7 @@ impl GraphBuilder {
             kernel: Kernel::Softmax,
             params,
             workgroups: [to_u32(rows, "softmax workgroups")?, 1, 1],
+            arena_bindings: vec![arena_binding(0, &input), arena_binding(1, &output)],
         });
         Ok(output)
     }
@@ -1228,6 +1384,7 @@ impl GraphBuilder {
             kernel: Kernel::LayerNorm,
             params,
             workgroups: [to_u32(rows, "layer normalization workgroups")?, 1, 1],
+            arena_bindings: vec![arena_binding(0, &input), arena_binding(1, &output)],
         });
         Ok(output)
     }
@@ -1288,32 +1445,60 @@ impl GraphBuilder {
         params[12] = to_u32(score_rows, "attention score rows")?;
 
         let workgroups = [to_u32(score_rows, "attention workgroups")?, 1, 1];
+        let arena_bindings = vec![
+            arena_binding(0, &qkv),
+            arena_binding(1, &scores),
+            arena_binding(2, &output),
+        ];
         self.dispatches.push(Dispatch {
             kernel: Kernel::AttentionScores,
             params,
             workgroups,
+            arena_bindings: arena_bindings.clone(),
         });
         self.dispatches.push(Dispatch {
             kernel: Kernel::AttentionContext,
             params,
             workgroups,
+            arena_bindings,
         });
         Ok(output)
     }
 
-    pub fn finish(self, output: Value) -> Result<Plan> {
-        let allocator = self.allocator.borrow();
-        let arena_elements = allocator.high_water.max(4);
+    pub fn finish(mut self, output: Value) -> Result<Plan> {
+        let (offsets, arena_elements, peak_live) = {
+            let allocator = self.allocator.borrow();
+            let (compacted_offsets, compacted_elements) = allocator.compact_layout()?;
+            let (offsets, arena_elements) = if compacted_elements < allocator.high_water {
+                (compacted_offsets, compacted_elements)
+            } else {
+                (
+                    allocator
+                        .allocations
+                        .iter()
+                        .map(|allocation| allocation.offset)
+                        .collect(),
+                    allocator.high_water.max(4),
+                )
+            };
+            (offsets, arena_elements, allocator.peak_live)
+        };
         if std::env::var_os("PPOCR_GPU_MEMORY_REPORT").is_some() {
             eprintln!(
-                "gpu_memory activation_peak_live_bytes={}",
-                u64::from(allocator.peak_live) * size_of::<f32>() as u64
+                "gpu_memory activation_peak_live_bytes={} activation_planned_bytes={}",
+                u64::from(peak_live) * size_of::<f32>() as u64,
+                u64::from(arena_elements) * size_of::<f32>() as u64,
             );
         }
+        for dispatch in &mut self.dispatches {
+            for binding in &dispatch.arena_bindings {
+                dispatch.params[binding.parameter] = offsets[binding.allocation_id];
+            }
+        }
         Ok(Plan {
-            input_offset: self.input_offset,
+            input_offset: offsets[self.input_allocation_id],
             input_shape: self.input_shape,
-            output_offset: output.offset(),
+            output_offset: offsets[output.allocation_id()],
             output_shape: output.shape,
             arena_elements,
             dispatches: self.dispatches,
@@ -1396,9 +1581,10 @@ fn pool_params(
 }
 
 fn allocate_value(allocator: &Rc<RefCell<ArenaAllocator>>, shape: Shape4) -> Result<Value> {
-    let (offset, length) = allocator.borrow_mut().allocate(shape.elements()?)?;
+    let (id, offset, length) = allocator.borrow_mut().allocate(shape.elements()?)?;
     Ok(Value {
         allocation: Rc::new(Allocation {
+            id,
             offset,
             length,
             allocator: allocator.clone(),
@@ -1452,15 +1638,17 @@ pub(crate) struct RawOutput {
 pub(crate) struct Session {
     gpu: Gpu,
     plan: Plan,
-    arena: wgpu::Buffer,
-    _weights: wgpu::Buffer,
+    weights: SharedWeights,
     readback: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
-    execution_lock: Mutex<()>,
 }
 
 impl Session {
-    fn new(gpu: Gpu, weights: Vec<f32>, mut plan: Plan) -> Result<Self> {
+    fn new(
+        gpu: Gpu,
+        weights: Vec<f32>,
+        mut plan: Plan,
+        shared_weights: Option<SharedWeights>,
+    ) -> Result<(Self, SharedWeights)> {
         let arena_bytes = u64::from(plan.arena_elements)
             .checked_mul(size_of::<f32>() as u64)
             .ok_or_else(|| Error::Gpu("activation arena byte size overflow".into()))?;
@@ -1471,12 +1659,6 @@ impl Session {
         let output_bytes = (plan.output_shape.elements()? as u64)
             .checked_mul(size_of::<f32>() as u64)
             .ok_or_else(|| Error::Gpu("output byte size overflow".into()))?;
-        if std::env::var_os("PPOCR_GPU_MEMORY_REPORT").is_some() {
-            eprintln!(
-                "gpu_memory activation_arena_bytes={arena_bytes} weights_bytes={weight_bytes} output_readback_bytes={output_bytes} model_buffer_bytes={}",
-                arena_bytes + weight_bytes + output_bytes,
-            );
-        }
         let device = &gpu.inner.device;
         let max_workgroups = device.limits().max_compute_workgroups_per_dimension;
         split_dispatches(&mut plan.dispatches, max_workgroups)?;
@@ -1502,63 +1684,81 @@ impl Session {
                 device.limits().max_buffer_size,
             )));
         }
-        let arena = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ppocr activation arena"),
-            size: arena_bytes.max(4),
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let weight_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ppocr weights"),
-            size: weight_bytes.max(4),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        if !weights.is_empty() {
-            gpu.inner
-                .queue
-                .write_buffer(&weight_buffer, 0, &f32_bytes(&weights));
-        }
+        let (weights, allocated_weight_bytes) = match shared_weights {
+            Some(shared) => {
+                if shared.0.elements != weight_elements {
+                    return Err(Error::InvalidModel(format!(
+                        "shared weight buffer has {} elements; expected {weight_elements}",
+                        shared.0.elements
+                    )));
+                }
+                (shared, 0)
+            }
+            None => {
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("ppocr weights"),
+                    size: weight_bytes.max(4),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                if !weights.is_empty() {
+                    gpu.inner
+                        .queue
+                        .write_buffer(&buffer, 0, &f32_bytes(&weights));
+                }
+                (
+                    SharedWeights(Arc::new(DeviceWeights {
+                        buffer,
+                        elements: weight_elements,
+                    })),
+                    weight_bytes,
+                )
+            }
+        };
+        let (workspace_bytes, workspace_grew_bytes) = {
+            let mut workspace = gpu
+                .inner
+                .workspace
+                .lock()
+                .map_err(|_| Error::Gpu("shared activation workspace is poisoned".into()))?;
+            let previous = workspace.bytes;
+            if arena_bytes > workspace.bytes {
+                workspace.arena = create_activation_arena(device, arena_bytes);
+                workspace.bytes = arena_bytes;
+            }
+            (workspace.bytes, workspace.bytes - previous)
+        };
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ppocr output readback"),
             size: output_bytes.max(4),
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ppocr buffers"),
-            layout: &gpu.inner.kernels.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: arena.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: weight_buffer.as_entire_binding(),
-                },
-            ],
-        });
-        Ok(Self {
+        if std::env::var_os("PPOCR_GPU_MEMORY_REPORT").is_some() {
+            eprintln!(
+                "gpu_memory activation_required_bytes={arena_bytes} shared_workspace_bytes={workspace_bytes} workspace_grew_bytes={workspace_grew_bytes} weights_bytes={weight_bytes} weights_allocated_bytes={allocated_weight_bytes} output_readback_bytes={output_bytes} unique_buffer_bytes={}",
+                workspace_grew_bytes + allocated_weight_bytes + output_bytes,
+            );
+        }
+        let session = Self {
             gpu,
             plan,
-            arena,
-            _weights: weight_buffer,
+            weights: weights.clone(),
             readback,
-            bind_group,
-            execution_lock: Mutex::new(()),
-        })
+        };
+        Ok((session, weights))
     }
 
     pub fn run_nchw(&self, input: &[f32]) -> Result<RawOutput> {
-        let _execution = self
-            .execution_lock
+        let workspace = self
+            .gpu
+            .inner
+            .workspace
             .lock()
-            .map_err(|_| Error::Gpu("inference lock is poisoned".into()))?;
-        self.upload_nchw(input)?;
-        let submission = self.submit(true)?;
+            .map_err(|_| Error::Gpu("shared activation workspace is poisoned".into()))?;
+        let bind_group = self.create_bind_group(&workspace.arena);
+        self.upload_nchw(input, &workspace.arena)?;
+        let submission = self.submit(&workspace.arena, &bind_group, true)?;
         self.gpu
             .inner
             .device
@@ -1574,12 +1774,16 @@ impl Session {
     /// normalization, and recognizer padding. The source image is never
     /// materialized as a host-side F32 tensor.
     pub fn run_image(&self, image: &GpuImage, preprocess: ImagePreprocess) -> Result<RawOutput> {
-        let _execution = self
-            .execution_lock
+        let workspace = self
+            .gpu
+            .inner
+            .workspace
             .lock()
-            .map_err(|_| Error::Gpu("inference lock is poisoned".into()))?;
+            .map_err(|_| Error::Gpu("shared activation workspace is poisoned".into()))?;
+        let bind_group = self.create_bind_group(&workspace.arena);
         self.validate_image_preprocess(image, preprocess)?;
-        let submission = self.submit_image(image, preprocess, true)?;
+        let submission =
+            self.submit_image(image, preprocess, &workspace.arena, &bind_group, true)?;
         self.gpu
             .inner
             .device
@@ -1597,32 +1801,35 @@ impl Session {
         warmup: usize,
         runs: usize,
     ) -> Result<Vec<std::time::Duration>> {
-        let _execution = self
-            .execution_lock
+        let workspace = self
+            .gpu
+            .inner
+            .workspace
             .lock()
-            .map_err(|_| Error::Gpu("inference lock is poisoned".into()))?;
+            .map_err(|_| Error::Gpu("shared activation workspace is poisoned".into()))?;
+        let bind_group = self.create_bind_group(&workspace.arena);
         if runs == 0 {
             return Err(Error::InvalidInput("benchmark runs must be nonzero".into()));
         }
-        self.upload_nchw(input)?;
+        self.upload_nchw(input, &workspace.arena)?;
         if std::env::var_os("PPOCR_GPU_PROFILE").is_some() {
-            self.profile_dispatches()?;
+            self.profile_dispatches(&bind_group)?;
         }
         for _ in 0..warmup {
-            let submission = self.submit(false)?;
+            let submission = self.submit(&workspace.arena, &bind_group, false)?;
             self.wait(submission)?;
         }
         let mut samples = Vec::with_capacity(runs);
         for _ in 0..runs {
             let start = std::time::Instant::now();
-            let submission = self.submit(false)?;
+            let submission = self.submit(&workspace.arena, &bind_group, false)?;
             self.wait(submission)?;
             samples.push(start.elapsed());
         }
         Ok(samples)
     }
 
-    fn profile_dispatches(&self) -> Result<()> {
+    fn profile_dispatches(&self, bind_group: &wgpu::BindGroup) -> Result<()> {
         if !self.gpu.inner.timestamp_profiling {
             return Err(Error::Gpu(
                 "the selected adapter does not support timestamps inside compute passes".into(),
@@ -1659,7 +1866,7 @@ impl Session {
                 label: Some("ppocr profiled graph"),
                 timestamp_writes: None,
             });
-            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[]);
             for (index, dispatch) in self.plan.dispatches.iter().enumerate() {
                 let start_query = u32::try_from(index * 2)
                     .map_err(|_| Error::Gpu("profile query index overflow".into()))?;
@@ -1737,7 +1944,27 @@ impl Session {
         Ok(())
     }
 
-    fn upload_nchw(&self, input: &[f32]) -> Result<()> {
+    fn create_bind_group(&self, arena: &wgpu::Buffer) -> wgpu::BindGroup {
+        self.gpu
+            .inner
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ppocr shared workspace buffers"),
+                layout: &self.gpu.inner.kernels.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: arena.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.weights.0.buffer.as_entire_binding(),
+                    },
+                ],
+            })
+    }
+
+    fn upload_nchw(&self, input: &[f32], arena: &wgpu::Buffer) -> Result<()> {
         let expected = self.plan.input_shape.logical_elements()?;
         if input.len() != expected {
             return Err(Error::InvalidInput(format!(
@@ -1771,7 +1998,7 @@ impl Session {
         self.gpu
             .inner
             .queue
-            .write_buffer(&self.arena, byte_offset, &f32_bytes(&packed));
+            .write_buffer(arena, byte_offset, &f32_bytes(&packed));
         Ok(())
     }
 
@@ -1816,7 +2043,12 @@ impl Session {
         Ok(())
     }
 
-    fn submit(&self, copy_output: bool) -> Result<wgpu::SubmissionIndex> {
+    fn submit(
+        &self,
+        arena: &wgpu::Buffer,
+        bind_group: &wgpu::BindGroup,
+        copy_output: bool,
+    ) -> Result<wgpu::SubmissionIndex> {
         let device = &self.gpu.inner.device;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("ppocr inference"),
@@ -1826,7 +2058,7 @@ impl Session {
                 label: Some("ppocr graph"),
                 timestamp_writes: None,
             });
-            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[]);
             for dispatch in &self.plan.dispatches {
                 pass.set_pipeline(self.gpu.inner.kernels.pipeline(dispatch.kernel));
                 let immediate = words_bytes(&dispatch.params);
@@ -1841,7 +2073,7 @@ impl Session {
         if copy_output {
             let output_bytes = self.plan.output_shape.elements()? as u64 * size_of::<f32>() as u64;
             encoder.copy_buffer_to_buffer(
-                &self.arena,
+                arena,
                 u64::from(self.plan.output_offset) * size_of::<f32>() as u64,
                 &self.readback,
                 0,
@@ -1855,6 +2087,8 @@ impl Session {
         &self,
         image: &GpuImage,
         preprocess: ImagePreprocess,
+        arena: &wgpu::Buffer,
+        bind_group: &wgpu::BindGroup,
         copy_output: bool,
     ) -> Result<wgpu::SubmissionIndex> {
         let device = &self.gpu.inner.device;
@@ -1868,7 +2102,7 @@ impl Session {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: self.arena.as_entire_binding(),
+                    resource: arena.as_entire_binding(),
                 },
             ],
         });
@@ -1895,7 +2129,7 @@ impl Session {
                 label: Some("ppocr graph"),
                 timestamp_writes: None,
             });
-            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[]);
             for dispatch in &self.plan.dispatches {
                 pass.set_pipeline(self.gpu.inner.kernels.pipeline(dispatch.kernel));
                 let immediate = words_bytes(&dispatch.params);
@@ -1910,7 +2144,7 @@ impl Session {
         if copy_output {
             let output_bytes = self.plan.output_shape.elements()? as u64 * size_of::<f32>() as u64;
             encoder.copy_buffer_to_buffer(
-                &self.arena,
+                arena,
                 u64::from(self.plan.output_offset) * size_of::<f32>() as u64,
                 &self.readback,
                 0,
@@ -2394,12 +2628,12 @@ mod tests {
     #[test]
     fn arena_reuses_and_coalesces_regions() {
         let mut arena = ArenaAllocator::default();
-        let (a, _) = arena.allocate(5).unwrap();
-        let (b, b_len) = arena.allocate(8).unwrap();
+        let (a_id, a, a_len) = arena.allocate(5).unwrap();
+        let (b_id, b, b_len) = arena.allocate(8).unwrap();
         assert_eq!((a, b), (0, 8));
-        arena.release(b, b_len);
-        arena.release(a, 8);
-        let (whole, _) = arena.allocate(16).unwrap();
+        arena.release(b_id, b, b_len);
+        arena.release(a_id, a, a_len);
+        let (_, whole, _) = arena.allocate(16).unwrap();
         assert_eq!(whole, 0);
         assert_eq!(arena.high_water, 16);
     }
@@ -2407,13 +2641,28 @@ mod tests {
     #[test]
     fn arena_reclaims_a_free_tail_before_growing() {
         let mut arena = ArenaAllocator::default();
-        let (_, first_len) = arena.allocate(8).unwrap();
-        let (tail, tail_len) = arena.allocate(8).unwrap();
-        arena.release(tail, tail_len);
+        let (_, _, first_len) = arena.allocate(8).unwrap();
+        let (tail_id, tail, tail_len) = arena.allocate(8).unwrap();
+        arena.release(tail_id, tail, tail_len);
 
-        let (larger, _) = arena.allocate(12).unwrap();
+        let (_, larger, _) = arena.allocate(12).unwrap();
         assert_eq!(larger, first_len);
         assert_eq!(arena.high_water, 20);
+    }
+
+    #[test]
+    fn offline_layout_compacts_fragmented_lifetimes_to_peak_live_size() {
+        let mut arena = ArenaAllocator::default();
+        let (first_id, first, first_len) = arena.allocate(8).unwrap();
+        let _ = arena.allocate(4).unwrap();
+        let _ = arena.allocate(8).unwrap();
+        arena.release(first_id, first, first_len);
+        let _ = arena.allocate(12).unwrap();
+
+        assert_eq!(arena.high_water, 32);
+        assert_eq!(arena.peak_live, 24);
+        let (_, compacted) = arena.compact_layout().unwrap();
+        assert_eq!(compacted, 24);
     }
 
     #[test]
@@ -2438,6 +2687,7 @@ mod tests {
             kernel: Kernel::Deconv,
             params: [0; IMMEDIATE_WORDS],
             workgroups: [200, 2, 1],
+            arena_bindings: Vec::new(),
         };
         split_dispatches(std::slice::from_mut(&mut dispatch), 64).unwrap();
         assert_eq!(dispatch.workgroups, [64, 2, 4]);
@@ -2450,6 +2700,7 @@ mod tests {
             kernel: Kernel::GlobalMean,
             params: [0; IMMEDIATE_WORDS],
             workgroups: [4, 100, 1],
+            arena_bindings: Vec::new(),
         };
         split_dispatches(std::slice::from_mut(&mut dispatch), 64).unwrap();
         assert_eq!(dispatch.workgroups, [64, 1, 7]);
@@ -2463,6 +2714,7 @@ mod tests {
             kernel: Kernel::Softmax,
             params: [0; IMMEDIATE_WORDS],
             workgroups: [65, 1, 1],
+            arena_bindings: Vec::new(),
         };
         let error = split_dispatches(std::slice::from_mut(&mut dispatch), 8).unwrap_err();
         assert!(error.to_string().contains("cannot fit"));
@@ -2532,6 +2784,7 @@ mod tests {
                 kernel,
                 params: [0; IMMEDIATE_WORDS],
                 workgroups: [65, 1, 1],
+                arena_bindings: Vec::new(),
             };
             split_dispatches(std::slice::from_mut(&mut dispatch), 64).unwrap();
             assert_eq!(dispatch.workgroups, [64, 1, 2]);
@@ -2545,6 +2798,7 @@ mod tests {
             kernel: Kernel::Conv,
             params: [0; IMMEDIATE_WORDS],
             workgroups: [1, 1, 2],
+            arena_bindings: Vec::new(),
         };
         let error = split_dispatches(std::slice::from_mut(&mut dispatch), 64).unwrap_err();
         assert!(error.to_string().contains("must have z=1"));
@@ -2572,6 +2826,33 @@ mod tests {
             let error = builder.layer_norm(input, 0, 4, epsilon).err().unwrap();
             assert!(error.to_string().contains("finite and positive"));
         }
+    }
+
+    #[test]
+    fn sessions_share_device_weights_and_the_largest_activation_workspace() {
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        let (first_builder, first_output) = GraphBuilder::new([1, 3, 2, 4]).unwrap();
+        let (first, shared) = gpu
+            .create_session_shared_weights(
+                Vec::new(),
+                first_builder.finish(first_output).unwrap(),
+                None,
+            )
+            .unwrap();
+        let (second_builder, second_output) = GraphBuilder::new([1, 3, 4, 8]).unwrap();
+        let (second, reused) = gpu
+            .create_session_shared_weights(
+                Vec::new(),
+                second_builder.finish(second_output).unwrap(),
+                Some(shared.clone()),
+            )
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&shared.0, &reused.0));
+        assert_eq!(gpu.inner.workspace.lock().unwrap().bytes, 4 * 4 * 8 * 4);
+        drop((first, second));
     }
 
     #[test]

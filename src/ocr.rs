@@ -22,6 +22,7 @@ const MAX_RECTIFIED_PIXELS: f32 = 8_000_000.0;
 const RECOGNIZER_BATCH_SIZE: usize = 6;
 const PROBABILITY_EPSILON: f32 = 1e-8;
 const DETECTOR_LIMIT_SIDE: f64 = 736.0;
+const DEFAULT_DETECTOR_MAX_SIDE: u32 = 736;
 const DETECTOR_MAX_SIDE: f64 = 4_000.0;
 #[cfg(feature = "gpu")]
 const GPU_DETECTOR_CACHE_LIMIT: usize = 2;
@@ -292,8 +293,8 @@ pub struct OcrOptions {
     pub threads: usize,
     /// Detector output postprocessing settings.
     pub detector_postprocess: DetectorPostprocessOptions,
-    /// Optional maximum detector image side. `None` uses the released model's
-    /// default resize policy.
+    /// Optional maximum detector image side. The default matches the detector
+    /// benchmark input width; `None` uses the released model's resize policy.
     pub detector_max_side: Option<u32>,
 }
 
@@ -307,7 +308,7 @@ impl Default for OcrOptions {
                 .map_or(1, usize::from)
                 .min(4),
             detector_postprocess: DetectorPostprocessOptions::default(),
-            detector_max_side: None,
+            detector_max_side: Some(DEFAULT_DETECTOR_MAX_SIDE),
         }
     }
 }
@@ -370,8 +371,8 @@ pub struct OcrEngine {
 enum OcrRuntime {
     #[cfg(feature = "cpu")]
     Cpu {
-        detector: Detector,
-        recognizer: Recognizer,
+        detector: Box<Detector>,
+        recognizer: Box<Recognizer>,
     },
     #[cfg(feature = "gpu")]
     Gpu(GpuOcrRuntime),
@@ -387,6 +388,7 @@ struct GpuOcrRuntime {
     detector_cache: RefCell<Vec<([usize; 4], crate::gpu::Detector)>>,
     recognizer_model: PathBuf,
     recognizer_size: ModelSize,
+    recognizer_weights: RefCell<Option<crate::gpu::SharedWeights>>,
     recognizer_cache: RefCell<Vec<([usize; 4], crate::gpu::Recognizer)>>,
 }
 
@@ -447,8 +449,8 @@ impl OcrEngine {
                                     format!("load recognizer {}", recognizer_model.display())
                                 })?;
                         OcrRuntime::Cpu {
-                            detector,
-                            recognizer,
+                            detector: Box::new(detector),
+                            recognizer: Box::new(recognizer),
                         }
                     }
                     #[cfg(not(feature = "cpu"))]
@@ -467,6 +469,7 @@ impl OcrEngine {
                             detector_cache: RefCell::new(Vec::new()),
                             recognizer_model: recognizer_model.to_path_buf(),
                             recognizer_size: options.recognizer_size,
+                            recognizer_weights: RefCell::new(None),
                             recognizer_cache: RefCell::new(Vec::new()),
                         })
                     }
@@ -659,19 +662,23 @@ impl GpuOcrRuntime {
                 if cache.len() == GPU_RECOGNIZER_CACHE_LIMIT {
                     cache.remove(0);
                 }
-                let recognizer = crate::gpu::Recognizer::load(
-                    &self.gpu,
-                    &self.recognizer_model,
-                    self.recognizer_size,
-                    shape,
-                )
-                .with_context(|| {
-                    format!(
-                        "load GPU recognizer {} for input {:?}",
-                        self.recognizer_model.display(),
-                        shape
+                let shared_weights = self.recognizer_weights.borrow().clone();
+                let (recognizer, shared_weights) =
+                    crate::gpu::Recognizer::load_with_shared_weights(
+                        &self.gpu,
+                        &self.recognizer_model,
+                        self.recognizer_size,
+                        shape,
+                        shared_weights,
                     )
-                })?;
+                    .with_context(|| {
+                        format!(
+                            "load GPU recognizer {} for input {:?}",
+                            self.recognizer_model.display(),
+                            shape
+                        )
+                    })?;
+                *self.recognizer_weights.borrow_mut() = Some(shared_weights);
                 cache.push((shape, recognizer));
                 cache.len() - 1
             }
@@ -1212,6 +1219,11 @@ fn distance(left: Point, right: Point) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_detector_limit_matches_benchmark_width() {
+        assert_eq!(OcrOptions::default().detector_max_side, Some(736));
+    }
 
     #[test]
     fn detector_postprocess_maps_components_to_source_coordinates() {

@@ -123,10 +123,14 @@ targets `x86-64-v3`, so AVX2 and FMA are required for those builds.
 
 The GPU path uploads decoded RGB8 pixels once. Detector resize, RGB-to-BGR
 conversion, normalization, perspective text rectification, recognizer resize,
-and padding run in WGPU compute passes that write directly into each model's
-activation arena. Detection heatmaps and recognizer outputs are read back only
+and padding run in WGPU compute passes that write directly into a shared
+activation workspace. Detection heatmaps and recognizer outputs are read back only
 for the existing CPU detector postprocessing and CTC decoding; preprocessed
 pixel tensors never cross back through the CPU.
+
+End-to-end OCR limits the detector's longest input side to 736 pixels by
+default, matching the detector benchmark shape. Use `--detector-max-side` to
+select another limit.
 
 ## Benchmarks
 
