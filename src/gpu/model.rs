@@ -1,5 +1,7 @@
 use super::error::{Error, Result};
-use super::runtime::{Activation, ConvDesc, Gpu, GraphBuilder, Session, Value};
+use super::runtime::{
+    Activation, ConvDesc, Gpu, GpuImage, GraphBuilder, ImagePreprocess, Session, Value,
+};
 use super::weights::Weights;
 use crate::models::ModelSize;
 use std::path::Path;
@@ -44,11 +46,7 @@ pub struct Detector {
 }
 
 impl Detector {
-    pub fn load(gpu: &Gpu, path: impl AsRef<Path>, input_shape: [usize; 4]) -> Result<Self> {
-        Self::load_with_size(gpu, path, ModelSize::Tiny, input_shape)
-    }
-
-    pub fn load_with_size(
+    pub fn load(
         gpu: &Gpu,
         path: impl AsRef<Path>,
         size: ModelSize,
@@ -113,6 +111,31 @@ impl Detector {
         })
     }
 
+    /// Runs a detector from a device-resident source image.
+    pub fn forward_image(
+        &self,
+        image: &GpuImage,
+        preprocess: ImagePreprocess,
+    ) -> Result<ModelOutput> {
+        let output = self.session.run_image(image, preprocess)?;
+        let found = [
+            output.shape.n,
+            output.shape.c,
+            output.shape.h,
+            output.shape.w,
+        ];
+        if found != self.output_shape {
+            return Err(Error::Gpu(format!(
+                "detector returned shape {found:?}; expected {:?}",
+                self.output_shape
+            )));
+        }
+        Ok(ModelOutput {
+            shape: self.output_shape.to_vec(),
+            values: output.values,
+        })
+    }
+
     pub fn benchmark(
         &self,
         input: &[f32],
@@ -129,11 +152,7 @@ pub struct Recognizer {
 }
 
 impl Recognizer {
-    pub fn load(gpu: &Gpu, path: impl AsRef<Path>, input_shape: [usize; 4]) -> Result<Self> {
-        Self::load_with_size(gpu, path, ModelSize::Tiny, input_shape)
-    }
-
-    pub fn load_with_size(
+    pub fn load(
         gpu: &Gpu,
         path: impl AsRef<Path>,
         size: ModelSize,
@@ -194,6 +213,26 @@ impl Recognizer {
             )));
         }
         // RawOutput is compacted in NHWC order. With H=1 this is already N-T-C.
+        Ok(ModelOutput {
+            shape: self.output_shape.to_vec(),
+            values: output.values,
+        })
+    }
+
+    /// Runs a recognizer from a device-resident source image.
+    pub fn forward_image(
+        &self,
+        image: &GpuImage,
+        preprocess: ImagePreprocess,
+    ) -> Result<ModelOutput> {
+        let output = self.session.run_image(image, preprocess)?;
+        let found = [output.shape.n, output.shape.w, output.shape.c];
+        if output.shape.h != 1 || found != self.output_shape {
+            return Err(Error::Gpu(format!(
+                "recognizer returned NHWC shape {:?}; expected NTC {:?}",
+                output.shape, self.output_shape
+            )));
+        }
         Ok(ModelOutput {
             shape: self.output_shape.to_vec(),
             values: output.values,

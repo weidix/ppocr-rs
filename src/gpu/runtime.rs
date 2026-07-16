@@ -25,6 +25,49 @@ pub struct Gpu {
     inner: Arc<GpuInner>,
 }
 
+/// An RGB8 image uploaded once to a particular GPU device.
+pub struct GpuImage {
+    gpu: Gpu,
+    pixels: wgpu::Buffer,
+    width: u32,
+    height: u32,
+}
+
+/// Device-side image preprocessing parameters for one model invocation.
+#[derive(Clone, Copy, Debug)]
+pub struct ImagePreprocess {
+    corners: [[f32; 2]; 4],
+    content_width: usize,
+    kind: ImagePreprocessKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ImagePreprocessKind {
+    Detector,
+    Recognizer,
+}
+
+impl ImagePreprocess {
+    /// Resizes and normalizes a full source image for the detector.
+    pub fn detector(corners: [[f32; 2]; 4]) -> Self {
+        Self {
+            corners,
+            content_width: usize::MAX,
+            kind: ImagePreprocessKind::Detector,
+        }
+    }
+
+    /// Rectifies, resizes, pads, and normalizes one source-image quadrilateral
+    /// for the recognizer.
+    pub fn recognizer(corners: [[f32; 2]; 4], content_width: usize) -> Self {
+        Self {
+            corners,
+            content_width,
+            kind: ImagePreprocessKind::Recognizer,
+        }
+    }
+}
+
 struct GpuInner {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -103,6 +146,61 @@ impl Gpu {
 
     pub fn info(&self) -> &GpuInfo {
         &self.inner.info
+    }
+
+    /// Uploads interleaved RGB8 pixels once for device-resident OCR preprocessing.
+    pub fn upload_rgb(&self, width: u32, height: u32, pixels: &[u8]) -> Result<GpuImage> {
+        if width == 0 || height == 0 {
+            return Err(Error::InvalidInput(
+                "source image dimensions must be non-zero".into(),
+            ));
+        }
+        let pixel_count = usize::try_from(width)
+            .ok()
+            .and_then(|width| width.checked_mul(height as usize))
+            .ok_or_else(|| Error::InvalidInput("source image dimensions overflow".into()))?;
+        let expected = pixel_count
+            .checked_mul(3)
+            .ok_or_else(|| Error::InvalidInput("source image byte length overflow".into()))?;
+        if pixels.len() != expected {
+            return Err(Error::InvalidInput(format!(
+                "source image has {} RGB bytes; expected {expected} for {width}x{height}",
+                pixels.len()
+            )));
+        }
+        let packed = pixels
+            .chunks_exact(3)
+            .map(|pixel| {
+                u32::from(pixel[0]) | (u32::from(pixel[1]) << 8) | (u32::from(pixel[2]) << 16)
+            })
+            .collect::<Vec<_>>();
+        let byte_size = u64::try_from(packed.len())
+            .ok()
+            .and_then(|length| length.checked_mul(size_of::<u32>() as u64))
+            .ok_or_else(|| Error::InvalidInput("source image buffer size overflow".into()))?;
+        let limits = self.inner.device.limits();
+        if byte_size > limits.max_buffer_size || byte_size > limits.max_storage_buffer_binding_size
+        {
+            return Err(Error::InvalidInput(format!(
+                "source image buffer {byte_size} exceeds device limits (buffer {}, storage binding {})",
+                limits.max_buffer_size, limits.max_storage_buffer_binding_size
+            )));
+        }
+        let buffer = self.inner.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ppocr source RGB image"),
+            size: byte_size.max(4),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.inner
+            .queue
+            .write_buffer(&buffer, 0, &u32_bytes(&packed));
+        Ok(GpuImage {
+            gpu: self.clone(),
+            pixels: buffer,
+            width,
+            height,
+        })
     }
 
     pub(crate) fn create_session(&self, weights: Vec<f32>, plan: Plan) -> Result<Session> {
@@ -1361,6 +1459,27 @@ impl Session {
         self.read_output()
     }
 
+    /// Runs a model after device-side resize, rectification, BGR conversion,
+    /// normalization, and recognizer padding. The source image is never
+    /// materialized as a host-side F32 tensor.
+    pub fn run_image(&self, image: &GpuImage, preprocess: ImagePreprocess) -> Result<RawOutput> {
+        let _execution = self
+            .execution_lock
+            .lock()
+            .map_err(|_| Error::Gpu("inference lock is poisoned".into()))?;
+        self.validate_image_preprocess(image, preprocess)?;
+        let submission = self.submit_image(image, preprocess, true)?;
+        self.gpu
+            .inner
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|error| Error::Gpu(format!("wait for image inference: {error}")))?;
+        self.read_output()
+    }
+
     pub fn benchmark_nchw(
         &self,
         input: &[f32],
@@ -1545,6 +1664,47 @@ impl Session {
         Ok(())
     }
 
+    fn validate_image_preprocess(
+        &self,
+        image: &GpuImage,
+        preprocess: ImagePreprocess,
+    ) -> Result<()> {
+        if !Arc::ptr_eq(&self.gpu.inner, &image.gpu.inner) {
+            return Err(Error::InvalidInput(
+                "source image belongs to a different GPU device".into(),
+            ));
+        }
+        let input = self.plan.input_shape;
+        if input.n != 1 || input.c != 3 || input.cs != 4 {
+            return Err(Error::Gpu(format!(
+                "image preprocessing requires [1, 3, H, W] model input; found {input:?}"
+            )));
+        }
+        let content_width = match preprocess.kind {
+            ImagePreprocessKind::Detector => input.w,
+            ImagePreprocessKind::Recognizer => preprocess.content_width,
+        };
+        if content_width == 0 || content_width > input.w {
+            return Err(Error::InvalidInput(format!(
+                "preprocessed content width {content_width} is outside 1..={}",
+                input.w
+            )));
+        }
+        if image.width == 0
+            || image.height == 0
+            || preprocess
+                .corners
+                .iter()
+                .flatten()
+                .any(|coordinate| !coordinate.is_finite())
+        {
+            return Err(Error::InvalidInput(
+                "source image and preprocessing corners must be finite and non-empty".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn submit(&self, copy_output: bool) -> Result<wgpu::SubmissionIndex> {
         let device = &self.gpu.inner.device;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1578,6 +1738,106 @@ impl Session {
             );
         }
         Ok(self.gpu.inner.queue.submit([encoder.finish()]))
+    }
+
+    fn submit_image(
+        &self,
+        image: &GpuImage,
+        preprocess: ImagePreprocess,
+        copy_output: bool,
+    ) -> Result<wgpu::SubmissionIndex> {
+        let device = &self.gpu.inner.device;
+        let preprocess_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ppocr image preprocessing buffers"),
+            layout: &self.gpu.inner.kernels.image_preprocess_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: image.pixels.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.arena.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("ppocr image inference"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ppocr image preprocessing"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.gpu.inner.kernels.image_preprocess);
+            pass.set_bind_group(0, &preprocess_bind_group, &[]);
+            let params = self.image_preprocess_params(image, preprocess)?;
+            pass.set_immediates(0, &words_bytes(&params));
+            pass.dispatch_workgroups(
+                div_ceil_u32(self.plan.input_shape.w, 16)?,
+                div_ceil_u32(self.plan.input_shape.h, 16)?,
+                1,
+            );
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ppocr graph"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            for dispatch in &self.plan.dispatches {
+                pass.set_pipeline(self.gpu.inner.kernels.pipeline(dispatch.kernel));
+                let immediate = words_bytes(&dispatch.params);
+                pass.set_immediates(0, &immediate);
+                pass.dispatch_workgroups(
+                    dispatch.workgroups[0],
+                    dispatch.workgroups[1],
+                    dispatch.workgroups[2],
+                );
+            }
+        }
+        if copy_output {
+            let output_bytes = self.plan.output_shape.elements()? as u64 * size_of::<f32>() as u64;
+            encoder.copy_buffer_to_buffer(
+                &self.arena,
+                u64::from(self.plan.output_offset) * size_of::<f32>() as u64,
+                &self.readback,
+                0,
+                output_bytes,
+            );
+        }
+        Ok(self.gpu.inner.queue.submit([encoder.finish()]))
+    }
+
+    fn image_preprocess_params(
+        &self,
+        image: &GpuImage,
+        preprocess: ImagePreprocess,
+    ) -> Result<[u32; IMMEDIATE_WORDS]> {
+        let input = self.plan.input_shape;
+        let mut params = [0u32; IMMEDIATE_WORDS];
+        params[0] = self.plan.input_offset;
+        params[1] = image.width;
+        params[2] = image.height;
+        params[3] = to_u32(input.w, "image preprocessing output width")?;
+        params[4] = to_u32(input.h, "image preprocessing output height")?;
+        params[5] = to_u32(
+            match preprocess.kind {
+                ImagePreprocessKind::Detector => input.w,
+                ImagePreprocessKind::Recognizer => preprocess.content_width,
+            },
+            "image preprocessing content width",
+        )?;
+        params[6] = to_u32(input.cs, "image preprocessing channel stride")?;
+        params[7] = match preprocess.kind {
+            ImagePreprocessKind::Detector => 0,
+            ImagePreprocessKind::Recognizer => 1,
+        };
+        for (index, point) in preprocess.corners.into_iter().enumerate() {
+            params[8 + index * 2] = point[0].to_bits();
+            params[9 + index * 2] = point[1].to_bits();
+        }
+        Ok(params)
     }
 
     fn read_output(&self) -> Result<RawOutput> {
@@ -1703,6 +1963,13 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
         .collect()
 }
 
+fn u32_bytes(values: &[u32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
 fn words_bytes(words: &[u32; IMMEDIATE_WORDS]) -> [u8; IMMEDIATE_WORDS * 4] {
     let mut bytes = [0u8; IMMEDIATE_WORDS * 4];
     for (index, word) in words.iter().enumerate() {
@@ -1725,6 +1992,8 @@ fn bytes_f32(bytes: &[u8]) -> Result<Vec<f32>> {
 
 struct Kernels {
     bind_group_layout: wgpu::BindGroupLayout,
+    image_preprocess_bind_group_layout: wgpu::BindGroupLayout,
+    image_preprocess: wgpu::ComputePipeline,
     conv: wgpu::ComputePipeline,
     conv_2x2_direct: wgpu::ComputePipeline,
     conv_3x3_direct: wgpu::ComputePipeline,
@@ -1801,7 +2070,56 @@ impl Kernels {
                 cache: None,
             })
         };
+        let image_preprocess_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("ppocr image preprocessing buffers"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let image_preprocess_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ppocr image preprocessing layout"),
+                bind_group_layouts: &[Some(&image_preprocess_bind_group_layout)],
+                immediate_size: IMMEDIATE_BYTES,
+            });
+        let image_preprocess_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("ppocr image preprocessing shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/image_preprocess.wgsl").into()),
+        });
+        let image_preprocess = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("ppocr image preprocessing"),
+            layout: Some(&image_preprocess_layout),
+            module: &image_preprocess_shader,
+            entry_point: Some("preprocess"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[],
+                zero_initialize_workgroup_memory: false,
+            },
+            cache: None,
+        });
         Ok(Self {
+            image_preprocess_bind_group_layout,
+            image_preprocess,
             conv: create("ppocr conv", include_str!("shaders/conv.wgsl"), "conv"),
             conv_2x2_direct: create(
                 "ppocr direct 2x2 convolution",
@@ -2172,6 +2490,68 @@ mod tests {
         assert!(error.to_string().contains("nonzero"));
         let error = builder.attention(qkv, 192, 8).err().unwrap();
         assert!(error.to_string().contains("576 QKV channels"));
+    }
+
+    #[test]
+    fn device_preprocess_writes_normalized_nhwc_input_without_host_f32() {
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        let image = gpu
+            .upload_rgb(2, 1, &[255, 0, 0, 0, 0, 255])
+            .expect("upload RGB source image");
+        let (builder, input) = GraphBuilder::new([1, 3, 2, 4]).expect("input graph");
+        let session = gpu
+            .create_session(Vec::new(), builder.finish(input).expect("input plan"))
+            .expect("input session");
+        let output = session
+            .run_image(
+                &image,
+                ImagePreprocess::recognizer([[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0]], 4),
+            )
+            .expect("device preprocessing");
+
+        let expected_row = [
+            -1.0, -1.0, 1.0, // red
+            -0.5, -1.0, 0.5, // first blend
+            0.5, -1.0, -0.5, // second blend
+            1.0, -1.0, -1.0, // blue
+        ];
+        assert_eq!(output.shape, Shape4::new(1, 2, 4, 3).unwrap());
+        assert_eq!(output.values.len(), expected_row.len() * 2);
+        for row in output.values.chunks_exact(expected_row.len()) {
+            for (&actual, expected) in row.iter().zip(expected_row) {
+                assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn device_preprocess_uses_detector_bgr_statistics() {
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        let image = gpu
+            .upload_rgb(1, 1, &[255, 0, 0])
+            .expect("upload RGB source image");
+        let (builder, input) = GraphBuilder::new([1, 3, 1, 1]).expect("input graph");
+        let session = gpu
+            .create_session(Vec::new(), builder.finish(input).expect("input plan"))
+            .expect("input session");
+        let output = session
+            .run_image(
+                &image,
+                ImagePreprocess::detector([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]),
+            )
+            .expect("device preprocessing");
+        let expected = [
+            (0.0 - 0.485) / 0.229,
+            (0.0 - 0.456) / 0.224,
+            (1.0 - 0.406) / 0.225,
+        ];
+        for (&actual, expected) in output.values.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+        }
     }
 
     #[test]

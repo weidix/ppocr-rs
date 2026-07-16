@@ -132,6 +132,17 @@ pub struct OcrModelPaths {
     pub recognizer: ModelPaths,
 }
 
+/// Cache-validation and download policy used while resolving pinned models.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelAccess {
+    /// Use a complete cache when available and download missing or invalid files.
+    Online,
+    /// Require a complete cache and never use the network.
+    Offline,
+    /// Require a complete cache and recompute every asset digest.
+    Verify,
+}
+
 /// A model cache backed by the checked-in, pinned model catalog.
 #[derive(Clone, Debug)]
 pub struct ModelStore {
@@ -172,16 +183,29 @@ impl ModelStore {
     /// Hugging Face revision. Downloads are serialized across processes and
     /// are verified before becoming visible in the cache.
     pub fn ensure(&self, kind: ModelKind, size: ModelSize) -> Result<ModelPaths> {
-        self.resolve(kind, size, false)
+        self.resolve(kind, size, ModelAccess::Online)
     }
 
     /// Ensures a model package is already available without using the network.
     pub fn ensure_offline(&self, kind: ModelKind, size: ModelSize) -> Result<ModelPaths> {
-        self.resolve(kind, size, true)
+        self.resolve(kind, size, ModelAccess::Offline)
     }
 
     /// Fully revalidates every file in a cached model package.
     pub fn verify(&self, kind: ModelKind, size: ModelSize) -> Result<ModelPaths> {
+        self.resolve(kind, size, ModelAccess::Verify)
+    }
+
+    /// Resolves one pinned model package using one explicit cache policy.
+    pub fn resolve(
+        &self,
+        kind: ModelKind,
+        size: ModelSize,
+        access: ModelAccess,
+    ) -> Result<ModelPaths> {
+        if access != ModelAccess::Verify {
+            return self.ensure_resolved(kind, size, access == ModelAccess::Offline);
+        }
         let manifest = model_manifest(kind, size)?;
         let paths = model_paths(&self.root, &manifest)?;
         let _lock = self.lock()?;
@@ -202,13 +226,28 @@ impl ModelStore {
         detector_size: ModelSize,
         recognizer_size: ModelSize,
     ) -> Result<OcrModelPaths> {
+        self.resolve_pair(detector_size, recognizer_size, ModelAccess::Online)
+    }
+
+    /// Resolves the detector and recognizer packages using one cache policy.
+    pub fn resolve_pair(
+        &self,
+        detector_size: ModelSize,
+        recognizer_size: ModelSize,
+        access: ModelAccess,
+    ) -> Result<OcrModelPaths> {
         Ok(OcrModelPaths {
-            detector: self.ensure(ModelKind::Detector, detector_size)?,
-            recognizer: self.ensure(ModelKind::Recognizer, recognizer_size)?,
+            detector: self.resolve(ModelKind::Detector, detector_size, access)?,
+            recognizer: self.resolve(ModelKind::Recognizer, recognizer_size, access)?,
         })
     }
 
-    fn resolve(&self, kind: ModelKind, size: ModelSize, offline: bool) -> Result<ModelPaths> {
+    fn ensure_resolved(
+        &self,
+        kind: ModelKind,
+        size: ModelSize,
+        offline: bool,
+    ) -> Result<ModelPaths> {
         let manifest = model_manifest(kind, size)?;
         let paths = model_paths(&self.root, &manifest)?;
         if cache_is_complete(&paths, &manifest)? {

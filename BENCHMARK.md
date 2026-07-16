@@ -13,13 +13,19 @@ existing cache and `--verify-models` to force a full checksum pass.
 
 ```sh
 cargo run --release --bin ppocr-cpu-bench -- \
-  --kind det --size tiny --height 416 --width 736 \
+  --kind det --model-size tiny --height 416 --width 736 \
   --threads 4 --warmup 5 --runs 30
 
 cargo run --release --no-default-features --features gpu --bin ppocr-gpu-bench -- \
-  --kind det --size tiny --height 416 --width 736 \
+  --kind det --model-size tiny --height 416 --width 736 \
   --warmup 5 --runs 30
 ```
+
+Both commands use the identical benchmark options and deterministic default
+input: `--kind`, `--model-size`, `--model`, `--model-dir`, `--offline`,
+`--verify-models`, dimensions, input/reference/dump paths, warmup, and runs.
+`--threads` is the only CPU-specific option. `--offline` and
+`--verify-models` are mutually exclusive.
 
 Detector inputs use `[1, 3, 416, 736]`; recognizer inputs use
 `[1, 3, 48, 320]`. Run benchmarks with `--release`, record the exact hardware,

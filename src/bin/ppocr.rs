@@ -1,7 +1,10 @@
+mod model_store;
+
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, ValueEnum};
+use model_store::ModelStoreArgs;
 use ppocr_rs::{
-    CpuOptions, DetectorPostprocessOptions, ModelKind, ModelPaths, ModelSize, ModelStore,
+    DetectorPostprocessOptions, ModelKind, ModelPaths, ModelSize, ModelStore, OcrBackend,
     OcrEngine, OcrOptions,
 };
 use std::{fs, path::PathBuf};
@@ -13,13 +16,16 @@ struct Arguments {
     #[arg(value_name = "IMAGE")]
     image: PathBuf,
 
+    /// Inference backend.
+    #[arg(long, value_enum, default_value_t = Backend::Cpu)]
+    backend: Backend,
+
     /// Released model tier used for both detector and recognizer.
     #[arg(long, default_value_t = ModelSize::Tiny)]
     model_size: ModelSize,
 
-    /// Directory where pinned model packages are stored.
-    #[arg(long, env = "PPOCR_MODEL_DIR", default_value = "models")]
-    model_dir: PathBuf,
+    #[command(flatten)]
+    model_store: ModelStoreArgs,
 
     /// Use an explicit detector Safetensors file instead of the pinned package.
     #[arg(long)]
@@ -33,15 +39,7 @@ struct Arguments {
     #[arg(long)]
     dictionary: Option<PathBuf>,
 
-    /// Fail when a required pinned model is not already cached.
-    #[arg(long)]
-    offline: bool,
-
-    /// Recompute hashes for pinned model files before loading them.
-    #[arg(long)]
-    verify_models: bool,
-
-    /// Number of CPU worker threads per loaded model.
+    /// Number of CPU worker threads. The GPU backend does not use this option.
     #[arg(long, default_value_t = default_threads())]
     threads: usize,
 
@@ -83,6 +81,21 @@ struct Arguments {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum Backend {
+    Cpu,
+    Gpu,
+}
+
+impl From<Backend> for OcrBackend {
+    fn from(value: Backend) -> Self {
+        match value {
+            Backend::Cpu => Self::Cpu,
+            Backend::Gpu => Self::Gpu,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum OutputFormat {
     Json,
     Text,
@@ -92,11 +105,10 @@ fn main() -> Result<()> {
     let arguments = Arguments::parse();
     ensure!(arguments.threads > 0, "--threads must be positive");
     let options = OcrOptions {
+        backend: arguments.backend.into(),
         detector_size: arguments.model_size,
         recognizer_size: arguments.model_size,
-        cpu: CpuOptions {
-            threads: arguments.threads,
-        },
+        threads: arguments.threads,
         detector_postprocess: DetectorPostprocessOptions {
             binary_threshold: arguments.binary_threshold,
             box_threshold: arguments.box_threshold,
@@ -126,7 +138,7 @@ fn main() -> Result<()> {
 }
 
 fn resolve_models(arguments: &Arguments) -> Result<(PathBuf, PathBuf, PathBuf)> {
-    let store = ModelStore::new(&arguments.model_dir);
+    let store = ModelStore::new(&arguments.model_store.model_dir);
     let detector = match &arguments.detector_model {
         Some(path) => path.clone(),
         None => resolve_pinned_model(&store, ModelKind::Detector, arguments)?,
@@ -175,15 +187,9 @@ fn resolve_pinned_paths(
     kind: ModelKind,
     arguments: &Arguments,
 ) -> Result<ModelPaths> {
-    if arguments.verify_models {
-        store.verify(kind, arguments.model_size)
-    } else if arguments.offline {
-        store.ensure_offline(kind, arguments.model_size)
-    } else {
-        store.ensure(kind, arguments.model_size)
-    }
+    store.resolve(kind, arguments.model_size, arguments.model_store.access())
 }
 
 fn default_threads() -> usize {
-    CpuOptions::default().threads
+    OcrOptions::default().threads
 }

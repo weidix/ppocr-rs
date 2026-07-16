@@ -1,18 +1,17 @@
-use anyhow::{Context, Result, bail};
-use image::{Rgb, RgbImage, imageops};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
+#[cfg(feature = "gpu")]
+use std::path::PathBuf;
 use std::{collections::VecDeque, fs, path::Path};
 
+use crate::{ModelSize, ModelStore, RgbImage};
 #[cfg(feature = "cpu")]
 use crate::{
-    cpu::{CpuOptions, Detector, ModelSize, Recognizer, Tensor},
-    models::ModelStore,
+    cpu::{CpuOptions, Detector, Recognizer, Tensor},
     preprocess::{prepare_detector, prepare_recognizer},
 };
-#[cfg(feature = "cpu")]
-use anyhow::ensure;
-#[cfg(feature = "cpu")]
-use image::ImageReader;
+#[cfg(feature = "gpu")]
+use std::cell::RefCell;
 
 pub const RECOGNIZER_INPUT_HEIGHT: usize = 48;
 pub const RECOGNIZER_INPUT_WIDTH: usize = 320;
@@ -21,6 +20,10 @@ const MAX_RECTIFIED_EDGE: f32 = 4_096.0;
 const MAX_RECTIFIED_PIXELS: f32 = 8_000_000.0;
 const MAX_RECOGNITION_CHUNKS: usize = 64;
 const PROBABILITY_EPSILON: f32 = 1e-8;
+const DETECTOR_LIMIT_SIDE: f64 = 736.0;
+const DETECTOR_MAX_SIDE: f64 = 4_000.0;
+#[cfg(feature = "gpu")]
+const GPU_DETECTOR_CACHE_LIMIT: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DetectorTransform {
@@ -65,6 +68,179 @@ impl DetectorTransform {
         (y * self.source_height as f32 / self.content_height as f32)
             .clamp(0.0, self.source_height as f32)
     }
+}
+
+/// Backend-independent detector input geometry.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DetectorInputPlan {
+    input_width: usize,
+    input_height: usize,
+    transform: DetectorTransform,
+}
+
+impl DetectorInputPlan {
+    pub(crate) fn new(image: &RgbImage, max_side: Option<u32>) -> Result<Self> {
+        let width = image.width();
+        let height = image.height();
+        let ratio = match max_side {
+            Some(limit) if limit > 0 => (f64::from(limit) / f64::from(width.max(height))).min(1.0),
+            Some(_) => bail!("detector maximum side must be positive"),
+            None => default_detector_ratio(width, height),
+        };
+        let input_width = aligned_dimension(f64::from(width) * ratio)?;
+        let input_height = aligned_dimension(f64::from(height) * ratio)?;
+        Ok(Self {
+            input_width: input_width as usize,
+            input_height: input_height as usize,
+            transform: DetectorTransform::new(width, height, input_width, input_height)?,
+        })
+    }
+
+    pub(crate) const fn input_width(self) -> usize {
+        self.input_width
+    }
+
+    pub(crate) const fn input_height(self) -> usize {
+        self.input_height
+    }
+
+    pub(crate) const fn transform(self) -> DetectorTransform {
+        self.transform
+    }
+
+    pub(crate) fn corners(self) -> [Point; 4] {
+        [
+            Point(0.0, 0.0),
+            Point(self.transform.source_width as f32, 0.0),
+            Point(
+                self.transform.source_width as f32,
+                self.transform.source_height as f32,
+            ),
+            Point(0.0, self.transform.source_height as f32),
+        ]
+    }
+}
+
+/// Backend-independent recognizer input geometry for one text segment.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecognitionInputPlan {
+    corners: [Point; 4],
+    input_width: usize,
+    content_width: usize,
+}
+
+impl RecognitionInputPlan {
+    pub(crate) const fn corners(self) -> [Point; 4] {
+        self.corners
+    }
+
+    pub(crate) const fn input_width(self) -> usize {
+        self.input_width
+    }
+
+    #[cfg(feature = "cpu")]
+    pub(crate) const fn input_height(self) -> usize {
+        RECOGNIZER_INPUT_HEIGHT
+    }
+
+    pub(crate) const fn content_width(self) -> usize {
+        self.content_width
+    }
+}
+
+pub(crate) fn recognition_input_plans(
+    polygon: [Point; 4],
+    max_width: u32,
+) -> Result<Vec<RecognitionInputPlan>> {
+    validate_recognizer_width(max_width)?;
+    let width = distance(polygon[0], polygon[1]).max(distance(polygon[3], polygon[2]));
+    let height = distance(polygon[0], polygon[3]).max(distance(polygon[1], polygon[2]));
+    let (width, height) = bounded_crop_dimensions(width, height)?;
+    let maximum_chunk_width = (height as usize)
+        .checked_mul(max_width as usize)
+        .context("recognition crop width overflow")?
+        / RECOGNIZER_INPUT_HEIGHT;
+    let maximum_chunk_width =
+        u32::try_from(maximum_chunk_width.max(1)).context("recognition crop width overflow")?;
+    let overlap = if maximum_chunk_width > 1 {
+        (maximum_chunk_width / 3).clamp(1, maximum_chunk_width - 1)
+    } else {
+        0
+    };
+    let step = maximum_chunk_width.saturating_sub(overlap).max(1);
+    let mut plans = Vec::new();
+    let mut start = 0u32;
+    loop {
+        if plans.len() == MAX_RECOGNITION_CHUNKS {
+            bail!(
+                "recognition crop requires more than {MAX_RECOGNITION_CHUNKS} fixed-width chunks"
+            );
+        }
+        let chunk_width = (width - start).min(maximum_chunk_width);
+        let start_ratio = start as f32 / width as f32;
+        let end_ratio = (start + chunk_width) as f32 / width as f32;
+        let corners = [
+            lerp(polygon[0], polygon[1], start_ratio),
+            lerp(polygon[0], polygon[1], end_ratio),
+            lerp(polygon[3], polygon[2], end_ratio),
+            lerp(polygon[3], polygon[2], start_ratio),
+        ];
+        plans.push(RecognitionInputPlan {
+            corners,
+            input_width: max_width as usize,
+            content_width: scaled_recognizer_width(chunk_width, height, max_width)?,
+        });
+        if start + chunk_width >= width {
+            break;
+        }
+        start += step;
+    }
+    Ok(plans)
+}
+
+fn default_detector_ratio(width: u32, height: u32) -> f64 {
+    let min_side = f64::from(width.min(height));
+    let mut ratio = if min_side < DETECTOR_LIMIT_SIDE {
+        DETECTOR_LIMIT_SIDE / min_side
+    } else {
+        1.0
+    };
+    if f64::from(width.max(height)) * ratio > DETECTOR_MAX_SIDE {
+        ratio = DETECTOR_MAX_SIDE / f64::from(width.max(height));
+    }
+    ratio
+}
+
+fn aligned_dimension(value: f64) -> Result<u32> {
+    if !value.is_finite() || value <= 0.0 {
+        bail!("invalid resized image dimension {value}");
+    }
+    let units = (value / 32.0).round().max(1.0);
+    if units > f64::from(u32::MAX / 32) {
+        bail!("resized image dimension {value} is too large");
+    }
+    Ok(units as u32 * 32)
+}
+
+fn validate_recognizer_width(max_width: u32) -> Result<()> {
+    ensure!(
+        max_width >= RECOGNIZER_INPUT_WIDTH as u32,
+        "recognizer maximum width must be at least {RECOGNIZER_INPUT_WIDTH}"
+    );
+    ensure!(
+        max_width.is_multiple_of(4),
+        "recognizer maximum width must be divisible by four"
+    );
+    Ok(())
+}
+
+fn scaled_recognizer_width(width: u32, height: u32, max_width: u32) -> Result<usize> {
+    let scaled = (RECOGNIZER_INPUT_HEIGHT as u32)
+        .checked_mul(width)
+        .context("recognizer content width overflow")?
+        .div_ceil(height)
+        .clamp(1, max_width);
+    Ok(scaled as usize)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -120,16 +296,26 @@ pub struct DecodedText {
     pub score: f32,
 }
 
-/// Configuration for the end-to-end CPU OCR pipeline.
-#[cfg(feature = "cpu")]
+/// Inference device used by the end-to-end OCR engine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OcrBackend {
+    /// Native CPU kernels.
+    Cpu,
+    /// WGPU compute kernels.
+    Gpu,
+}
+
+/// Configuration for the end-to-end OCR pipeline.
 #[derive(Clone, Debug)]
 pub struct OcrOptions {
+    /// Inference device.
+    pub backend: OcrBackend,
     /// Detector model tier.
     pub detector_size: ModelSize,
     /// Recognizer model tier.
     pub recognizer_size: ModelSize,
-    /// CPU runtime settings shared by the detector and recognizer.
-    pub cpu: CpuOptions,
+    /// CPU worker threads. The GPU backend ignores this value.
+    pub threads: usize,
     /// Detector output postprocessing settings.
     pub detector_postprocess: DetectorPostprocessOptions,
     /// Optional maximum detector image side. `None` uses the released model's
@@ -139,13 +325,15 @@ pub struct OcrOptions {
     pub recognizer_max_width: u32,
 }
 
-#[cfg(feature = "cpu")]
 impl Default for OcrOptions {
     fn default() -> Self {
         Self {
+            backend: OcrBackend::Cpu,
             detector_size: ModelSize::Tiny,
             recognizer_size: ModelSize::Tiny,
-            cpu: CpuOptions::default(),
+            threads: std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(4),
             detector_postprocess: DetectorPostprocessOptions::default(),
             detector_max_side: None,
             recognizer_max_width: RECOGNIZER_INPUT_WIDTH as u32,
@@ -153,16 +341,12 @@ impl Default for OcrOptions {
     }
 }
 
-#[cfg(feature = "cpu")]
 impl OcrOptions {
     /// Validates options before model resolution or inference.
     pub fn validate(&self) -> Result<()> {
         self.detector_postprocess.validate()?;
-        ensure!(self.cpu.threads > 0, "CPU thread count must be positive");
-        ensure!(
-            self.recognizer_max_width >= RECOGNIZER_INPUT_WIDTH as u32,
-            "recognizer maximum width must be at least {RECOGNIZER_INPUT_WIDTH}"
-        );
+        ensure!(self.threads > 0, "worker thread count must be positive");
+        validate_recognizer_width(self.recognizer_max_width)?;
         if let Some(max_side) = self.detector_max_side {
             ensure!(max_side > 0, "detector maximum side must be positive");
         }
@@ -171,7 +355,6 @@ impl OcrOptions {
 }
 
 /// One recognized text region.
-#[cfg(feature = "cpu")]
 #[derive(Clone, Debug, Serialize)]
 pub struct OcrLine {
     /// Text-region quadrilateral in source-image coordinates.
@@ -185,7 +368,6 @@ pub struct OcrLine {
 }
 
 /// The complete result of OCR on one image.
-#[cfg(feature = "cpu")]
 #[derive(Clone, Debug, Serialize)]
 pub struct OcrResult {
     /// Source image dimensions as `[width, height]`.
@@ -196,7 +378,6 @@ pub struct OcrResult {
     pub lines: Vec<OcrLine>,
 }
 
-#[cfg(feature = "cpu")]
 impl OcrResult {
     /// Returns recognized non-empty lines joined with newlines.
     pub fn text(&self) -> String {
@@ -209,26 +390,52 @@ impl OcrResult {
     }
 }
 
-/// An end-to-end PP-OCRv6 CPU inference engine.
-#[cfg(feature = "cpu")]
+/// An end-to-end PP-OCRv6 inference engine.
 pub struct OcrEngine {
-    detector: Detector,
-    recognizer: Recognizer,
+    runtime: OcrRuntime,
     dictionary: Vec<String>,
     options: OcrOptions,
 }
 
-#[cfg(feature = "cpu")]
+enum OcrRuntime {
+    #[cfg(feature = "cpu")]
+    Cpu {
+        detector: Detector,
+        recognizer: Recognizer,
+    },
+    #[cfg(feature = "gpu")]
+    Gpu(GpuOcrRuntime),
+    #[cfg(not(any(feature = "cpu", feature = "gpu")))]
+    Unavailable,
+}
+
+#[cfg(feature = "gpu")]
+struct GpuOcrRuntime {
+    gpu: crate::gpu::Gpu,
+    detector_model: PathBuf,
+    detector_size: ModelSize,
+    detector_cache: RefCell<Vec<([usize; 4], crate::gpu::Detector)>>,
+    recognizer: crate::gpu::Recognizer,
+}
+
 impl OcrEngine {
     /// Downloads missing pinned models through `store`, then loads an OCR engine.
     pub fn load_from_store(store: &ModelStore, options: OcrOptions) -> Result<Self> {
-        let paths = store.ensure_pair(options.detector_size, options.recognizer_size)?;
-        Self::load(
-            &paths.detector.weights,
-            &paths.recognizer.weights,
-            &paths.recognizer.inference,
-            options,
-        )
+        #[cfg(not(any(feature = "cpu", feature = "gpu")))]
+        {
+            let _ = (store, options);
+            bail!("no OCR backend is compiled; rebuild with --features cpu or --features gpu")
+        }
+        #[cfg(any(feature = "cpu", feature = "gpu"))]
+        {
+            let paths = store.ensure_pair(options.detector_size, options.recognizer_size)?;
+            Self::load(
+                &paths.detector.weights,
+                &paths.recognizer.weights,
+                &paths.recognizer.inference,
+                options,
+            )
+        }
     }
 
     /// Loads an engine from explicit detector, recognizer, and dictionary paths.
@@ -238,91 +445,241 @@ impl OcrEngine {
         dictionary: impl AsRef<Path>,
         options: OcrOptions,
     ) -> Result<Self> {
-        options.validate()?;
-        let detector_model = detector_model.as_ref();
-        let recognizer_model = recognizer_model.as_ref();
-        let dictionary_path = dictionary.as_ref();
-        let dictionary = load_dictionary(dictionary_path)?;
-        validate_recognizer_dictionary(&dictionary, options.recognizer_size)?;
-        let detector = Detector::load(detector_model, options.detector_size, options.cpu)
-            .with_context(|| format!("load detector {}", detector_model.display()))?;
-        let recognizer =
-            Recognizer::load(recognizer_model, options.recognizer_size, options.cpu)
-                .with_context(|| format!("load recognizer {}", recognizer_model.display()))?;
-        Ok(Self {
-            detector,
-            recognizer,
-            dictionary,
-            options,
-        })
+        #[cfg(not(any(feature = "cpu", feature = "gpu")))]
+        {
+            let _ = (detector_model, recognizer_model, dictionary, options);
+            bail!("no OCR backend is compiled; rebuild with --features cpu or --features gpu")
+        }
+        #[cfg(any(feature = "cpu", feature = "gpu"))]
+        {
+            options.validate()?;
+            let detector_model = detector_model.as_ref();
+            let recognizer_model = recognizer_model.as_ref();
+            let dictionary_path = dictionary.as_ref();
+            let dictionary = load_dictionary(dictionary_path)?;
+            validate_recognizer_dictionary(&dictionary, options.recognizer_size)?;
+            let runtime = match options.backend {
+                OcrBackend::Cpu => {
+                    #[cfg(feature = "cpu")]
+                    {
+                        let cpu = CpuOptions {
+                            threads: options.threads,
+                        };
+                        let detector = Detector::load(detector_model, options.detector_size, cpu)
+                            .with_context(|| {
+                            format!("load detector {}", detector_model.display())
+                        })?;
+                        let recognizer =
+                            Recognizer::load(recognizer_model, options.recognizer_size, cpu)
+                                .with_context(|| {
+                                    format!("load recognizer {}", recognizer_model.display())
+                                })?;
+                        OcrRuntime::Cpu {
+                            detector,
+                            recognizer,
+                        }
+                    }
+                    #[cfg(not(feature = "cpu"))]
+                    {
+                        bail!("the CPU backend is not compiled; rebuild with --features cpu")
+                    }
+                }
+                OcrBackend::Gpu => {
+                    #[cfg(feature = "gpu")]
+                    {
+                        let gpu = crate::gpu::Gpu::new().context("initialize GPU backend")?;
+                        let recognizer = crate::gpu::Recognizer::load(
+                            &gpu,
+                            recognizer_model,
+                            options.recognizer_size,
+                            [
+                                1,
+                                3,
+                                RECOGNIZER_INPUT_HEIGHT,
+                                options.recognizer_max_width as usize,
+                            ],
+                        )
+                        .with_context(|| {
+                            format!("load recognizer {}", recognizer_model.display())
+                        })?;
+                        OcrRuntime::Gpu(GpuOcrRuntime {
+                            gpu,
+                            detector_model: detector_model.to_path_buf(),
+                            detector_size: options.detector_size,
+                            detector_cache: RefCell::new(Vec::new()),
+                            recognizer,
+                        })
+                    }
+                    #[cfg(not(feature = "gpu"))]
+                    {
+                        bail!("the GPU backend is not compiled; rebuild with --features gpu")
+                    }
+                }
+            };
+            Ok(Self {
+                runtime,
+                dictionary,
+                options,
+            })
+        }
     }
 
     /// Decodes an image file into text regions.
     pub fn recognize_path(&self, path: impl AsRef<Path>) -> Result<OcrResult> {
-        let path = path.as_ref();
-        let image = ImageReader::open(path)
-            .with_context(|| format!("open image {}", path.display()))?
-            .decode()
-            .with_context(|| format!("decode image {}", path.display()))?
-            .to_rgb8();
+        let image = RgbImage::from_path(path)?;
         self.recognize(&image)
     }
 
     /// Decodes an RGB image into text regions.
     pub fn recognize(&self, image: &RgbImage) -> Result<OcrResult> {
-        let source_size = [image.width(), image.height()];
-        let prepared = prepare_detector(image, self.options.detector_max_side)?;
-        let detector_input_size = [prepared.input.width, prepared.input.height];
-        let detector_input = Tensor::from_f32(prepared.input.shape(), prepared.input.data)?;
-        let detector_output = self.detector.run(detector_input)?;
-        let detections = extract_detections(
-            detector_output.as_f32()?,
-            detector_output.shape(),
-            prepared.transform,
-            self.options.detector_postprocess,
-        )?;
-
-        let mut lines = Vec::with_capacity(detections.len());
-        for detection in detections {
-            let crop = rectify_text_crop(image, detection.polygon)?;
-            let mut decoded_chunks = Vec::new();
-            for chunk in split_recognition_crop_for_input(
-                &crop,
-                RECOGNIZER_INPUT_HEIGHT,
-                self.options.recognizer_max_width as usize,
-            )? {
-                let prepared = prepare_recognizer(&chunk, self.options.recognizer_max_width)?;
-                let content_width = prepared.content_width;
-                let input_width = prepared.input.width;
-                let recognizer_input =
-                    Tensor::from_f32(prepared.input.shape(), prepared.input.data)?;
-                let recognizer_output = self.recognizer.run(recognizer_input)?;
-                decoded_chunks.push(decode_ctc_greedy_for_input(
-                    recognizer_output.as_f32()?,
-                    recognizer_output.shape(),
+        match &self.runtime {
+            #[cfg(feature = "cpu")]
+            OcrRuntime::Cpu {
+                detector,
+                recognizer,
+            } => recognize_with(
+                image,
+                &self.dictionary,
+                &self.options,
+                |plan| {
+                    let prepared = detector.with_thread_pool(|| prepare_detector(image, plan));
+                    let output =
+                        detector.forward(Tensor::from_f32(prepared.shape(), prepared.data)?)?;
+                    Ok((output.as_f32()?.to_vec(), output.shape().to_vec()))
+                },
+                |plan| {
+                    let prepared = recognizer.with_thread_pool(|| prepare_recognizer(image, plan));
+                    let output =
+                        recognizer.forward(Tensor::from_f32(prepared.shape(), prepared.data)?)?;
+                    Ok((output.as_f32()?.to_vec(), output.shape().to_vec()))
+                },
+            ),
+            #[cfg(feature = "gpu")]
+            OcrRuntime::Gpu(runtime) => {
+                let gpu_image = runtime
+                    .gpu
+                    .upload_rgb(image.width(), image.height(), image.pixels())
+                    .context("upload source image to GPU")?;
+                recognize_with(
+                    image,
                     &self.dictionary,
-                    content_width,
-                    input_width,
-                )?);
+                    &self.options,
+                    |plan| runtime.run_detector(&gpu_image, plan),
+                    |plan| runtime.run_recognizer(&gpu_image, plan),
+                )
             }
-            let decoded = join_decoded_texts(&decoded_chunks);
-            lines.push(OcrLine {
-                polygon: detection.polygon,
-                detection_score: detection.score,
-                text: decoded.text,
-                recognition_score: decoded.score,
-            });
+            #[cfg(not(any(feature = "cpu", feature = "gpu")))]
+            OcrRuntime::Unavailable => {
+                bail!("no OCR backend is compiled; rebuild with --features cpu or --features gpu")
+            }
         }
-
-        Ok(OcrResult {
-            source_size,
-            detector_input_size,
-            lines,
-        })
     }
 }
 
-#[cfg(feature = "cpu")]
+fn recognize_with(
+    image: &RgbImage,
+    dictionary: &[String],
+    options: &OcrOptions,
+    mut run_detector: impl FnMut(DetectorInputPlan) -> Result<(Vec<f32>, Vec<usize>)>,
+    mut run_recognizer: impl FnMut(RecognitionInputPlan) -> Result<(Vec<f32>, Vec<usize>)>,
+) -> Result<OcrResult> {
+    let detector_plan = DetectorInputPlan::new(image, options.detector_max_side)?;
+    let detector_input_size = [detector_plan.input_width(), detector_plan.input_height()];
+    let (detector_values, detector_shape) = run_detector(detector_plan)?;
+    let detections = extract_detections(
+        &detector_values,
+        &detector_shape,
+        detector_plan.transform(),
+        options.detector_postprocess,
+    )?;
+
+    let mut lines = Vec::with_capacity(detections.len());
+    for detection in detections {
+        let mut decoded_chunks = Vec::new();
+        for plan in recognition_input_plans(detection.polygon, options.recognizer_max_width)? {
+            let (values, shape) = run_recognizer(plan)?;
+            decoded_chunks.push(decode_ctc_greedy_for_input(
+                &values,
+                &shape,
+                dictionary,
+                plan.content_width(),
+                plan.input_width(),
+            )?);
+        }
+        let decoded = join_decoded_texts(&decoded_chunks);
+        lines.push(OcrLine {
+            polygon: detection.polygon,
+            detection_score: detection.score,
+            text: decoded.text,
+            recognition_score: decoded.score,
+        });
+    }
+
+    Ok(OcrResult {
+        source_size: [image.width(), image.height()],
+        detector_input_size,
+        lines,
+    })
+}
+
+#[cfg(feature = "gpu")]
+impl GpuOcrRuntime {
+    fn run_detector(
+        &self,
+        image: &crate::gpu::GpuImage,
+        plan: DetectorInputPlan,
+    ) -> Result<(Vec<f32>, Vec<usize>)> {
+        let shape = [1, 3, plan.input_height(), plan.input_width()];
+        let mut cache = self
+            .detector_cache
+            .try_borrow_mut()
+            .map_err(|_| anyhow::anyhow!("GPU detector cache is already in use"))?;
+        let index = match cache.iter().position(|(cached, _)| *cached == shape) {
+            Some(index) => index,
+            None => {
+                if cache.len() == GPU_DETECTOR_CACHE_LIMIT {
+                    cache.remove(0);
+                }
+                let detector = crate::gpu::Detector::load(
+                    &self.gpu,
+                    &self.detector_model,
+                    self.detector_size,
+                    shape,
+                )
+                .with_context(|| {
+                    format!(
+                        "load GPU detector {} for input {:?}",
+                        self.detector_model.display(),
+                        shape
+                    )
+                })?;
+                cache.push((shape, detector));
+                cache.len() - 1
+            }
+        };
+        let output = cache[index].1.forward_image(
+            image,
+            crate::gpu::ImagePreprocess::detector(plan.corners().map(point_coordinates)),
+        )?;
+        Ok((output.values, output.shape))
+    }
+
+    fn run_recognizer(
+        &self,
+        image: &crate::gpu::GpuImage,
+        plan: RecognitionInputPlan,
+    ) -> Result<(Vec<f32>, Vec<usize>)> {
+        let output = self.recognizer.forward_image(
+            image,
+            crate::gpu::ImagePreprocess::recognizer(
+                plan.corners().map(point_coordinates),
+                plan.content_width(),
+            ),
+        )?;
+        Ok((output.values, output.shape))
+    }
+}
+
 fn validate_recognizer_dictionary(dictionary: &[String], size: ModelSize) -> Result<()> {
     let classes = size.recognizer_classes();
     ensure!(
@@ -332,50 +689,6 @@ fn validate_recognizer_dictionary(dictionary: &[String], size: ModelSize) -> Res
         dictionary.len()
     );
     Ok(())
-}
-
-pub fn split_recognition_crop_for_input(
-    image: &RgbImage,
-    input_height: usize,
-    input_width: usize,
-) -> Result<Vec<RgbImage>> {
-    if image.width() == 0 || image.height() == 0 {
-        bail!("cannot split an empty recognition crop");
-    }
-    if input_height == 0 || input_width == 0 {
-        bail!("recognizer input dimensions must be non-zero");
-    }
-    let max_width = (image.height() as usize)
-        .checked_mul(input_width)
-        .context("recognition crop width overflow")?
-        / input_height;
-    let max_width = u32::try_from(max_width.max(1)).context("recognition crop width overflow")?;
-    if image.width() <= max_width {
-        return Ok(vec![image.clone()]);
-    }
-
-    let overlap = if max_width > 1 {
-        (max_width / 3).clamp(1, max_width - 1)
-    } else {
-        0
-    };
-    let step = max_width.saturating_sub(overlap).max(1);
-    let mut chunks = Vec::new();
-    let mut start = 0u32;
-    loop {
-        if chunks.len() == MAX_RECOGNITION_CHUNKS {
-            bail!(
-                "recognition crop requires more than {MAX_RECOGNITION_CHUNKS} fixed-width chunks"
-            );
-        }
-        let width = (image.width() - start).min(max_width);
-        chunks.push(imageops::crop_imm(image, start, 0, width, image.height()).to_image());
-        if start + width >= image.width() {
-            break;
-        }
-        start += step;
-    }
-    Ok(chunks)
 }
 
 pub fn join_decoded_texts(parts: &[DecodedText]) -> DecodedText {
@@ -466,36 +779,6 @@ pub fn extract_detections(
         sort_detections(&mut detections);
     }
     Ok(detections)
-}
-
-pub fn rectify_text_crop(image: &RgbImage, polygon: [Point; 4]) -> Result<RgbImage> {
-    if image.width() == 0 || image.height() == 0 {
-        bail!("cannot rectify a crop from an empty image");
-    }
-    if polygon
-        .iter()
-        .any(|point| !point.0.is_finite() || !point.1.is_finite())
-    {
-        bail!("text polygon contains non-finite coordinates");
-    }
-
-    let width = distance(polygon[0], polygon[1]).max(distance(polygon[3], polygon[2]));
-    let height = distance(polygon[0], polygon[3]).max(distance(polygon[1], polygon[2]));
-    let (output_width, output_height) = bounded_crop_dimensions(width, height)?;
-    let mut output = RgbImage::new(output_width, output_height);
-    for y in 0..output_height {
-        let v = (y as f32 + 0.5) / output_height as f32;
-        for x in 0..output_width {
-            let u = (x as f32 + 0.5) / output_width as f32;
-            let source = bilinear_quad(polygon, u, v);
-            output.put_pixel(
-                x,
-                y,
-                sample_bilinear(image, Point(source.0 - 0.5, source.1 - 0.5)),
-            );
-        }
-    }
-    Ok(output)
 }
 
 pub fn load_dictionary(path: impl AsRef<Path>) -> Result<Vec<String>> {
@@ -818,37 +1101,6 @@ fn bounded_crop_dimensions(width: f32, height: f32) -> Result<(u32, u32)> {
     ))
 }
 
-fn bilinear_quad(polygon: [Point; 4], u: f32, v: f32) -> Point {
-    let top = add(scale(polygon[0], 1.0 - u), scale(polygon[1], u));
-    let bottom = add(scale(polygon[3], 1.0 - u), scale(polygon[2], u));
-    add(scale(top, 1.0 - v), scale(bottom, v))
-}
-
-fn sample_bilinear(image: &RgbImage, point: Point) -> Rgb<u8> {
-    let max_x = image.width().saturating_sub(1) as f32;
-    let max_y = image.height().saturating_sub(1) as f32;
-    let x = point.0.clamp(0.0, max_x);
-    let y = point.1.clamp(0.0, max_y);
-    let x0 = x.floor() as u32;
-    let y0 = y.floor() as u32;
-    let x1 = (x0 + 1).min(image.width() - 1);
-    let y1 = (y0 + 1).min(image.height() - 1);
-    let tx = x - x0 as f32;
-    let ty = y - y0 as f32;
-    let top_left = image.get_pixel(x0, y0).0;
-    let top_right = image.get_pixel(x1, y0).0;
-    let bottom_left = image.get_pixel(x0, y1).0;
-    let bottom_right = image.get_pixel(x1, y1).0;
-    let mut pixel = [0u8; 3];
-    for channel in 0..3 {
-        let top = f32::from(top_left[channel]) * (1.0 - tx) + f32::from(top_right[channel]) * tx;
-        let bottom =
-            f32::from(bottom_left[channel]) * (1.0 - tx) + f32::from(bottom_right[channel]) * tx;
-        pixel[channel] = (top * (1.0 - ty) + bottom * ty).round().clamp(0.0, 255.0) as u8;
-    }
-    Rgb(pixel)
-}
-
 fn row_probability(row: &[f32], value: f32) -> f32 {
     let sum = row.iter().sum::<f32>();
     if row.iter().all(|candidate| *candidate >= 0.0) && (sum - 1.0).abs() <= 0.01 {
@@ -901,6 +1153,18 @@ fn scale(point: Point, factor: f32) -> Point {
     Point(point.0 * factor, point.1 * factor)
 }
 
+fn lerp(left: Point, right: Point, factor: f32) -> Point {
+    Point(
+        left.0 * (1.0 - factor) + right.0 * factor,
+        left.1 * (1.0 - factor) + right.1 * factor,
+    )
+}
+
+#[cfg(feature = "gpu")]
+fn point_coordinates(point: Point) -> [f32; 2] {
+    [point.0, point.1]
+}
+
 fn distance(left: Point, right: Point) -> f32 {
     ((left.0 - right.0).powi(2) + (left.1 - right.1).powi(2)).sqrt()
 }
@@ -908,7 +1172,6 @@ fn distance(left: Point, right: Point) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::Rgb;
 
     #[test]
     fn detector_postprocess_maps_components_to_source_coordinates() {
@@ -951,24 +1214,95 @@ mod tests {
     }
 
     #[test]
-    fn split_preserves_recognizer_aspect_ratio() {
-        let image = RgbImage::from_pixel(1_000, 20, Rgb([0, 0, 0]));
-        let chunks = split_recognition_crop_for_input(&image, 48, 320).expect("split crop");
-        assert!(chunks.len() > 1);
-        assert!(chunks.iter().all(|chunk| chunk.width() <= 133));
+    fn recognition_plan_preserves_recognizer_aspect_ratio() {
+        let plans = recognition_input_plans(
+            [
+                Point(0.0, 0.0),
+                Point(1_000.0, 0.0),
+                Point(1_000.0, 20.0),
+                Point(0.0, 20.0),
+            ],
+            320,
+        )
+        .expect("recognition plans");
+        assert!(plans.len() > 1);
+        assert!(plans.iter().all(|plan| plan.content_width() <= 320));
     }
 
     #[test]
-    fn split_uses_a_third_width_overlap_for_chunk_boundaries() {
-        let image = RgbImage::from_fn(300, 20, |x, _| Rgb([(x & 0xff) as u8, (x >> 8) as u8, 0]));
-        let chunks = split_recognition_crop_for_input(&image, 48, 320).expect("split crop");
+    fn recognition_plan_uses_a_third_width_overlap() {
+        let plans = recognition_input_plans(
+            [
+                Point(0.0, 0.0),
+                Point(300.0, 0.0),
+                Point(300.0, 20.0),
+                Point(0.0, 20.0),
+            ],
+            320,
+        )
+        .expect("recognition plans");
+        assert_eq!(plans.len(), 3);
+        assert_eq!(plans[0].content_width(), 320);
+        assert_eq!(plans[1].content_width(), 320);
+        assert_eq!(plans[2].content_width(), 293);
+        assert!((plans[0].corners()[1].0 - plans[1].corners()[0].0 - 44.0).abs() < 1e-4);
+    }
 
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0].width(), 133);
-        assert_eq!(chunks[1].width(), 133);
-        assert_eq!(chunks[2].width(), 122);
-        for x in 0..44 {
-            assert_eq!(chunks[0].get_pixel(89 + x, 0), chunks[1].get_pixel(x, 0));
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_engine_runs_device_preprocessing_when_local_models_are_available() {
+        let detector = Path::new("models/tiny-det/model.safetensors");
+        let recognizer = Path::new("models/tiny-rec/model.safetensors");
+        let dictionary = Path::new("models/tiny-rec/inference.yml");
+        if !detector.is_file() || !recognizer.is_file() || !dictionary.is_file() {
+            return;
         }
+        if crate::gpu::Gpu::new().is_err() {
+            return;
+        }
+
+        let engine = OcrEngine::load(
+            detector,
+            recognizer,
+            dictionary,
+            OcrOptions {
+                backend: OcrBackend::Gpu,
+                detector_max_side: Some(32),
+                ..OcrOptions::default()
+            },
+        )
+        .expect("load GPU OCR engine");
+        let image = RgbImage::new(32, 32, vec![255; 32 * 32 * 3]).expect("source image");
+        let result = engine.recognize(&image).expect("run GPU OCR");
+        assert_eq!(result.source_size, [32, 32]);
+        assert_eq!(result.detector_input_size, [32, 32]);
+    }
+
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn cpu_engine_runs_shared_preprocessing_plan_when_local_models_are_available() {
+        let detector = Path::new("models/tiny-det/model.safetensors");
+        let recognizer = Path::new("models/tiny-rec/model.safetensors");
+        let dictionary = Path::new("models/tiny-rec/inference.yml");
+        if !detector.is_file() || !recognizer.is_file() || !dictionary.is_file() {
+            return;
+        }
+
+        let engine = OcrEngine::load(
+            detector,
+            recognizer,
+            dictionary,
+            OcrOptions {
+                backend: OcrBackend::Cpu,
+                detector_max_side: Some(32),
+                threads: 1,
+                ..OcrOptions::default()
+            },
+        )
+        .expect("load CPU OCR engine");
+        let image = RgbImage::new(32, 32, vec![255; 32 * 32 * 3]).expect("source image");
+        let result = engine.recognize(&image).expect("run CPU OCR");
+        assert_eq!(result.source_size, [32, 32]);
+        assert_eq!(result.detector_input_size, [32, 32]);
     }
 }

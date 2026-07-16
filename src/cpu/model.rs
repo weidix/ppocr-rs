@@ -1608,13 +1608,17 @@ impl Detector {
         })
     }
 
-    pub fn run(&self, input: Tensor) -> Result<Tensor> {
+    pub fn forward(&self, input: Tensor) -> Result<Tensor> {
         validate_input(&input, true)?;
         self.pool
-            .install(|| self.arena.scope(|| self.forward(&input)))
+            .install(|| self.arena.scope(|| self.infer(&input)))
     }
 
-    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+    pub(crate) fn with_thread_pool<R: Send>(&self, operation: impl FnOnce() -> R + Send) -> R {
+        self.pool.install(operation)
+    }
+
+    fn infer(&self, input: &Tensor) -> Result<Tensor> {
         let features = self.backbone.forward(input)?;
         self.head.forward(&self.neck.forward(&features)?)
     }
@@ -2017,13 +2021,17 @@ impl Recognizer {
         })
     }
 
-    pub fn run(&self, input: Tensor) -> Result<Tensor> {
+    pub fn forward(&self, input: Tensor) -> Result<Tensor> {
         validate_input(&input, false)?;
         self.pool
-            .install(|| self.arena.scope(|| self.forward(&input)))
+            .install(|| self.arena.scope(|| self.infer(&input)))
     }
 
-    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+    pub(crate) fn with_thread_pool<R: Send>(&self, operation: impl FnOnce() -> R + Send) -> R {
+        self.pool.install(operation)
+    }
+
+    fn infer(&self, input: &Tensor) -> Result<Tensor> {
         let features = self.backbone.forward(input)?;
         let feature = features.last().expect("recognizer backbone has stages");
         let pooled = feature.avg_pool2d([3, 2], [3, 2], [0; 4], false, false)?;

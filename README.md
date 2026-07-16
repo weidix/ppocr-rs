@@ -9,7 +9,7 @@ returns detected text regions in reading order.
 Run OCR with the default tiny detector and recognizer:
 
 ```sh
-cargo run --release --bin ppocr -- path/to/image.png
+cargo run --release --bin ppocr -- --backend cpu path/to/image.png
 ```
 
 The first run downloads the pinned model packages into `models/`. Later runs
@@ -17,7 +17,14 @@ reuse the validated cache. Use `--format text` for newline-separated text
 instead of JSON:
 
 ```sh
-cargo run --release --bin ppocr -- path/to/image.jpg --format text
+cargo run --release --bin ppocr -- --backend cpu path/to/image.jpg --format text
+```
+
+Run the same end-to-end pipeline on the GPU with a GPU-only build:
+
+```sh
+cargo run --release --no-default-features --features gpu --bin ppocr -- \
+  --backend gpu path/to/image.png
 ```
 
 The JSON result has a stable image-level shape:
@@ -50,7 +57,7 @@ The default model directory is `models`; override it with `--model-dir` or
 
 ```sh
 PPOCR_MODEL_DIR="$HOME/.cache/ppocr-rs" \
-  cargo run --release --bin ppocr -- path/to/image.png --model-size small
+  cargo run --release --bin ppocr -- --backend cpu path/to/image.png --model-size small
 ```
 
 `--offline` fails instead of downloading missing models. `--verify-models`
@@ -61,7 +68,7 @@ read large weight files.
 For custom converted or local checkpoints, supply explicit paths:
 
 ```sh
-cargo run --release --bin ppocr -- path/to/image.png \
+cargo run --release --bin ppocr -- --backend cpu path/to/image.png \
   --detector-model custom/det/model.safetensors \
   --recognizer-model custom/rec/model.safetensors \
   --dictionary custom/rec/inference.yml
@@ -72,28 +79,34 @@ When `--recognizer-model` is used without `--dictionary`, `ppocr` looks for an
 
 ## Library API
 
-The high-level CPU API keeps model resolution separate from inference:
+The high-level API keeps model resolution separate from inference and selects a
+backend explicitly:
 
 ```rust,no_run
-use ppocr_rs::{ModelStore, OcrEngine, OcrOptions};
+use ppocr_rs::{ModelStore, OcrBackend, OcrEngine, OcrOptions};
 
 let store = ModelStore::new("models");
-let engine = OcrEngine::load_from_store(&store, OcrOptions::default())?;
+let engine = OcrEngine::load_from_store(
+    &store,
+    OcrOptions {
+        backend: OcrBackend::Cpu,
+        ..OcrOptions::default()
+    },
+)?;
 let result = engine.recognize_path("document.png")?;
 println!("{}", result.text());
 # Ok::<(), anyhow::Error>(())
 ```
 
-`ppocr_rs::ocr` also exposes detector postprocessing, text rectification, crop
-splitting, and CTC decoding for applications that need lower-level control.
-`ppocr_rs::cpu` and `ppocr_rs::gpu` remain available as advanced direct-model
-APIs.
+`ppocr_rs::ocr` also exposes detector postprocessing and CTC decoding for
+applications that need lower-level control. `ppocr_rs::cpu` and
+`ppocr_rs::gpu` remain available as advanced direct-model APIs.
 
 ## Backends
 
 | Surface | CPU | GPU |
 | --- | --- | --- |
-| End-to-end `ppocr` image OCR | Yes | Not yet exposed as a high-level pipeline |
+| End-to-end `ppocr` image OCR | Yes | Yes |
 | Direct Safetensors model API | Yes | Yes |
 | Benchmark command | `ppocr-cpu-bench` | `ppocr-gpu-bench` |
 
@@ -102,19 +115,27 @@ with `--no-default-features --features gpu`; it uses Metal on macOS and Vulkan
 on other supported platforms. The repository's x86-64 Cargo configuration
 targets `x86-64-v3`, so AVX2 and FMA are required for those builds.
 
+The GPU path uploads decoded RGB8 pixels once. Detector resize, RGB-to-BGR
+conversion, normalization, perspective text rectification, recognizer resize,
+and padding run in WGPU compute passes that write directly into each model's
+activation arena. Detection heatmaps and recognizer outputs are read back only
+for the existing CPU detector postprocessing and CTC decoding; preprocessed
+pixel tensors never cross back through the CPU.
+
 ## Benchmarks
 
-Both benchmark commands use the same pinned cache, `--kind det|rec`,
-`--size medium|small|tiny`, `--model-dir`, `--offline`, and
-`--verify-models` options. They accept explicit weights through `--model`
-(CPU) or `--weights` (GPU).
+Both benchmark commands use the same Clap contract: `--kind det|rec`,
+`--model-size medium|small|tiny`, `--model`, `--model-dir`, `--offline`,
+`--verify-models`, input/reference/dump paths, and timing options. `--offline`
+and `--verify-models` are mutually exclusive. Only the CPU command accepts
+`--threads`.
 
 ```sh
 cargo run --release --bin ppocr-cpu-bench -- \
-  --kind det --size tiny --height 416 --width 736 --threads 4 --warmup 5 --runs 30
+  --kind det --model-size tiny --height 416 --width 736 --threads 4 --warmup 5 --runs 30
 
 cargo run --release --no-default-features --features gpu --bin ppocr-gpu-bench -- \
-  --kind det --size tiny --height 416 --width 736 --warmup 5 --runs 30
+  --kind det --model-size tiny --height 416 --width 736 --warmup 5 --runs 30
 ```
 
 See [BENCHMARK.md](BENCHMARK.md) for recorded measurements and the complete
