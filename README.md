@@ -1,5 +1,8 @@
 # ppocr-rs
 
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![Rust 2024](https://img.shields.io/badge/Rust-2024-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
+
 Native Rust inference for the released PP-OCRv6 Safetensors detector and
 recognizer models. The primary `ppocr` command accepts a PNG or JPEG image and
 returns detected text regions in reading order.
@@ -147,3 +150,8 @@ The pinned packages are published by
 [PaddlePaddle on Hugging Face](https://huggingface.co/PaddlePaddle). Model
 terms are defined by their upstream repositories; review those terms before
 redistributing model files.
+
+## License
+
+Licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE) or
+the [MIT License](LICENSE-MIT), at your option.
