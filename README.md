@@ -7,6 +7,9 @@ Native Rust inference for the released PP-OCRv6 Safetensors detector and
 recognizer models. The primary `ppocr` command accepts a PNG or JPEG image and
 returns detected text regions in reading order.
 
+> [!NOTE]
+> ppocr-rs is a community project exploring native PP-OCR inference in Rust.
+
 ## Quick Start
 
 Run OCR with the default tiny detector and recognizer:
