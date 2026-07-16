@@ -124,7 +124,10 @@ impl Gpu {
             required_features,
             required_limits: adapter_limits,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::Performance,
+            // Inference keeps a few large buffers alive for the device lifetime.
+            // Smaller allocator blocks avoid reserving hundreds of unused MiB
+            // without changing the graph or its dispatches.
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
             trace: wgpu::Trace::Off,
         }))
         .map_err(|error| Error::Gpu(format!("create device: {error}")))?;
@@ -192,6 +195,9 @@ impl Gpu {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        if std::env::var_os("PPOCR_GPU_MEMORY_REPORT").is_some() {
+            eprintln!("gpu_memory source_image_bytes={byte_size}");
+        }
         self.inner
             .queue
             .write_buffer(&buffer, 0, &u32_bytes(&packed));
@@ -1366,6 +1372,12 @@ impl Session {
         let output_bytes = (plan.output_shape.elements()? as u64)
             .checked_mul(size_of::<f32>() as u64)
             .ok_or_else(|| Error::Gpu("output byte size overflow".into()))?;
+        if std::env::var_os("PPOCR_GPU_MEMORY_REPORT").is_some() {
+            eprintln!(
+                "gpu_memory activation_arena_bytes={arena_bytes} weights_bytes={weight_bytes} output_readback_bytes={output_bytes} model_buffer_bytes={}",
+                arena_bytes + weight_bytes + output_bytes,
+            );
+        }
         let device = &gpu.inner.device;
         let max_workgroups = device.limits().max_compute_workgroups_per_dimension;
         split_dispatches(&mut plan.dispatches, max_workgroups)?;

@@ -103,7 +103,7 @@ impl RgbImage {
 }
 
 /// Builds an RGB image filled with one colour for tests and examples.
-#[cfg(all(test, feature = "cpu"))]
+#[cfg(test)]
 pub(crate) fn solid(width: u32, height: u32, pixel: [u8; 3]) -> RgbImage {
     let count = width as usize * height as usize;
     let mut pixels = Vec::with_capacity(count * 3);

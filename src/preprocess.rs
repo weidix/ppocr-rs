@@ -2,15 +2,19 @@
 
 mod kernels;
 
+#[cfg(any(feature = "cpu", test))]
+use crate::ocr::DetectorInputPlan;
 use crate::{
     RgbImage,
-    ocr::{DetectorInputPlan, Point, RecognitionInputPlan},
+    ocr::{Point, RecognitionInputPlan},
 };
 use rayon::prelude::*;
 
 use kernels::{Kernel, Normalization, RowPlan};
 
+#[cfg(any(feature = "cpu", test))]
 const DETECTOR_MEAN_BGR: [f32; 3] = [0.485, 0.456, 0.406];
+#[cfg(any(feature = "cpu", test))]
 const DETECTOR_STD_BGR: [f32; 3] = [0.229, 0.224, 0.225];
 const RECOGNIZER_MEAN_BGR: [f32; 3] = [0.5, 0.5, 0.5];
 const RECOGNIZER_STD_BGR: [f32; 3] = [0.5, 0.5, 0.5];
@@ -29,6 +33,7 @@ impl PreparedInput {
     }
 }
 
+#[cfg(any(feature = "cpu", test))]
 pub(crate) fn prepare_detector(image: &RgbImage, plan: DetectorInputPlan) -> PreparedInput {
     normalized_bgr(
         image,

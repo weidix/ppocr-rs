@@ -6,8 +6,10 @@ use std::{collections::VecDeque, fs, path::Path};
 
 #[cfg(feature = "cpu")]
 use crate::cpu::{CpuOptions, Detector, Recognizer, Tensor};
+#[cfg(feature = "cpu")]
+use crate::preprocess::prepare_detector;
 #[cfg(any(feature = "cpu", feature = "gpu"))]
-use crate::preprocess::{prepare_detector, prepare_recognizer};
+use crate::preprocess::prepare_recognizer;
 use crate::{ModelSize, ModelStore, RgbImage};
 #[cfg(feature = "gpu")]
 use std::cell::RefCell;

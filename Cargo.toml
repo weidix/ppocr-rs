@@ -18,7 +18,7 @@ cpu = ["dep:rayon", "dep:safetensors"]
 # Compile-time operator timing for the native CPU backend. Normal inference
 # contains no profiling branch or logging.
 cpu-profile = ["cpu"]
-gpu = ["dep:safetensors", "dep:wgpu"]
+gpu = ["dep:rayon", "dep:safetensors", "dep:wgpu"]
 
 [dependencies]
 anyhow = "1.0"
