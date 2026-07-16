@@ -38,8 +38,19 @@ wgpu = { version = "=29.0.4", optional = true, default-features = false, feature
 wgpu = { version = "=29.0.4", optional = true, default-features = false, features = ["std", "wgsl", "vulkan"] }
 
 [profile.release]
+# Optimize deployed OCR binaries for sustained inference throughput and size.
+opt-level = 3
 lto = "thin"
 codegen-units = 1
+incremental = false
+strip = "symbols"
+
+[profile.bench]
+# Keep benchmark binaries comparable to release builds while retaining enough
+# debug information for profilers to attribute samples to source locations.
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
 
 [[bin]]
 name = "ppocr"
