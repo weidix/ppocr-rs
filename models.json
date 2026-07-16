@@ -1,48 +1,168 @@
 {
-  "format": 1,
+  "format": 2,
   "source": "https://huggingface.co/PaddlePaddle",
   "models": [
     {
       "name": "medium-det",
       "repository": "PaddlePaddle/PP-OCRv6_medium_det_safetensors",
       "revision": "4236c2b61741a259c091fd879dcc4edc339e916c",
-      "bytes": 88020412,
-      "sha256": "bd393266c02e1a680b1b34c301d5d0d81e6290440b7f8ab0f5d5032276b17eb1"
+      "files": [
+        {
+          "name": "model.safetensors",
+          "bytes": 88020412,
+          "sha256": "bd393266c02e1a680b1b34c301d5d0d81e6290440b7f8ab0f5d5032276b17eb1"
+        },
+        {
+          "name": "config.json",
+          "bytes": 2134,
+          "sha256": "3ea7e760f64255c152ba139e2f5f798303f7189b87c923cf498e2b2e830cadd3"
+        },
+        {
+          "name": "inference.yml",
+          "bytes": 886,
+          "sha256": "7298d5ead546584af2504d03355f881ac7a7bc0eb1e282d3e159277c1d0af871"
+        },
+        {
+          "name": "preprocessor_config.json",
+          "bytes": 838,
+          "sha256": "74421569a28a78d417db320f9bc039ce0997a1defe2b35f259dfc74299c9f1ed"
+        }
+      ]
     },
     {
       "name": "medium-rec",
       "repository": "PaddlePaddle/PP-OCRv6_medium_rec_safetensors",
       "revision": "024cad6a831de75c2c3c26e711ba8c4a82ccd24b",
-      "bytes": 76741720,
-      "sha256": "5f43c16f2a684b1d2284662178bdb604febd3d6bfdb5ca73828d08d0f7c0c3e9"
+      "files": [
+        {
+          "name": "model.safetensors",
+          "bytes": 76741720,
+          "sha256": "5f43c16f2a684b1d2284662178bdb604febd3d6bfdb5ca73828d08d0f7c0c3e9"
+        },
+        {
+          "name": "config.json",
+          "bytes": 1131,
+          "sha256": "aa5f351b4a7df95cc4953f013d53a6d44205f1bb0aee0ec7eb243d1d8fae1c27"
+        },
+        {
+          "name": "inference.yml",
+          "bytes": 150580,
+          "sha256": "991b700facf5b50a7de193468207d5f4255b538dde0d312ae3b7c7a9b6873129"
+        },
+        {
+          "name": "preprocessor_config.json",
+          "bytes": 206177,
+          "sha256": "2b24fa36f548893f26a931cf44f1a1a6b2b14ed7e2f8f8e28e6848801a8278db"
+        }
+      ]
     },
     {
       "name": "small-det",
       "repository": "PaddlePaddle/PP-OCRv6_small_det_safetensors",
       "revision": "eae2ee920a39fb3087637d3dbb58df1896ec1f24",
-      "bytes": 9938124,
-      "sha256": "89a96a8adc4e9cd0c994098edc76022e496d35844392562b4694c8fbc583f2da"
+      "files": [
+        {
+          "name": "model.safetensors",
+          "bytes": 9938124,
+          "sha256": "89a96a8adc4e9cd0c994098edc76022e496d35844392562b4694c8fbc583f2da"
+        },
+        {
+          "name": "config.json",
+          "bytes": 1096,
+          "sha256": "b42d76ab6325d5234e1afc9987b73dc592b0ec8437c8a29d46ba6209b79252eb"
+        },
+        {
+          "name": "inference.yml",
+          "bytes": 885,
+          "sha256": "193f435274bf9f0b5f71a929bbfbcf148282df7e633b34e7c373e8f44741b516"
+        },
+        {
+          "name": "preprocessor_config.json",
+          "bytes": 838,
+          "sha256": "74421569a28a78d417db320f9bc039ce0997a1defe2b35f259dfc74299c9f1ed"
+        }
+      ]
     },
     {
       "name": "small-rec",
       "repository": "PaddlePaddle/PP-OCRv6_small_rec_safetensors",
       "revision": "fe049fb103f57443fe8840c54ed06b702f3c1de5",
-      "bytes": 21204736,
-      "sha256": "f65a332afe5aa663f0b9d5706f4ae8457b5b4058a842d5c1eb22df505c27d642"
+      "files": [
+        {
+          "name": "model.safetensors",
+          "bytes": 21204736,
+          "sha256": "f65a332afe5aa663f0b9d5706f4ae8457b5b4058a842d5c1eb22df505c27d642"
+        },
+        {
+          "name": "config.json",
+          "bytes": 1083,
+          "sha256": "8693fd8485e8543e13d0f6dde3891a3f4af9a47fc4e3a391fbed71f8015c899e"
+        },
+        {
+          "name": "inference.yml",
+          "bytes": 150579,
+          "sha256": "ab078671bb49f06228eadccd34f1bb501e157f7a047095ffb943ba81512c77d1"
+        },
+        {
+          "name": "preprocessor_config.json",
+          "bytes": 206177,
+          "sha256": "2b24fa36f548893f26a931cf44f1a1a6b2b14ed7e2f8f8e28e6848801a8278db"
+        }
+      ]
     },
     {
       "name": "tiny-det",
       "repository": "PaddlePaddle/PP-OCRv6_tiny_det_safetensors",
       "revision": "07595f982703daf0d4e120a12a01da8073542f3a",
-      "bytes": 1786412,
-      "sha256": "cae3c88d2a9902fd0293e6b17990428f54bfa7ec98f800a4368e95423a754d16"
+      "files": [
+        {
+          "name": "model.safetensors",
+          "bytes": 1786412,
+          "sha256": "cae3c88d2a9902fd0293e6b17990428f54bfa7ec98f800a4368e95423a754d16"
+        },
+        {
+          "name": "config.json",
+          "bytes": 1085,
+          "sha256": "911288a948ee0aa617bd70cdd299315b990db08c611aebea8afb087d041d7d36"
+        },
+        {
+          "name": "inference.yml",
+          "bytes": 883,
+          "sha256": "3ac018be6f97499a08faa3bbdeb33640968d9307f6736d152902747a9f259593"
+        },
+        {
+          "name": "preprocessor_config.json",
+          "bytes": 838,
+          "sha256": "74421569a28a78d417db320f9bc039ce0997a1defe2b35f259dfc74299c9f1ed"
+        }
+      ]
     },
     {
       "name": "tiny-rec",
       "repository": "PaddlePaddle/PP-OCRv6_tiny_rec_safetensors",
       "revision": "6f2d2d51b4b4226d7a2329a02f416f4994106f3a",
-      "bytes": 4474264,
-      "sha256": "cc3892aba0fbd89afbf6a76d8b7817bb58802668be7a1384ca761ce65612f3f7"
+      "files": [
+        {
+          "name": "model.safetensors",
+          "bytes": 4474264,
+          "sha256": "cc3892aba0fbd89afbf6a76d8b7817bb58802668be7a1384ca761ce65612f3f7"
+        },
+        {
+          "name": "config.json",
+          "bytes": 788,
+          "sha256": "d8a130cc18e1833aa5f352e057b5cd0e254c46efc5709823f73d53a8b5a42969"
+        },
+        {
+          "name": "inference.yml",
+          "bytes": 55571,
+          "sha256": "66170210bad538e83fff3c4a3867e547d6bf20b50d64b20347c4b913f3034ea1"
+        },
+        {
+          "name": "preprocessor_config.json",
+          "bytes": 75758,
+          "sha256": "196f42619e2e9e0e93a6dc1a622fa1c664628e1c63ce116b376275b3e192125f"
+        }
+      ]
     }
   ]
 }

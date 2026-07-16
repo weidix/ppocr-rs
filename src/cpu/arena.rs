@@ -171,6 +171,7 @@ impl Handle {
         }
     }
 
+    #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
     pub(crate) fn zeroed(&self, len: usize) -> Buffer {
         Buffer::zeroed_with(self.arena.clone(), len)
     }

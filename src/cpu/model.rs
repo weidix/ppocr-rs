@@ -6,48 +6,10 @@ use super::{
     tensor::Tensor,
     weights::{VarBuilder, Weights},
 };
+use crate::models::ModelSize;
 use anyhow::{Context, Result, ensure};
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use std::{path::Path, str::FromStr};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ModelSize {
-    Medium,
-    Small,
-    Tiny,
-}
-
-impl ModelSize {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Medium => "medium",
-            Self::Small => "small",
-            Self::Tiny => "tiny",
-        }
-    }
-
-    pub const fn recognizer_classes(self) -> usize {
-        match self {
-            Self::Medium | Self::Small => 18_710,
-            Self::Tiny => 6_906,
-        }
-    }
-}
-
-impl FromStr for ModelSize {
-    type Err = String;
-
-    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        match value {
-            "medium" => Ok(Self::Medium),
-            "small" => Ok(Self::Small),
-            "tiny" => Ok(Self::Tiny),
-            _ => Err(format!(
-                "unsupported model size {value:?}; expected medium, small, or tiny"
-            )),
-        }
-    }
-}
+use std::path::Path;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CpuOptions {
@@ -1969,6 +1931,7 @@ impl TinyRecognizerHead {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum RecognizerHeadKind {
     LightSvtr(LightSvtrRecognizerHead),
     Tiny(TinyRecognizerHead),

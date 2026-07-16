@@ -296,6 +296,7 @@ impl Tensor {
 #[derive(Clone)]
 pub(crate) struct Conv2d {
     weight: Tensor,
+    #[cfg(target_arch = "x86_64")]
     large_pointwise_weight: Option<Tensor>,
     bias: Option<Tensor>,
     options: ConvOptions,
@@ -387,6 +388,7 @@ impl Conv2d {
             && !system_dense_pointwise
             && !system_dense_spatial
             && !direct_spatial;
+        #[cfg(target_arch = "x86_64")]
         let large_pointwise_weight = (blocked_pointwise && output_channels.is_multiple_of(16))
             .then(|| pack_conv_rows(weight.clone(), output_channels, 16))
             .transpose()?;
@@ -405,6 +407,7 @@ impl Conv2d {
         };
         Ok(Self {
             weight,
+            #[cfg(target_arch = "x86_64")]
             large_pointwise_weight,
             bias,
             options: ConvOptions {
@@ -856,6 +859,7 @@ impl Conv2d {
     }
 
     fn run(&self, input: &Tensor, activation: Option<kernels::UnaryOperation>) -> Result<Tensor> {
+        #[cfg(target_arch = "x86_64")]
         if self.options.blocked_pointwise
             && self.large_pointwise_weight.is_some()
             && self.large_pointwise_work(input) >= 64_000_000
@@ -876,6 +880,7 @@ impl Conv2d {
         run(operation, inputs)
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn large_pointwise_work(&self, input: &Tensor) -> usize {
         let Some(weight) = &self.large_pointwise_weight else {
             return 0;
@@ -900,6 +905,7 @@ impl Conv2d {
             .unwrap_or(usize::MAX)
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn run_large_pointwise(
         &self,
         input: &Tensor,

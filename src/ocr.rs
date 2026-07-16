@@ -3,6 +3,17 @@ use image::{Rgb, RgbImage, imageops};
 use serde::Serialize;
 use std::{collections::VecDeque, fs, path::Path};
 
+#[cfg(feature = "cpu")]
+use crate::{
+    cpu::{CpuOptions, Detector, ModelSize, Recognizer, Tensor},
+    models::ModelStore,
+    preprocess::{prepare_detector, prepare_recognizer},
+};
+#[cfg(feature = "cpu")]
+use anyhow::ensure;
+#[cfg(feature = "cpu")]
+use image::ImageReader;
+
 pub const RECOGNIZER_INPUT_HEIGHT: usize = 48;
 pub const RECOGNIZER_INPUT_WIDTH: usize = 320;
 
@@ -107,6 +118,220 @@ impl DetectorPostprocessOptions {
 pub struct DecodedText {
     pub text: String,
     pub score: f32,
+}
+
+/// Configuration for the end-to-end CPU OCR pipeline.
+#[cfg(feature = "cpu")]
+#[derive(Clone, Debug)]
+pub struct OcrOptions {
+    /// Detector model tier.
+    pub detector_size: ModelSize,
+    /// Recognizer model tier.
+    pub recognizer_size: ModelSize,
+    /// CPU runtime settings shared by the detector and recognizer.
+    pub cpu: CpuOptions,
+    /// Detector output postprocessing settings.
+    pub detector_postprocess: DetectorPostprocessOptions,
+    /// Optional maximum detector image side. `None` uses the released model's
+    /// default resize policy.
+    pub detector_max_side: Option<u32>,
+    /// Width of each recognizer canvas and the maximum width of one text crop.
+    pub recognizer_max_width: u32,
+}
+
+#[cfg(feature = "cpu")]
+impl Default for OcrOptions {
+    fn default() -> Self {
+        Self {
+            detector_size: ModelSize::Tiny,
+            recognizer_size: ModelSize::Tiny,
+            cpu: CpuOptions::default(),
+            detector_postprocess: DetectorPostprocessOptions::default(),
+            detector_max_side: None,
+            recognizer_max_width: RECOGNIZER_INPUT_WIDTH as u32,
+        }
+    }
+}
+
+#[cfg(feature = "cpu")]
+impl OcrOptions {
+    /// Validates options before model resolution or inference.
+    pub fn validate(&self) -> Result<()> {
+        self.detector_postprocess.validate()?;
+        ensure!(self.cpu.threads > 0, "CPU thread count must be positive");
+        ensure!(
+            self.recognizer_max_width >= RECOGNIZER_INPUT_WIDTH as u32,
+            "recognizer maximum width must be at least {RECOGNIZER_INPUT_WIDTH}"
+        );
+        if let Some(max_side) = self.detector_max_side {
+            ensure!(max_side > 0, "detector maximum side must be positive");
+        }
+        Ok(())
+    }
+}
+
+/// One recognized text region.
+#[cfg(feature = "cpu")]
+#[derive(Clone, Debug, Serialize)]
+pub struct OcrLine {
+    /// Text-region quadrilateral in source-image coordinates.
+    pub polygon: [Point; 4],
+    /// Confidence emitted by the detector.
+    pub detection_score: f32,
+    /// CTC-decoded text.
+    pub text: String,
+    /// Geometric mean confidence of emitted recognition tokens.
+    pub recognition_score: f32,
+}
+
+/// The complete result of OCR on one image.
+#[cfg(feature = "cpu")]
+#[derive(Clone, Debug, Serialize)]
+pub struct OcrResult {
+    /// Source image dimensions as `[width, height]`.
+    pub source_size: [u32; 2],
+    /// Detector input dimensions as `[width, height]` after resizing.
+    pub detector_input_size: [usize; 2],
+    /// Text regions in natural reading order.
+    pub lines: Vec<OcrLine>,
+}
+
+#[cfg(feature = "cpu")]
+impl OcrResult {
+    /// Returns recognized non-empty lines joined with newlines.
+    pub fn text(&self) -> String {
+        self.lines
+            .iter()
+            .filter(|line| !line.text.is_empty())
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// An end-to-end PP-OCRv6 CPU inference engine.
+#[cfg(feature = "cpu")]
+pub struct OcrEngine {
+    detector: Detector,
+    recognizer: Recognizer,
+    dictionary: Vec<String>,
+    options: OcrOptions,
+}
+
+#[cfg(feature = "cpu")]
+impl OcrEngine {
+    /// Downloads missing pinned models through `store`, then loads an OCR engine.
+    pub fn load_from_store(store: &ModelStore, options: OcrOptions) -> Result<Self> {
+        let paths = store.ensure_pair(options.detector_size, options.recognizer_size)?;
+        Self::load(
+            &paths.detector.weights,
+            &paths.recognizer.weights,
+            &paths.recognizer.inference,
+            options,
+        )
+    }
+
+    /// Loads an engine from explicit detector, recognizer, and dictionary paths.
+    pub fn load(
+        detector_model: impl AsRef<Path>,
+        recognizer_model: impl AsRef<Path>,
+        dictionary: impl AsRef<Path>,
+        options: OcrOptions,
+    ) -> Result<Self> {
+        options.validate()?;
+        let detector_model = detector_model.as_ref();
+        let recognizer_model = recognizer_model.as_ref();
+        let dictionary_path = dictionary.as_ref();
+        let dictionary = load_dictionary(dictionary_path)?;
+        validate_recognizer_dictionary(&dictionary, options.recognizer_size)?;
+        let detector = Detector::load(detector_model, options.detector_size, options.cpu)
+            .with_context(|| format!("load detector {}", detector_model.display()))?;
+        let recognizer =
+            Recognizer::load(recognizer_model, options.recognizer_size, options.cpu)
+                .with_context(|| format!("load recognizer {}", recognizer_model.display()))?;
+        Ok(Self {
+            detector,
+            recognizer,
+            dictionary,
+            options,
+        })
+    }
+
+    /// Decodes an image file into text regions.
+    pub fn recognize_path(&self, path: impl AsRef<Path>) -> Result<OcrResult> {
+        let path = path.as_ref();
+        let image = ImageReader::open(path)
+            .with_context(|| format!("open image {}", path.display()))?
+            .decode()
+            .with_context(|| format!("decode image {}", path.display()))?
+            .to_rgb8();
+        self.recognize(&image)
+    }
+
+    /// Decodes an RGB image into text regions.
+    pub fn recognize(&self, image: &RgbImage) -> Result<OcrResult> {
+        let source_size = [image.width(), image.height()];
+        let prepared = prepare_detector(image, self.options.detector_max_side)?;
+        let detector_input_size = [prepared.input.width, prepared.input.height];
+        let detector_input = Tensor::from_f32(prepared.input.shape(), prepared.input.data)?;
+        let detector_output = self.detector.run(detector_input)?;
+        let detections = extract_detections(
+            detector_output.as_f32()?,
+            detector_output.shape(),
+            prepared.transform,
+            self.options.detector_postprocess,
+        )?;
+
+        let mut lines = Vec::with_capacity(detections.len());
+        for detection in detections {
+            let crop = rectify_text_crop(image, detection.polygon)?;
+            let mut decoded_chunks = Vec::new();
+            for chunk in split_recognition_crop_for_input(
+                &crop,
+                RECOGNIZER_INPUT_HEIGHT,
+                self.options.recognizer_max_width as usize,
+            )? {
+                let prepared = prepare_recognizer(&chunk, self.options.recognizer_max_width)?;
+                let content_width = prepared.content_width;
+                let input_width = prepared.input.width;
+                let recognizer_input =
+                    Tensor::from_f32(prepared.input.shape(), prepared.input.data)?;
+                let recognizer_output = self.recognizer.run(recognizer_input)?;
+                decoded_chunks.push(decode_ctc_greedy_for_input(
+                    recognizer_output.as_f32()?,
+                    recognizer_output.shape(),
+                    &self.dictionary,
+                    content_width,
+                    input_width,
+                )?);
+            }
+            let decoded = join_decoded_texts(&decoded_chunks);
+            lines.push(OcrLine {
+                polygon: detection.polygon,
+                detection_score: detection.score,
+                text: decoded.text,
+                recognition_score: decoded.score,
+            });
+        }
+
+        Ok(OcrResult {
+            source_size,
+            detector_input_size,
+            lines,
+        })
+    }
+}
+
+#[cfg(feature = "cpu")]
+fn validate_recognizer_dictionary(dictionary: &[String], size: ModelSize) -> Result<()> {
+    let classes = size.recognizer_classes();
+    ensure!(
+        classes == dictionary.len() + 1 || classes == dictionary.len() + 2,
+        "{} recognizer has {classes} output classes, but the dictionary has {} entries",
+        size.as_str(),
+        dictionary.len()
+    );
+    Ok(())
 }
 
 pub fn split_recognition_crop_for_input(

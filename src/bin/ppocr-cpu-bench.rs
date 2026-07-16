@@ -1,41 +1,110 @@
-use anyhow::{Context, Result, bail, ensure};
-use ppocr_rs::cpu::{CpuOptions, Detector, ModelSize, Recognizer, Tensor};
+use anyhow::{Context, Result, ensure};
+use clap::{Parser, ValueEnum};
+use ppocr_rs::{
+    CpuOptions, ModelKind, ModelSize, ModelStore,
+    cpu::{Detector, Recognizer, Tensor},
+};
 use std::{
-    env, fs,
+    fs,
     fs::File,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
-    str::FromStr,
     time::Instant,
 };
 
-#[derive(Clone, Copy)]
-enum ModelKind {
+#[derive(Debug, Parser)]
+#[command(
+    name = "ppocr-cpu-bench",
+    version,
+    about = "Benchmark one native CPU PP-OCRv6 model"
+)]
+struct Arguments {
+    /// Model role to benchmark.
+    #[arg(long, value_enum)]
+    kind: BenchmarkKind,
+
+    /// Released model tier.
+    #[arg(long, default_value_t = ModelSize::Tiny)]
+    size: ModelSize,
+
+    /// Explicit Safetensors file. Omit to use the pinned model cache.
+    #[arg(long)]
+    model: Option<PathBuf>,
+
+    /// Directory where pinned model packages are stored.
+    #[arg(long, env = "PPOCR_MODEL_DIR", default_value = "models")]
+    model_dir: PathBuf,
+
+    /// Fail when the pinned model is not already cached.
+    #[arg(long)]
+    offline: bool,
+
+    /// Recompute hashes for the pinned model package before loading it.
+    #[arg(long)]
+    verify_models: bool,
+
+    /// Input height. Defaults to 416 for detector and 48 for recognizer.
+    #[arg(long)]
+    height: Option<usize>,
+
+    /// Input width. Defaults to 736 for detector and 320 for recognizer.
+    #[arg(long)]
+    width: Option<usize>,
+
+    /// Number of CPU worker threads.
+    #[arg(long, default_value_t = default_threads())]
+    threads: usize,
+
+    /// Number of untimed warmup runs.
+    #[arg(long, default_value_t = 5)]
+    warmup: usize,
+
+    /// Number of timed runs.
+    #[arg(long, default_value_t = 30)]
+    runs: usize,
+
+    /// Little-endian F32 input file. Omit for deterministic generated input.
+    #[arg(long)]
+    input: Option<PathBuf>,
+
+    /// Write the final output as little-endian F32 values.
+    #[arg(long)]
+    dump: Option<PathBuf>,
+
+    /// Compare the final output with a little-endian F32 reference file.
+    #[arg(long, visible_alias = "compare")]
+    reference: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BenchmarkKind {
+    #[value(name = "det")]
     Detector,
+    #[value(name = "rec")]
     Recognizer,
 }
 
-impl ModelKind {
-    const fn model_dir_suffix(self) -> &'static str {
+impl BenchmarkKind {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Detector => "det",
             Self::Recognizer => "rec",
         }
     }
-}
 
-struct Arguments {
-    model: PathBuf,
-    kind: ModelKind,
-    size: ModelSize,
-    height: usize,
-    width: usize,
-    threads: usize,
-    warmup: usize,
-    runs: usize,
-    input: Option<PathBuf>,
-    dump: Option<PathBuf>,
-    compare: Option<PathBuf>,
+    const fn model_kind(self) -> ModelKind {
+        match self {
+            Self::Detector => ModelKind::Detector,
+            Self::Recognizer => ModelKind::Recognizer,
+        }
+    }
+
+    const fn default_dimensions(self) -> (usize, usize) {
+        match self {
+            Self::Detector => (416, 736),
+            Self::Recognizer => (48, 320),
+        }
+    }
 }
 
 enum Model {
@@ -53,57 +122,72 @@ impl Model {
 }
 
 fn main() -> Result<()> {
-    let arguments = parse_arguments()?;
+    let arguments = Arguments::parse();
+    ensure!(arguments.threads > 0, "--threads must be positive");
+    ensure!(arguments.runs > 0, "--runs must be positive");
+    let (default_height, default_width) = arguments.kind.default_dimensions();
+    let height = arguments.height.unwrap_or(default_height);
+    let width = arguments.width.unwrap_or(default_width);
+    ensure!(height > 0, "--height must be positive");
+    ensure!(width > 0, "--width must be positive");
+
+    let model_path = resolve_model_path(&arguments)?;
     let options = CpuOptions {
         threads: arguments.threads,
     };
     let model = match arguments.kind {
-        ModelKind::Detector => {
-            Model::Detector(Detector::load(&arguments.model, arguments.size, options)?)
+        BenchmarkKind::Detector => {
+            Model::Detector(Detector::load(&model_path, arguments.size, options)?)
         }
-        ModelKind::Recognizer => {
-            Model::Recognizer(Recognizer::load(&arguments.model, arguments.size, options)?)
+        BenchmarkKind::Recognizer => {
+            Model::Recognizer(Recognizer::load(&model_path, arguments.size, options)?)
         }
     };
-    let shape = vec![1, 3, arguments.height, arguments.width];
-    let length = shape.iter().product();
+    let input_shape = [1, 3, height, width];
+    let input_length = input_shape
+        .into_iter()
+        .try_fold(1usize, usize::checked_mul)
+        .context("input shape overflow")?;
     let values = match &arguments.input {
-        Some(path) => read_f32(path, length)?,
-        None => deterministic_input(length),
+        Some(path) => read_f32(path, input_length)?,
+        None => deterministic_input(input_length),
     };
-    let input = Tensor::from_f32(shape.clone(), values)?;
+    let input = Tensor::from_f32(input_shape, values)?;
 
     for _ in 0..arguments.warmup {
         validate_output(&model.run(input.clone())?)?;
     }
     let mut samples = Vec::with_capacity(arguments.runs);
     let mut final_output = None;
-    for run in 0..arguments.runs {
+    for _ in 0..arguments.runs {
         let start = Instant::now();
         let output = model.run(input.clone())?;
         samples.push(start.elapsed().as_secs_f64() * 1_000.0);
         validate_output(&output)?;
-        if run + 1 == arguments.runs {
-            final_output = Some(output);
-        }
+        final_output = Some(output);
     }
-    let average_ms = samples.iter().sum::<f64>() / samples.len() as f64;
-    samples.sort_by(f64::total_cmp);
-    let output = final_output.expect("positive run count");
+    let output = final_output.context("benchmark did not produce an output")?;
     let values = output.as_f32()?;
     let output_sum = values.iter().map(|&value| f64::from(value)).sum::<f64>();
-    println!("model: {}", arguments.model.display());
+    let average_ms = samples.iter().sum::<f64>() / samples.len() as f64;
+    samples.sort_by(f64::total_cmp);
+
+    println!("backend: cpu");
+    println!("kind: {}", arguments.kind.as_str());
+    println!("model: {}", model_path.display());
     println!("threads: {}", arguments.threads);
-    println!("input: {shape:?}");
-    println!("output: {:?}", output.shape());
+    println!("input_shape: {input_shape:?}");
+    println!("output_shape: {:?}", output.shape());
     println!("output_sum: {output_sum:.9}");
+    println!("warmup: {}", arguments.warmup);
+    println!("runs: {}", arguments.runs);
     println!("average_ms: {average_ms:.3}");
-    println!("p95_ms: {:.3}", percentile(&samples, 0.95));
-    println!("fps: {:.2}", 1_000.0 / average_ms);
     println!("p50_ms: {:.3}", percentile(&samples, 0.50));
     println!("p90_ms: {:.3}", percentile(&samples, 0.90));
+    println!("p95_ms: {:.3}", percentile(&samples, 0.95));
+    println!("throughput_per_s: {:.2}", 1_000.0 / average_ms);
 
-    if let Some(path) = &arguments.compare {
+    if let Some(path) = &arguments.reference {
         let reference = read_f32(path, values.len())?;
         report_difference(arguments.kind, output.shape(), values, &reference)?;
     }
@@ -114,78 +198,24 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_arguments() -> Result<Arguments> {
-    let mut values = env::args().skip(1);
-    let mut model = None;
-    let mut kind = None;
-    let mut size = ModelSize::Tiny;
-    let mut height = None;
-    let mut width = None;
-    let defaults = CpuOptions::default();
-    let mut threads = defaults.threads;
-    let mut warmup = 5;
-    let mut runs = 30;
-    let mut input = None;
-    let mut dump = None;
-    let mut compare = None;
-    while let Some(flag) = values.next() {
-        let value = values
-            .next()
-            .with_context(|| format!("missing value for {flag}"))?;
-        match flag.as_str() {
-            "--model" => model = Some(PathBuf::from(value)),
-            "--kind" => {
-                kind = Some(match value.as_str() {
-                    "det" => ModelKind::Detector,
-                    "rec" => ModelKind::Recognizer,
-                    _ => bail!("unsupported --kind {value:?}; expected det or rec"),
-                })
-            }
-            "--size" => size = ModelSize::from_str(&value).map_err(anyhow::Error::msg)?,
-            "--height" => height = Some(parse_usize(&value, &flag)?),
-            "--width" => width = Some(parse_usize(&value, &flag)?),
-            "--threads" => threads = parse_usize(&value, &flag)?,
-            "--warmup" => warmup = parse_usize(&value, &flag)?,
-            "--runs" => runs = parse_usize(&value, &flag)?,
-            "--input" => input = Some(PathBuf::from(value)),
-            "--dump" => dump = Some(PathBuf::from(value)),
-            "--compare" => compare = Some(PathBuf::from(value)),
-            _ => bail!("unknown argument {flag:?}"),
-        }
+fn resolve_model_path(arguments: &Arguments) -> Result<PathBuf> {
+    if let Some(path) = &arguments.model {
+        return Ok(path.clone());
     }
-    let kind = kind.context("--kind is required")?;
-    let model = model.unwrap_or_else(|| default_model_path(size, kind));
-    let (default_height, default_width) = match kind {
-        ModelKind::Detector => (416, 736),
-        ModelKind::Recognizer => (48, 320),
+    let store = ModelStore::new(&arguments.model_dir);
+    let kind = arguments.kind.model_kind();
+    let paths = if arguments.verify_models {
+        store.verify(kind, arguments.size)?
+    } else if arguments.offline {
+        store.ensure_offline(kind, arguments.size)?
+    } else {
+        store.ensure(kind, arguments.size)?
     };
-    ensure!(threads > 0, "--threads must be positive");
-    ensure!(runs > 0, "--runs must be positive");
-    Ok(Arguments {
-        model,
-        kind,
-        size,
-        height: height.unwrap_or(default_height),
-        width: width.unwrap_or(default_width),
-        threads,
-        warmup,
-        runs,
-        input,
-        dump,
-        compare,
-    })
+    Ok(paths.weights)
 }
 
-fn default_model_path(size: ModelSize, kind: ModelKind) -> PathBuf {
-    PathBuf::from("models")
-        .join(format!("{}-{}", size.as_str(), kind.model_dir_suffix()))
-        .join("model.safetensors")
-}
-
-fn parse_usize(value: &str, flag: &str) -> Result<usize> {
-    value
-        .parse::<usize>()
-        .with_context(|| format!("parse {flag}"))
+fn default_threads() -> usize {
+    CpuOptions::default().threads
 }
 
 fn deterministic_input(length: usize) -> Vec<f32> {
@@ -208,7 +238,7 @@ fn read_f32(path: &Path, expected: usize) -> Result<Vec<f32>> {
     );
     Ok(bytes
         .chunks_exact(size_of::<f32>())
-        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
         .collect())
 }
 
@@ -233,7 +263,7 @@ fn validate_output(output: &Tensor) -> Result<()> {
 }
 
 fn report_difference(
-    kind: ModelKind,
+    kind: BenchmarkKind,
     shape: &[usize],
     actual: &[f32],
     expected: &[f32],
@@ -245,21 +275,21 @@ fn report_difference(
         max_absolute = max_absolute.max(difference);
         total_absolute += f64::from(difference);
     }
-    println!("max_abs_error: {max_absolute:.9}");
+    println!("reference_max_abs: {max_absolute:.9}");
     println!(
-        "mean_abs_error: {:.9}",
+        "reference_mean_abs: {:.9}",
         total_absolute / actual.len() as f64
     );
     match kind {
-        ModelKind::Detector => {
+        BenchmarkKind::Detector => {
             let mismatches = actual
                 .iter()
                 .zip(expected)
                 .filter(|&(actual, expected)| (*actual >= 0.5) != (*expected >= 0.5))
                 .count();
-            println!("threshold_0.5_mismatches: {mismatches}");
+            println!("reference_threshold_0.5_mismatches: {mismatches}");
         }
-        ModelKind::Recognizer => {
+        BenchmarkKind::Recognizer => {
             let classes = *shape
                 .last()
                 .context("recognizer output has no class axis")?;
@@ -269,7 +299,7 @@ fn report_difference(
                 .zip(expected.chunks_exact(classes))
                 .filter(|(actual, expected)| argmax(actual) != argmax(expected))
                 .count();
-            println!("argmax_mismatches: {mismatches}");
+            println!("reference_argmax_mismatches: {mismatches}");
         }
     }
     Ok(())

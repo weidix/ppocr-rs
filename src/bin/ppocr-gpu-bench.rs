@@ -1,5 +1,107 @@
-use ppocr_rs::gpu::{self, Detector, Gpu, ModelOutput, ModelSize, Recognizer};
-use std::{env, error::Error, fs, io, path::PathBuf, str::FromStr, time::Duration};
+use anyhow::{Context, Result, ensure};
+use clap::{Parser, ValueEnum};
+use ppocr_rs::{
+    ModelKind, ModelSize, ModelStore,
+    gpu::{self, Detector, Gpu, ModelOutput, Recognizer},
+};
+use std::{
+    fs,
+    fs::File,
+    io::{BufWriter, Write},
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "ppocr-gpu-bench",
+    version,
+    about = "Benchmark one WGPU PP-OCRv6 model"
+)]
+struct Arguments {
+    /// Model role to benchmark.
+    #[arg(long, visible_alias = "model", value_enum)]
+    kind: BenchmarkKind,
+
+    /// Released model tier.
+    #[arg(long, default_value_t = ModelSize::Tiny)]
+    size: ModelSize,
+
+    /// Explicit Safetensors file. Omit to use the pinned model cache.
+    #[arg(long)]
+    weights: Option<PathBuf>,
+
+    /// Directory where pinned model packages are stored.
+    #[arg(long, env = "PPOCR_MODEL_DIR", default_value = "models")]
+    model_dir: PathBuf,
+
+    /// Fail when the pinned model is not already cached.
+    #[arg(long)]
+    offline: bool,
+
+    /// Recompute hashes for the pinned model package before loading it.
+    #[arg(long)]
+    verify_models: bool,
+
+    /// Input height. Defaults to 416 for detector and 48 for recognizer.
+    #[arg(long)]
+    height: Option<usize>,
+
+    /// Input width. Defaults to 736 for detector and 320 for recognizer.
+    #[arg(long)]
+    width: Option<usize>,
+
+    /// Little-endian F32 input file. Omit for deterministic generated input.
+    #[arg(long)]
+    input: Option<PathBuf>,
+
+    /// Compare the final output with a little-endian F32 reference file.
+    #[arg(long)]
+    reference: Option<PathBuf>,
+
+    /// Write the final output as little-endian F32 values.
+    #[arg(long)]
+    dump: Option<PathBuf>,
+
+    /// Number of untimed warmup runs.
+    #[arg(long, default_value_t = 5)]
+    warmup: usize,
+
+    /// Number of timed runs.
+    #[arg(long, default_value_t = 30)]
+    runs: usize,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BenchmarkKind {
+    #[value(name = "det")]
+    Detector,
+    #[value(name = "rec")]
+    Recognizer,
+}
+
+impl BenchmarkKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Detector => "det",
+            Self::Recognizer => "rec",
+        }
+    }
+
+    const fn model_kind(self) -> ModelKind {
+        match self {
+            Self::Detector => ModelKind::Detector,
+            Self::Recognizer => ModelKind::Recognizer,
+        }
+    }
+
+    const fn default_dimensions(self) -> (usize, usize) {
+        match self {
+            Self::Detector => (416, 736),
+            Self::Recognizer => (48, 320),
+        }
+    }
+}
 
 enum Model {
     Detector(Detector),
@@ -22,54 +124,51 @@ impl Model {
     }
 }
 
-struct Args {
-    kind: String,
-    size: ModelSize,
-    weights: PathBuf,
-    height: usize,
-    width: usize,
-    input: Option<PathBuf>,
-    reference: Option<PathBuf>,
-    warmup: usize,
-    runs: usize,
-}
-
-fn main() -> Result<(), Box<dyn Error>> {
-    let args = parse_args()?;
-    let input_shape = [1, 3, args.height, args.width];
-    let input_len = input_shape
+fn main() -> Result<()> {
+    let arguments = Arguments::parse();
+    ensure!(arguments.runs > 0, "--runs must be positive");
+    let (default_height, default_width) = arguments.kind.default_dimensions();
+    let height = arguments.height.unwrap_or(default_height);
+    let width = arguments.width.unwrap_or(default_width);
+    ensure!(height > 0, "--height must be positive");
+    ensure!(width > 0, "--width must be positive");
+    let input_shape = [1, 3, height, width];
+    let input_length = input_shape
         .into_iter()
         .try_fold(1usize, usize::checked_mul)
-        .ok_or("input shape overflow")?;
-    let input = match &args.input {
+        .context("input shape overflow")?;
+    let input = match &arguments.input {
         Some(path) => read_f32(path)?,
-        None => deterministic_input(input_len),
+        None => deterministic_input(input_length),
     };
-    if input.len() != input_len {
-        return Err(format!(
-            "input has {} values; expected {input_len} for {input_shape:?}",
-            input.len()
-        )
-        .into());
-    }
+    ensure!(
+        input.len() == input_length,
+        "input has {} values; expected {input_length} for {input_shape:?}",
+        input.len()
+    );
 
+    let weights = resolve_weights(&arguments)?;
     let gpu = Gpu::new()?;
-    let model = match args.kind.as_str() {
-        "det" | "detector" => Model::Detector(Detector::load_with_size(
+    let model = match arguments.kind {
+        BenchmarkKind::Detector => Model::Detector(Detector::load_with_size(
             &gpu,
-            &args.weights,
-            args.size,
+            &weights,
+            arguments.size,
             input_shape,
         )?),
-        "rec" | "recognizer" => Model::Recognizer(Recognizer::load_with_size(
+        BenchmarkKind::Recognizer => Model::Recognizer(Recognizer::load_with_size(
             &gpu,
-            &args.weights,
-            args.size,
+            &weights,
+            arguments.size,
             input_shape,
         )?),
-        _ => return Err("--model must be det or rec".into()),
     };
     let output = model.forward(&input)?;
+    ensure!(!output.values.is_empty(), "model output is empty");
+    ensure!(
+        output.values.iter().all(|value| value.is_finite()),
+        "model output contains non-finite values"
+    );
     let (minimum, maximum, sum) = output.values.iter().copied().fold(
         (f32::INFINITY, f32::NEG_INFINITY, 0.0f64),
         |(minimum, maximum, sum), value| {
@@ -80,93 +179,63 @@ fn main() -> Result<(), Box<dyn Error>> {
             )
         },
     );
+    let mut samples = model.benchmark(&input, arguments.warmup, arguments.runs)?;
+    samples.sort_unstable();
+    let average_seconds =
+        samples.iter().map(Duration::as_secs_f64).sum::<f64>() / samples.len() as f64;
 
+    println!("backend: gpu");
+    println!("kind: {}", arguments.kind.as_str());
+    println!("model: {}", weights.display());
+    println!("adapter: {}", gpu.info().name);
+    println!("gpu_backend: {:?}", gpu.info().backend);
+    println!("gpu_device_type: {:?}", gpu.info().device_type);
+    println!("input_shape: {input_shape:?}");
+    println!("output_shape: {:?}", output.shape);
+    println!("output_min: {minimum:.9e}");
+    println!("output_max: {maximum:.9e}");
+    println!("output_sum: {sum:.9e}");
+    println!("warmup: {}", arguments.warmup);
+    println!("runs: {}", arguments.runs);
+    println!("average_ms: {:.3}", average_seconds * 1_000.0);
     println!(
-        "adapter={:?} backend={:?} type={:?}",
-        gpu.info().name,
-        gpu.info().backend,
-        gpu.info().device_type
+        "p50_ms: {:.3}",
+        percentile(&samples, 50).as_secs_f64() * 1_000.0
     );
     println!(
-        "output_shape={:?} min={minimum:.9e} max={maximum:.9e} sum={sum:.9e}",
-        output.shape
+        "p90_ms: {:.3}",
+        percentile(&samples, 90).as_secs_f64() * 1_000.0
     );
-    if let Some(path) = &args.reference {
+    println!(
+        "p95_ms: {:.3}",
+        percentile(&samples, 95).as_secs_f64() * 1_000.0
+    );
+    println!("throughput_per_s: {:.2}", 1.0 / average_seconds);
+
+    if let Some(path) = &arguments.reference {
         compare(&output.values, &read_f32(path)?, &output.shape)?;
     }
-
-    let mut samples = model.benchmark(&input, args.warmup, args.runs)?;
-    samples.sort_unstable();
-    let p50 = percentile(&samples, 50);
-    let p90 = percentile(&samples, 90);
-    let p95 = percentile(&samples, 95);
-    println!(
-        "warmup={} runs={} p50_ms={:.3} p90_ms={:.3} p95_ms={:.3} throughput_per_s={:.2}",
-        args.warmup,
-        args.runs,
-        p50.as_secs_f64() * 1_000.0,
-        p90.as_secs_f64() * 1_000.0,
-        p95.as_secs_f64() * 1_000.0,
-        1.0 / p50.as_secs_f64()
-    );
+    if let Some(path) = &arguments.dump {
+        write_f32(path, &output.values)?;
+        println!("dump: {}", path.display());
+    }
     Ok(())
 }
 
-fn parse_args() -> Result<Args, Box<dyn Error>> {
-    let mut kind = None;
-    let mut weights = None;
-    let mut size = ModelSize::Tiny;
-    let mut height = None;
-    let mut width = None;
-    let mut input = None;
-    let mut reference = None;
-    let mut warmup = 5usize;
-    let mut runs = 30usize;
-    let mut values = env::args().skip(1);
-    while let Some(flag) = values.next() {
-        if matches!(flag.as_str(), "-h" | "--help") {
-            print_usage();
-            std::process::exit(0);
-        }
-        let value = values
-            .next()
-            .ok_or_else(|| format!("missing value for {flag}"))?;
-        match flag.as_str() {
-            "--model" => kind = Some(value),
-            "--weights" => weights = Some(PathBuf::from(value)),
-            "--size" => size = ModelSize::from_str(&value)?,
-            "--height" => height = Some(value.parse()?),
-            "--width" => width = Some(value.parse()?),
-            "--input" => input = Some(PathBuf::from(value)),
-            "--reference" => reference = Some(PathBuf::from(value)),
-            "--warmup" => warmup = value.parse()?,
-            "--runs" => runs = value.parse()?,
-            _ => return Err(format!("unknown option {flag:?}").into()),
-        }
+fn resolve_weights(arguments: &Arguments) -> Result<PathBuf> {
+    if let Some(path) = &arguments.weights {
+        return Ok(path.clone());
     }
-    let kind = kind.ok_or("missing --model")?;
-    let weights = weights.ok_or("missing --weights")?;
-    let recognizer = matches!(kind.as_str(), "rec" | "recognizer");
-    Ok(Args {
-        kind,
-        size,
-        weights,
-        height: height.unwrap_or(if recognizer { 48 } else { 416 }),
-        width: width.unwrap_or(if recognizer { 320 } else { 736 }),
-        input,
-        reference,
-        warmup,
-        runs,
-    })
-}
-
-fn print_usage() {
-    println!(
-        "usage: ppocr-gpu-bench --model det|rec --size medium|small|tiny \
-         --weights MODEL.safetensors \
-         [--height N] [--width N] [--input INPUT.f32] [--reference OUTPUT.f32] \
-         [--warmup N] [--runs N]"
-    );
+    let store = ModelStore::new(&arguments.model_dir);
+    let kind = arguments.kind.model_kind();
+    let paths = if arguments.verify_models {
+        store.verify(kind, arguments.size)?
+    } else if arguments.offline {
+        store.ensure_offline(kind, arguments.size)?
+    } else {
+        store.ensure(kind, arguments.size)?
+    };
+    Ok(paths.weights)
 }
 
 fn deterministic_input(length: usize) -> Vec<f32> {
@@ -178,32 +247,36 @@ fn deterministic_input(length: usize) -> Vec<f32> {
         .collect()
 }
 
-fn read_f32(path: &PathBuf) -> Result<Vec<f32>, Box<dyn Error>> {
-    let bytes = fs::read(path)?;
-    let mut chunks = bytes.chunks_exact(4);
-    let values = chunks
-        .by_ref()
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect::<Vec<_>>();
-    if !chunks.remainder().is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} length is not divisible by four", path.display()),
-        )
-        .into());
-    }
-    Ok(values)
+fn read_f32(path: &Path) -> Result<Vec<f32>> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    ensure!(
+        bytes.len().is_multiple_of(size_of::<f32>()),
+        "{} length is not divisible by four",
+        path.display()
+    );
+    Ok(bytes
+        .chunks_exact(size_of::<f32>())
+        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .collect())
 }
 
-fn compare(actual: &[f32], expected: &[f32], shape: &[usize]) -> Result<(), Box<dyn Error>> {
-    if actual.len() != expected.len() {
-        return Err(format!(
-            "reference has {} values; output has {}",
-            expected.len(),
-            actual.len()
-        )
-        .into());
+fn write_f32(path: &Path, values: &[f32]) -> Result<()> {
+    let mut writer =
+        BufWriter::new(File::create(path).with_context(|| format!("create {}", path.display()))?);
+    for &value in values {
+        writer.write_all(&value.to_le_bytes())?;
     }
+    writer.flush()?;
+    Ok(())
+}
+
+fn compare(actual: &[f32], expected: &[f32], shape: &[usize]) -> Result<()> {
+    ensure!(
+        actual.len() == expected.len(),
+        "reference has {} values; output has {}",
+        expected.len(),
+        actual.len()
+    );
     let mut maximum = 0.0f32;
     let mut total = 0.0f64;
     for (&actual, &expected) in actual.iter().zip(expected) {
@@ -211,10 +284,8 @@ fn compare(actual: &[f32], expected: &[f32], shape: &[usize]) -> Result<(), Box<
         maximum = maximum.max(difference);
         total += f64::from(difference);
     }
-    println!(
-        "reference_max_abs={maximum:.9e} reference_mean_abs={:.9e}",
-        total / actual.len() as f64
-    );
+    println!("reference_max_abs: {maximum:.9e}");
+    println!("reference_mean_abs: {:.9e}", total / actual.len() as f64);
     if shape.len() == 3 {
         let classes = shape[2];
         let steps = actual.len() / classes;
@@ -223,7 +294,7 @@ fn compare(actual: &[f32], expected: &[f32], shape: &[usize]) -> Result<(), Box<
             .zip(expected.chunks_exact(classes))
             .filter(|(actual, expected)| argmax(actual) == argmax(expected))
             .count();
-        println!("reference_argmax_matches={matches}/{steps}");
+        println!("reference_argmax_matches: {matches}/{steps}");
     }
     Ok(())
 }

@@ -1,7 +1,8 @@
 use super::error::{Error, Result};
 use super::runtime::{Activation, ConvDesc, Gpu, GraphBuilder, Session, Value};
 use super::weights::Weights;
-use std::{path::Path, str::FromStr};
+use crate::models::ModelSize;
+use std::path::Path;
 
 const BN_EPSILON: f32 = 1.0e-5;
 const MEDIUM_DETECTOR_TENSORS: usize = 350;
@@ -13,29 +14,7 @@ const TINY_RECOGNIZER_TENSORS: usize = 150;
 const LARGE_RECOGNIZER_CLASSES: usize = 18_710;
 const TINY_RECOGNIZER_CLASSES: usize = 6_906;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ModelSize {
-    Medium,
-    Small,
-    Tiny,
-}
-
 impl ModelSize {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Medium => "medium",
-            Self::Small => "small",
-            Self::Tiny => "tiny",
-        }
-    }
-
-    pub const fn recognizer_classes(self) -> usize {
-        match self {
-            Self::Medium | Self::Small => LARGE_RECOGNIZER_CLASSES,
-            Self::Tiny => TINY_RECOGNIZER_CLASSES,
-        }
-    }
-
     const fn detector_tensors(self) -> usize {
         match self {
             Self::Medium => MEDIUM_DETECTOR_TENSORS,
@@ -49,21 +28,6 @@ impl ModelSize {
             Self::Medium => MEDIUM_RECOGNIZER_TENSORS,
             Self::Small => SMALL_RECOGNIZER_TENSORS,
             Self::Tiny => TINY_RECOGNIZER_TENSORS,
-        }
-    }
-}
-
-impl FromStr for ModelSize {
-    type Err = String;
-
-    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        match value {
-            "medium" => Ok(Self::Medium),
-            "small" => Ok(Self::Small),
-            "tiny" => Ok(Self::Tiny),
-            _ => Err(format!(
-                "unsupported model size {value:?}; expected medium, small, or tiny"
-            )),
         }
     }
 }

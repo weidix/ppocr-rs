@@ -1,6 +1,9 @@
 //! Architecture-specific CPU kernels.
 
-use super::arena::{Buffer, Handle as ArenaHandle};
+#[cfg(target_arch = "x86_64")]
+use super::arena::Buffer;
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+use super::arena::Handle as ArenaHandle;
 use rayon::prelude::*;
 
 #[cfg(target_os = "macos")]
@@ -80,6 +83,7 @@ pub(crate) unsafe fn copy_stride2_16(output: *mut f32, input: *const f32) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spatial_conv2d_direct(
     output: &mut [f32],
@@ -107,7 +111,7 @@ pub(crate) fn spatial_conv2d_direct(
     assert_eq!(weight.len(), output_channels * patch_size);
     assert!(bias.is_none_or(|bias| bias.len() == output_channels));
     let output_plane = output_height * output_width;
-    #[cfg(feature = "cpu-profile")]
+    #[cfg(all(feature = "cpu-profile", target_arch = "x86_64"))]
     eprintln!(
         "cpu-profile spatial-conv input_channels={input_channels} output_channels={output_channels} input={input_height}x{input_width} output={output_height}x{output_width} kernel={kernel_height}x{kernel_width} stride={} micro_panels={}",
         strides[0],
@@ -115,7 +119,6 @@ pub(crate) fn spatial_conv2d_direct(
             && output_channels >= 16
             && spatial_panel_working_set_fits(weight.len(), patch_size, output_channels)
     );
-
     #[cfg(target_arch = "x86_64")]
     if rayon::current_num_threads() == 1
         && output_channels >= 16
@@ -337,6 +340,28 @@ unsafe fn spatial_conv2d_micro_panels(
             )
         };
     }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spatial_conv2d_direct(
+    _output: &mut [f32],
+    _input: &[f32],
+    _weight: &[f32],
+    _bias: Option<&[f32]>,
+    _input_channels: usize,
+    _input_height: usize,
+    _input_width: usize,
+    _output_channels: usize,
+    _output_height: usize,
+    _output_width: usize,
+    _kernel_height: usize,
+    _kernel_width: usize,
+    _strides: [usize; 2],
+    _pads: [usize; 4],
+    _activation: Option<UnaryOperation>,
+) {
+    unreachable!("direct spatial convolution is only available on x86-64");
 }
 
 #[cfg(target_arch = "x86_64")]

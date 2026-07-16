@@ -1,41 +1,35 @@
-# PP-OCRv6 CPU and GPU benchmarks
+# PP-OCRv6 Benchmarks
 
-This document records results for the repository's two Safetensors inference
-backends. Model loading, input generation or upload, and output validation are
-outside the timed interval.
+This document records direct Safetensors inference measurements for the native
+CPU and WGPU backends. Model download, checksum validation, model loading,
+input generation or upload, and output validation are outside the timed
+interval.
 
 ## Reproduction
 
-Download and verify the pinned models:
+The benchmark commands resolve the pinned model package automatically. On a
+new machine, the first command downloads it; use `--offline` to require an
+existing cache and `--verify-models` to force a full checksum pass.
 
 ```sh
-./scripts/download-models.sh
-```
-
-Run a CPU model:
-
-```sh
-cargo run --release --features cpu --bin ppocr-cpu-bench -- \
+cargo run --release --bin ppocr-cpu-bench -- \
   --kind det --size tiny --height 416 --width 736 \
   --threads 4 --warmup 5 --runs 30
+
+cargo run --release --no-default-features --features gpu --bin ppocr-gpu-bench -- \
+  --kind det --size tiny --height 416 --width 736 \
+  --warmup 5 --runs 30
 ```
 
-Run a GPU model:
-
-```sh
-cargo run --release --no-default-features --features gpu \
-  --bin ppocr-gpu-bench -- \
-  --model det --size tiny \
-  --weights models/tiny-det/model.safetensors \
-  --height 416 --width 736 --warmup 5 --runs 30
-```
-
-Detector inputs are `[1,3,416,736]`; recognizer inputs are `[1,3,48,320]`.
+Detector inputs use `[1, 3, 416, 736]`; recognizer inputs use
+`[1, 3, 48, 320]`. Run benchmarks with `--release`, record the exact hardware,
+operating system, Rust version, model size, thread count, warmup count, and
+timed run count with any new result.
 
 ## Apple M4 GPU
 
 Hardware: Apple M4 (10-core GPU, 16 GB unified memory), macOS 26.5, Rust
-1.92.0. Each model used five warmups and 30 timed runs.
+1.92.0. Five warmups and 30 timed runs per model.
 
 | Model | p50 | p90 | Throughput at p50 |
 | --- | ---: | ---: | ---: |
@@ -46,14 +40,14 @@ Hardware: Apple M4 (10-core GPU, 16 GB unified memory), macOS 26.5, Rust
 | tiny detector | 20.337 ms | 21.575 ms | 49.17 frames/s |
 | tiny recognizer | 3.837 ms | 3.870 ms | 260.61 lines/s |
 
-The synchronized validation forward produced finite, nonzero output at the
-expected shape for all six models. The GPU backend uses Metal on macOS and
+The synchronized validation forward produced finite, nonzero output with the
+expected shape for every listed model. The GPU backend uses Metal on macOS and
 Vulkan on other supported platforms.
 
 ## Apple M4 CPU
 
-Hardware: Apple M4, macOS 26.5, Rust 1.92.0. Each model used one worker, five
-warmups, and 30 timed runs.
+Hardware: Apple M4, macOS 26.5, Rust 1.92.0. One CPU worker, five warmups, and
+30 timed runs per model.
 
 | Model | p50 | p90 | Throughput at p50 |
 | --- | ---: | ---: | ---: |
@@ -64,16 +58,13 @@ warmups, and 30 timed runs.
 | tiny detector | 24.944 ms | 25.826 ms | 40.09 frames/s |
 | tiny recognizer | 1.943 ms | 2.092 ms | 514.67 lines/s |
 
-On macOS, dense pointwise and tiled spatial convolutions use Accelerate SGEMM.
-The sparse representation skips only blocks whose weights are exactly zero.
-
 ## Windows x86-64 CPU
 
 Hardware: Intel Core i5-12600K, Windows build 26100, Rust 1.97.0
 (`x86_64-pc-windows-msvc`). The single-worker run used five warmups and 30
 timed runs.
 
-| Model | Average latency | P95 | Throughput |
+| Model | Average latency | p95 | Throughput |
 | --- | ---: | ---: | ---: |
 | tiny detector | 54.386 ms | 58.855 ms | 18.39 frames/s |
 | small detector | 121.699 ms | 133.223 ms | 8.22 frames/s |
@@ -84,7 +75,7 @@ timed runs.
 
 The four-worker acceptance run used 20 warmups and 50 timed runs:
 
-| Model | Average latency | P95 | Throughput |
+| Model | Average latency | p95 | Throughput |
 | --- | ---: | ---: | ---: |
 | tiny detector | 37.025 ms | 39.240 ms | 27.01 frames/s |
 | small detector | 86.485 ms | 91.517 ms | 11.56 frames/s |
@@ -93,6 +84,5 @@ The four-worker acceptance run used 20 warmups and 50 timed runs:
 | small recognizer | 24.176 ms | 27.648 ms | 41.36 lines/s |
 | medium recognizer | 100.158 ms | 104.133 ms | 9.98 lines/s |
 
-Windows MSVC release builds target the portable AVX2/FMA `x86-64-v3` ISA level
-through `.cargo/config.toml`. The optional `cpu-profile` feature prints
-per-operation timings to stderr and is compiled out of normal CPU builds.
+The repository configuration targets `x86-64-v3` for x86-64 builds, requiring
+AVX2 and FMA. Do not compare these measurements with generic x86-64 binaries.

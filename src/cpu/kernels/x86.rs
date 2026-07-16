@@ -765,6 +765,7 @@ pub(super) unsafe fn gemm_rows_8<const ROWS: usize, const PACKED_LEFT: bool>(
 
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(super) unsafe fn linear_rows_8<const ROWS: usize>(
     output: &mut [f32],
     input: &[f32],
@@ -826,6 +827,7 @@ pub(super) unsafe fn linear_rows_8<const ROWS: usize>(
 
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(super) unsafe fn linear_6x16_packed<const ROWS: usize>(
     output: &mut [f32],
     output_stride: usize,

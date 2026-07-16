@@ -10,5 +10,6 @@ mod weights;
 #[cfg(target_os = "windows")]
 mod windows;
 
-pub use model::{CpuOptions, Detector, ModelSize, Recognizer};
+pub use crate::models::ModelSize;
+pub use model::{CpuOptions, Detector, Recognizer};
 pub use tensor::Tensor;
