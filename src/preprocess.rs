@@ -18,13 +18,14 @@ const RECOGNIZER_STD_BGR: [f32; 3] = [0.5, 0.5, 0.5];
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedInput {
     pub(crate) data: Vec<f32>,
+    pub(crate) batch: usize,
     pub(crate) height: usize,
     pub(crate) width: usize,
 }
 
 impl PreparedInput {
     pub(crate) fn shape(&self) -> [usize; 4] {
-        [1, 3, self.height, self.width]
+        [self.batch, 3, self.height, self.width]
     }
 }
 
@@ -40,16 +41,33 @@ pub(crate) fn prepare_detector(image: &RgbImage, plan: DetectorInputPlan) -> Pre
     )
 }
 
-pub(crate) fn prepare_recognizer(image: &RgbImage, plan: RecognitionInputPlan) -> PreparedInput {
-    normalized_bgr(
-        image,
-        plan.corners(),
-        plan.input_width(),
-        plan.input_height(),
-        plan.content_width(),
-        &RECOGNIZER_MEAN_BGR,
-        &RECOGNIZER_STD_BGR,
-    )
+pub(crate) fn prepare_recognizer(
+    image: &RgbImage,
+    plans: &[RecognitionInputPlan],
+) -> PreparedInput {
+    let width = plans.first().map_or(0, |plan| plan.input_width());
+    let mut data = Vec::new();
+    for plan in plans {
+        debug_assert_eq!(plan.input_width(), width);
+        data.extend(
+            normalized_bgr(
+                image,
+                plan.corners(),
+                plan.input_width(),
+                plan.input_height(),
+                plan.content_width(),
+                &RECOGNIZER_MEAN_BGR,
+                &RECOGNIZER_STD_BGR,
+            )
+            .data,
+        );
+    }
+    PreparedInput {
+        data,
+        batch: plans.len(),
+        height: crate::ocr::RECOGNIZER_INPUT_HEIGHT,
+        width,
+    }
 }
 
 fn normalized_bgr(
@@ -93,6 +111,7 @@ fn normalized_bgr(
 
     PreparedInput {
         data,
+        batch: 1,
         height: canvas_height,
         width: canvas_width,
     }
@@ -119,7 +138,7 @@ fn scale(point: Point, factor: f32) -> Point {
 mod tests {
     use super::*;
     use crate::{
-        ocr::recognition_input_plans,
+        ocr::recognition_input_plan,
         pixels::{from_fn, solid},
     };
 
@@ -136,7 +155,7 @@ mod tests {
     #[test]
     fn recognizer_pads_and_tracks_content_width() {
         let image = solid(80, 20, [127, 127, 127]);
-        let plan = recognition_input_plans(
+        let plan = recognition_input_plan(
             [
                 Point(0.0, 0.0),
                 Point(80.0, 0.0),
@@ -145,9 +164,8 @@ mod tests {
             ],
             320,
         )
-        .expect("recognizer plan")
-        .remove(0);
-        let prepared = prepare_recognizer(&image, plan);
+        .expect("recognizer plan");
+        let prepared = prepare_recognizer(&image, &[plan]);
         assert_eq!(prepared.shape(), [1, 3, 48, 320]);
         assert_eq!(plan.content_width(), 192);
         let expected = (127.0 / 255.0 - 0.5) / 0.5;

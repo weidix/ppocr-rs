@@ -260,9 +260,9 @@ fn validate_detector_shape([n, c, h, w]: [usize; 4]) -> Result<()> {
 }
 
 fn validate_recognizer_shape([n, c, h, w]: [usize; 4]) -> Result<()> {
-    if n != 1 || c != 3 || h != 48 || w < 32 || w % 4 != 0 {
+    if n == 0 || c != 3 || h != 48 || w < 32 || w % 4 != 0 {
         return Err(Error::InvalidInput(format!(
-            "recognizer expects [1, 3, 48, W] with W >= 32 and divisible by 4; got [{n}, {c}, {h}, {w}]"
+            "recognizer expects [N, 3, 48, W] with N > 0, W >= 32 and divisible by 4; got [{n}, {c}, {h}, {w}]"
         )));
     }
     checked_elements([n, c, h, w])?;

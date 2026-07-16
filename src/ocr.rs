@@ -4,12 +4,11 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::{collections::VecDeque, fs, path::Path};
 
-use crate::{ModelSize, ModelStore, RgbImage};
 #[cfg(feature = "cpu")]
-use crate::{
-    cpu::{CpuOptions, Detector, Recognizer, Tensor},
-    preprocess::{prepare_detector, prepare_recognizer},
-};
+use crate::cpu::{CpuOptions, Detector, Recognizer, Tensor};
+#[cfg(any(feature = "cpu", feature = "gpu"))]
+use crate::preprocess::{prepare_detector, prepare_recognizer};
+use crate::{ModelSize, ModelStore, RgbImage};
 #[cfg(feature = "gpu")]
 use std::cell::RefCell;
 
@@ -18,12 +17,14 @@ pub const RECOGNIZER_INPUT_WIDTH: usize = 320;
 
 const MAX_RECTIFIED_EDGE: f32 = 4_096.0;
 const MAX_RECTIFIED_PIXELS: f32 = 8_000_000.0;
-const MAX_RECOGNITION_CHUNKS: usize = 64;
+const RECOGNIZER_BATCH_SIZE: usize = 6;
 const PROBABILITY_EPSILON: f32 = 1e-8;
 const DETECTOR_LIMIT_SIDE: f64 = 736.0;
 const DETECTOR_MAX_SIDE: f64 = 4_000.0;
 #[cfg(feature = "gpu")]
 const GPU_DETECTOR_CACHE_LIMIT: usize = 2;
+#[cfg(feature = "gpu")]
+const GPU_RECOGNIZER_CACHE_LIMIT: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DetectorTransform {
@@ -138,7 +139,6 @@ impl RecognitionInputPlan {
         self.input_width
     }
 
-    #[cfg(feature = "cpu")]
     pub(crate) const fn input_height(self) -> usize {
         RECOGNIZER_INPUT_HEIGHT
     }
@@ -148,54 +148,23 @@ impl RecognitionInputPlan {
     }
 }
 
-pub(crate) fn recognition_input_plans(
+pub(crate) fn recognition_input_plan(
     polygon: [Point; 4],
-    max_width: u32,
-) -> Result<Vec<RecognitionInputPlan>> {
-    validate_recognizer_width(max_width)?;
+    input_width: usize,
+) -> Result<RecognitionInputPlan> {
     let width = distance(polygon[0], polygon[1]).max(distance(polygon[3], polygon[2]));
     let height = distance(polygon[0], polygon[3]).max(distance(polygon[1], polygon[2]));
     let (width, height) = bounded_crop_dimensions(width, height)?;
-    let maximum_chunk_width = (height as usize)
-        .checked_mul(max_width as usize)
-        .context("recognition crop width overflow")?
-        / RECOGNIZER_INPUT_HEIGHT;
-    let maximum_chunk_width =
-        u32::try_from(maximum_chunk_width.max(1)).context("recognition crop width overflow")?;
-    let overlap = if maximum_chunk_width > 1 {
-        (maximum_chunk_width / 3).clamp(1, maximum_chunk_width - 1)
-    } else {
-        0
-    };
-    let step = maximum_chunk_width.saturating_sub(overlap).max(1);
-    let mut plans = Vec::new();
-    let mut start = 0u32;
-    loop {
-        if plans.len() == MAX_RECOGNITION_CHUNKS {
-            bail!(
-                "recognition crop requires more than {MAX_RECOGNITION_CHUNKS} fixed-width chunks"
-            );
-        }
-        let chunk_width = (width - start).min(maximum_chunk_width);
-        let start_ratio = start as f32 / width as f32;
-        let end_ratio = (start + chunk_width) as f32 / width as f32;
-        let corners = [
-            lerp(polygon[0], polygon[1], start_ratio),
-            lerp(polygon[0], polygon[1], end_ratio),
-            lerp(polygon[3], polygon[2], end_ratio),
-            lerp(polygon[3], polygon[2], start_ratio),
-        ];
-        plans.push(RecognitionInputPlan {
-            corners,
-            input_width: max_width as usize,
-            content_width: scaled_recognizer_width(chunk_width, height, max_width)?,
-        });
-        if start + chunk_width >= width {
-            break;
-        }
-        start += step;
-    }
-    Ok(plans)
+    let content_width = scaled_recognizer_width(width, height)?;
+    ensure!(
+        content_width <= input_width,
+        "recognizer crop exceeds its batch canvas"
+    );
+    Ok(RecognitionInputPlan {
+        corners: polygon,
+        input_width,
+        content_width,
+    })
 }
 
 fn default_detector_ratio(width: u32, height: u32) -> f64 {
@@ -222,25 +191,28 @@ fn aligned_dimension(value: f64) -> Result<u32> {
     Ok(units as u32 * 32)
 }
 
-fn validate_recognizer_width(max_width: u32) -> Result<()> {
-    ensure!(
-        max_width >= RECOGNIZER_INPUT_WIDTH as u32,
-        "recognizer maximum width must be at least {RECOGNIZER_INPUT_WIDTH}"
-    );
-    ensure!(
-        max_width.is_multiple_of(4),
-        "recognizer maximum width must be divisible by four"
-    );
-    Ok(())
-}
-
-fn scaled_recognizer_width(width: u32, height: u32, max_width: u32) -> Result<usize> {
+fn scaled_recognizer_width(width: u32, height: u32) -> Result<usize> {
     let scaled = (RECOGNIZER_INPUT_HEIGHT as u32)
         .checked_mul(width)
         .context("recognizer content width overflow")?
         .div_ceil(height)
-        .clamp(1, max_width);
+        .max(1);
     Ok(scaled as usize)
+}
+
+fn recognizer_batch_width(polygons: &[[Point; 4]]) -> Result<usize> {
+    let maximum = polygons
+        .iter()
+        .try_fold(RECOGNIZER_INPUT_WIDTH, |maximum, polygon| {
+            let width = distance(polygon[0], polygon[1]).max(distance(polygon[3], polygon[2]));
+            let height = distance(polygon[0], polygon[3]).max(distance(polygon[1], polygon[2]));
+            let (width, height) = bounded_crop_dimensions(width, height)?;
+            Ok::<_, anyhow::Error>(maximum.max(scaled_recognizer_width(width, height)?))
+        })?;
+    maximum
+        .checked_add(3)
+        .map(|width| width / 4 * 4)
+        .context("recognizer batch width overflow")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -321,8 +293,6 @@ pub struct OcrOptions {
     /// Optional maximum detector image side. `None` uses the released model's
     /// default resize policy.
     pub detector_max_side: Option<u32>,
-    /// Width of each recognizer canvas and the maximum width of one text crop.
-    pub recognizer_max_width: u32,
 }
 
 impl Default for OcrOptions {
@@ -336,7 +306,6 @@ impl Default for OcrOptions {
                 .min(4),
             detector_postprocess: DetectorPostprocessOptions::default(),
             detector_max_side: None,
-            recognizer_max_width: RECOGNIZER_INPUT_WIDTH as u32,
         }
     }
 }
@@ -346,7 +315,6 @@ impl OcrOptions {
     pub fn validate(&self) -> Result<()> {
         self.detector_postprocess.validate()?;
         ensure!(self.threads > 0, "worker thread count must be positive");
-        validate_recognizer_width(self.recognizer_max_width)?;
         if let Some(max_side) = self.detector_max_side {
             ensure!(max_side > 0, "detector maximum side must be positive");
         }
@@ -415,7 +383,9 @@ struct GpuOcrRuntime {
     detector_model: PathBuf,
     detector_size: ModelSize,
     detector_cache: RefCell<Vec<([usize; 4], crate::gpu::Detector)>>,
-    recognizer: crate::gpu::Recognizer,
+    recognizer_model: PathBuf,
+    recognizer_size: ModelSize,
+    recognizer_cache: RefCell<Vec<([usize; 4], crate::gpu::Recognizer)>>,
 }
 
 impl OcrEngine {
@@ -488,26 +458,14 @@ impl OcrEngine {
                     #[cfg(feature = "gpu")]
                     {
                         let gpu = crate::gpu::Gpu::new().context("initialize GPU backend")?;
-                        let recognizer = crate::gpu::Recognizer::load(
-                            &gpu,
-                            recognizer_model,
-                            options.recognizer_size,
-                            [
-                                1,
-                                3,
-                                RECOGNIZER_INPUT_HEIGHT,
-                                options.recognizer_max_width as usize,
-                            ],
-                        )
-                        .with_context(|| {
-                            format!("load recognizer {}", recognizer_model.display())
-                        })?;
                         OcrRuntime::Gpu(GpuOcrRuntime {
                             gpu,
                             detector_model: detector_model.to_path_buf(),
                             detector_size: options.detector_size,
                             detector_cache: RefCell::new(Vec::new()),
-                            recognizer,
+                            recognizer_model: recognizer_model.to_path_buf(),
+                            recognizer_size: options.recognizer_size,
+                            recognizer_cache: RefCell::new(Vec::new()),
                         })
                     }
                     #[cfg(not(feature = "gpu"))]
@@ -547,8 +505,8 @@ impl OcrEngine {
                         detector.forward(Tensor::from_f32(prepared.shape(), prepared.data)?)?;
                     Ok((output.as_f32()?.to_vec(), output.shape().to_vec()))
                 },
-                |plan| {
-                    let prepared = recognizer.with_thread_pool(|| prepare_recognizer(image, plan));
+                |plans| {
+                    let prepared = recognizer.with_thread_pool(|| prepare_recognizer(image, plans));
                     let output =
                         recognizer.forward(Tensor::from_f32(prepared.shape(), prepared.data)?)?;
                     Ok((output.as_f32()?.to_vec(), output.shape().to_vec()))
@@ -565,7 +523,7 @@ impl OcrEngine {
                     &self.dictionary,
                     &self.options,
                     |plan| runtime.run_detector(&gpu_image, plan),
-                    |plan| runtime.run_recognizer(&gpu_image, plan),
+                    |plans| runtime.run_recognizer(image, plans),
                 )
             }
             #[cfg(not(any(feature = "cpu", feature = "gpu")))]
@@ -581,7 +539,7 @@ fn recognize_with(
     dictionary: &[String],
     options: &OcrOptions,
     mut run_detector: impl FnMut(DetectorInputPlan) -> Result<(Vec<f32>, Vec<usize>)>,
-    mut run_recognizer: impl FnMut(RecognitionInputPlan) -> Result<(Vec<f32>, Vec<usize>)>,
+    mut run_recognizer: impl FnMut(&[RecognitionInputPlan]) -> Result<(Vec<f32>, Vec<usize>)>,
 ) -> Result<OcrResult> {
     let detector_plan = DetectorInputPlan::new(image, options.detector_max_side)?;
     let detector_input_size = [detector_plan.input_width(), detector_plan.input_height()];
@@ -593,27 +551,45 @@ fn recognize_with(
         options.detector_postprocess,
     )?;
 
-    let mut lines = Vec::with_capacity(detections.len());
-    for detection in detections {
-        let mut decoded_chunks = Vec::new();
-        for plan in recognition_input_plans(detection.polygon, options.recognizer_max_width)? {
-            let (values, shape) = run_recognizer(plan)?;
-            decoded_chunks.push(decode_ctc_greedy_for_input(
-                &values,
-                &shape,
-                dictionary,
-                plan.content_width(),
-                plan.input_width(),
-            )?);
+    let mut recognition_order = (0..detections.len()).collect::<Vec<_>>();
+    recognition_order.sort_by(|&left, &right| {
+        polygon_aspect_ratio(detections[left].polygon)
+            .total_cmp(&polygon_aspect_ratio(detections[right].polygon))
+    });
+    let mut decoded = vec![
+        DecodedText {
+            text: String::new(),
+            score: 0.0
+        };
+        detections.len()
+    ];
+    for indices in recognition_order.chunks(RECOGNIZER_BATCH_SIZE) {
+        let polygons = indices
+            .iter()
+            .map(|&index| detections[index].polygon)
+            .collect::<Vec<_>>();
+        let input_width = recognizer_batch_width(&polygons)?;
+        let plans = polygons
+            .into_iter()
+            .map(|polygon| recognition_input_plan(polygon, input_width))
+            .collect::<Result<Vec<_>>>()?;
+        let (values, shape) = run_recognizer(&plans)?;
+        let batch = decode_ctc_batch(&values, &shape, dictionary, &plans)?;
+        for (&index, result) in indices.iter().zip(batch) {
+            decoded[index] = result;
         }
-        let decoded = join_decoded_texts(&decoded_chunks);
-        lines.push(OcrLine {
+    }
+
+    let lines = detections
+        .into_iter()
+        .zip(decoded)
+        .map(|(detection, decoded)| OcrLine {
             polygon: detection.polygon,
             detection_score: detection.score,
             text: decoded.text,
             recognition_score: decoded.score,
-        });
-    }
+        })
+        .collect();
 
     Ok(OcrResult {
         source_size: [image.width(), image.height()],
@@ -666,16 +642,39 @@ impl GpuOcrRuntime {
 
     fn run_recognizer(
         &self,
-        image: &crate::gpu::GpuImage,
-        plan: RecognitionInputPlan,
+        image: &RgbImage,
+        plans: &[RecognitionInputPlan],
     ) -> Result<(Vec<f32>, Vec<usize>)> {
-        let output = self.recognizer.forward_image(
-            image,
-            crate::gpu::ImagePreprocess::recognizer(
-                plan.corners().map(point_coordinates),
-                plan.content_width(),
-            ),
-        )?;
+        let prepared = prepare_recognizer(image, plans);
+        let shape = prepared.shape();
+        let mut cache = self
+            .recognizer_cache
+            .try_borrow_mut()
+            .map_err(|_| anyhow::anyhow!("GPU recognizer cache is already in use"))?;
+        let index = match cache.iter().position(|(cached, _)| *cached == shape) {
+            Some(index) => index,
+            None => {
+                if cache.len() == GPU_RECOGNIZER_CACHE_LIMIT {
+                    cache.remove(0);
+                }
+                let recognizer = crate::gpu::Recognizer::load(
+                    &self.gpu,
+                    &self.recognizer_model,
+                    self.recognizer_size,
+                    shape,
+                )
+                .with_context(|| {
+                    format!(
+                        "load GPU recognizer {} for input {:?}",
+                        self.recognizer_model.display(),
+                        shape
+                    )
+                })?;
+                cache.push((shape, recognizer));
+                cache.len() - 1
+            }
+        };
+        let output = cache[index].1.forward(&prepared.data)?;
         Ok((output.values, output.shape))
     }
 }
@@ -842,6 +841,46 @@ pub fn decode_ctc_greedy_for_input(
             (log_score / emitted as f64).exp() as f32
         },
     })
+}
+
+fn decode_ctc_batch(
+    values: &[f32],
+    shape: &[usize],
+    dictionary: &[String],
+    plans: &[RecognitionInputPlan],
+) -> Result<Vec<DecodedText>> {
+    if shape.len() != 3 || shape[0] != plans.len() || shape[1] == 0 || shape[2] < 2 {
+        bail!(
+            "recognizer output shape {shape:?}, expected [{}, time, classes>=2]",
+            plans.len()
+        );
+    }
+    let item_len = shape[1]
+        .checked_mul(shape[2])
+        .context("recognizer output item size overflow")?;
+    let expected = plans
+        .len()
+        .checked_mul(item_len)
+        .context("recognizer output size overflow")?;
+    if values.len() != expected {
+        bail!(
+            "recognizer output has {} values, expected {expected}",
+            values.len()
+        );
+    }
+    plans
+        .iter()
+        .zip(values.chunks_exact(item_len))
+        .map(|(plan, item)| {
+            decode_ctc_greedy_for_input(
+                item,
+                &[1, shape[1], shape[2]],
+                dictionary,
+                plan.content_width(),
+                plan.input_width(),
+            )
+        })
+        .collect()
 }
 
 fn parse_dictionary(contents: &str) -> Result<Vec<String>> {
@@ -1088,6 +1127,12 @@ fn polygon_center(polygon: [Point; 4]) -> Point {
     )
 }
 
+fn polygon_aspect_ratio(polygon: [Point; 4]) -> f32 {
+    let width = distance(polygon[0], polygon[1]).max(distance(polygon[3], polygon[2]));
+    let height = distance(polygon[0], polygon[3]).max(distance(polygon[1], polygon[2]));
+    width / height.max(f32::EPSILON)
+}
+
 fn bounded_crop_dimensions(width: f32, height: f32) -> Result<(u32, u32)> {
     if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
         bail!("text polygon has an invalid crop size {width} by {height}");
@@ -1153,13 +1198,6 @@ fn scale(point: Point, factor: f32) -> Point {
     Point(point.0 * factor, point.1 * factor)
 }
 
-fn lerp(left: Point, right: Point, factor: f32) -> Point {
-    Point(
-        left.0 * (1.0 - factor) + right.0 * factor,
-        left.1 * (1.0 - factor) + right.1 * factor,
-    )
-}
-
 #[cfg(feature = "gpu")]
 fn point_coordinates(point: Point) -> [f32; 2] {
     [point.0, point.1]
@@ -1214,38 +1252,75 @@ mod tests {
     }
 
     #[test]
-    fn recognition_plan_preserves_recognizer_aspect_ratio() {
-        let plans = recognition_input_plans(
-            [
-                Point(0.0, 0.0),
-                Point(1_000.0, 0.0),
-                Point(1_000.0, 20.0),
-                Point(0.0, 20.0),
-            ],
-            320,
-        )
-        .expect("recognition plans");
-        assert!(plans.len() > 1);
-        assert!(plans.iter().all(|plan| plan.content_width() <= 320));
+    fn recognition_plan_preserves_the_entire_crop() {
+        let polygon = [
+            Point(0.0, 0.0),
+            Point(1_000.0, 0.0),
+            Point(1_000.0, 20.0),
+            Point(0.0, 20.0),
+        ];
+        let width = recognizer_batch_width(&[polygon]).expect("batch width");
+        let plan = recognition_input_plan(polygon, width).expect("recognition plan");
+        assert_eq!(plan.corners(), polygon);
+        assert_eq!(plan.content_width(), 2_400);
+        assert_eq!(plan.input_width(), 2_400);
     }
 
     #[test]
-    fn recognition_plan_uses_a_third_width_overlap() {
-        let plans = recognition_input_plans(
-            [
-                Point(0.0, 0.0),
-                Point(300.0, 0.0),
-                Point(300.0, 20.0),
-                Point(0.0, 20.0),
-            ],
-            320,
+    fn recognizer_batch_uses_the_largest_aspect_ratio() {
+        let narrow = [
+            Point(0.0, 0.0),
+            Point(80.0, 0.0),
+            Point(80.0, 20.0),
+            Point(0.0, 20.0),
+        ];
+        let wide = [
+            Point(0.0, 0.0),
+            Point(300.0, 0.0),
+            Point(300.0, 20.0),
+            Point(0.0, 20.0),
+        ];
+        assert_eq!(
+            recognizer_batch_width(&[narrow, wide]).expect("batch width"),
+            720
+        );
+    }
+
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn cpu_recognizer_accepts_a_real_batch() {
+        let model = Path::new("models/tiny-rec/model.safetensors");
+        if !model.is_file() {
+            return;
+        }
+        let recognizer = Recognizer::load(model, ModelSize::Tiny, CpuOptions { threads: 1 })
+            .expect("load CPU recognizer");
+        let input = Tensor::from_f32(
+            [2, 3, RECOGNIZER_INPUT_HEIGHT, RECOGNIZER_INPUT_WIDTH],
+            vec![0.0; 2 * 3 * RECOGNIZER_INPUT_HEIGHT * RECOGNIZER_INPUT_WIDTH],
         )
-        .expect("recognition plans");
-        assert_eq!(plans.len(), 3);
-        assert_eq!(plans[0].content_width(), 320);
-        assert_eq!(plans[1].content_width(), 320);
-        assert_eq!(plans[2].content_width(), 293);
-        assert!((plans[0].corners()[1].0 - plans[1].corners()[0].0 - 44.0).abs() < 1e-4);
+        .expect("batch input");
+        let output = recognizer.forward(input).expect("recognize batch");
+        assert_eq!(output.shape()[0], 2);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_recognizer_accepts_a_real_batch() {
+        let model = Path::new("models/tiny-rec/model.safetensors");
+        if !model.is_file() {
+            return;
+        }
+        let Ok(gpu) = crate::gpu::Gpu::new() else {
+            return;
+        };
+        let shape = [2, 3, RECOGNIZER_INPUT_HEIGHT, RECOGNIZER_INPUT_WIDTH];
+        let recognizer = crate::gpu::Recognizer::load(&gpu, model, ModelSize::Tiny, shape)
+            .expect("load GPU recognizer");
+        let output = recognizer
+            .forward(&vec![0.0; shape.into_iter().product()])
+            .expect("recognize batch");
+        assert_eq!(output.shape[0], 2);
     }
 
     #[cfg(feature = "gpu")]

@@ -8,7 +8,7 @@
 pub mod models;
 pub mod ocr;
 mod pixels;
-#[cfg(feature = "cpu")]
+#[cfg(any(feature = "cpu", feature = "gpu"))]
 mod preprocess;
 
 pub use models::{ModelAccess, ModelKind, ModelPaths, ModelSize, ModelStore, OcrModelPaths};

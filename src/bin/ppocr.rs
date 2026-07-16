@@ -47,10 +47,6 @@ struct Arguments {
     #[arg(long)]
     detector_max_side: Option<u32>,
 
-    /// Recognizer canvas width and maximum width of one recognition chunk.
-    #[arg(long, default_value_t = 320)]
-    recognizer_max_width: u32,
-
     /// Minimum detector probability used to form a text component.
     #[arg(long, default_value_t = 0.2)]
     binary_threshold: f32,
@@ -117,7 +113,6 @@ fn main() -> Result<()> {
             max_boxes: arguments.max_boxes,
         },
         detector_max_side: arguments.detector_max_side,
-        recognizer_max_width: arguments.recognizer_max_width,
     };
     options.validate()?;
     let (detector_model, recognizer_model, dictionary) = resolve_models(&arguments)?;
